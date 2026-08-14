@@ -1,0 +1,25 @@
+{
+  "gpu": "NVIDIA GeForce RTX 5090",
+  "model": "llama-7b fp16",
+  "mode": "patch-selection",
+  "warmup": 3,
+  "iters": 10,
+  "n_trials": 3,
+  "sanity_check_max_abs_diff": 0.0011834055185317993,
+  "no_kv_cache_ms_per_trial": [
+    279.92138266563416,
+    280.3456485271454,
+    281.98787569999695
+  ],
+  "with_kv_cache_ms_per_trial": [
+    256.5404772758484,
+    256.13313913345337,
+    257.79664516448975
+  ],
+  "no_kv_cache_ms_avg": 280.7516356309255,
+  "with_kv_cache_ms_avg": 256.82342052459717,
+  "absolute_saving_ms": 23.92821510632831,
+  "improvement_pct": 8.522912093657116,
+  "no_kv_cache_peak_mem_mb": 13340.16259765625,
+  "with_kv_cache_peak_mem_mb": 13340.16259765625
+}

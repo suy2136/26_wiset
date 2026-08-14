@@ -1,0 +1,5 @@
+# Additional packages needed for the ViT patch-selection viewport-prediction work,
+# on top of the base env (torch==2.2.0, numpy==1.24.4, munch==4.0.0,
+# transformers==4.34.1, peft==0.6.2).
+torchvision
+opencv-python

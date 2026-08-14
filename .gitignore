@@ -1,0 +1,46 @@
+# Model weights / pretrained LMs
+downloaded_plms/
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Data & fine-tuned checkpoints (large, instance-local)
+/data
+data/images/
+data/data/
+data/ft_plms/
+data/models/
+
+# Original archives / provisioning zips
+*.zip
+VP.zip
+data.zip
+try_llama2_7b.zip
+merge.zip
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# Conda / venv environments
+.conda/
+conda-meta/
+venv/
+.venv/
+environment.yml.lock
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+.vs/
+
+# Local agent/session artifacts
+.claude/

@@ -1,0 +1,131 @@
+{
+  "checkpoint": "/workspace/data/models/patch_selection/best_patch_selection.pth",
+  "split": "test",
+  "dataset": "Jin2022",
+  "num_samples": 1698,
+  "grid_rows": 4,
+  "grid_cols": 4,
+  "patch_top_k": null,
+  "patch_threshold": null,
+  "effective_threshold": 0.5,
+  "frequency_table": [
+    {
+      "patch_index": 6,
+      "row": 1,
+      "col": 2,
+      "count": 1689,
+      "pct": 99.47
+    },
+    {
+      "patch_index": 11,
+      "row": 2,
+      "col": 3,
+      "count": 1550,
+      "pct": 91.28
+    },
+    {
+      "patch_index": 10,
+      "row": 2,
+      "col": 2,
+      "count": 1535,
+      "pct": 90.4
+    },
+    {
+      "patch_index": 7,
+      "row": 1,
+      "col": 3,
+      "count": 1531,
+      "pct": 90.16
+    },
+    {
+      "patch_index": 4,
+      "row": 1,
+      "col": 0,
+      "count": 945,
+      "pct": 55.65
+    },
+    {
+      "patch_index": 5,
+      "row": 1,
+      "col": 1,
+      "count": 902,
+      "pct": 53.12
+    },
+    {
+      "patch_index": 9,
+      "row": 2,
+      "col": 1,
+      "count": 810,
+      "pct": 47.7
+    },
+    {
+      "patch_index": 3,
+      "row": 0,
+      "col": 3,
+      "count": 744,
+      "pct": 43.82
+    },
+    {
+      "patch_index": 8,
+      "row": 2,
+      "col": 0,
+      "count": 728,
+      "pct": 42.87
+    },
+    {
+      "patch_index": 14,
+      "row": 3,
+      "col": 2,
+      "count": 640,
+      "pct": 37.69
+    },
+    {
+      "patch_index": 2,
+      "row": 0,
+      "col": 2,
+      "count": 494,
+      "pct": 29.09
+    },
+    {
+      "patch_index": 15,
+      "row": 3,
+      "col": 3,
+      "count": 326,
+      "pct": 19.2
+    },
+    {
+      "patch_index": 13,
+      "row": 3,
+      "col": 1,
+      "count": 82,
+      "pct": 4.83
+    },
+    {
+      "patch_index": 12,
+      "row": 3,
+      "col": 0,
+      "count": 30,
+      "pct": 1.77
+    },
+    {
+      "patch_index": 0,
+      "row": 0,
+      "col": 0,
+      "count": 25,
+      "pct": 1.47
+    },
+    {
+      "patch_index": 1,
+      "row": 0,
+      "col": 1,
+      "count": 0,
+      "pct": 0.0
+    }
+  ],
+  "num_selected_stats": {
+    "min": 2,
+    "max": 12,
+    "mean": 7.085394581861013,
+    "median": 8
+  }
+}
