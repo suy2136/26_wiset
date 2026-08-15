@@ -106,10 +106,13 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
     if use_adalora:
         if total_step is None:
             raise ValueError("use_adalora=True requires total_step (total optimizer update steps)")
-        # pruning schedule derived from the total number of optimizer steps
-        tinit = max(1, int(total_step * 0.1))            # warmup: no pruning before this
-        tfinal = max(tinit + 1, int(total_step * 0.15))   # stop pruning after this
-        deltaT = 10                                       # reallocate every deltaT steps
+        # Training-time schedule derived from optimizer updates.  The NBS
+        # objective is unchanged; the schedule only controls when it may alter
+        # the active lora_E mask.
+        tinit = max(1, int(total_step * 0.1))
+        tfinal = max(tinit + 1, int(total_step * 0.15))
+        cooldown_start = max(tinit + 1, total_step - tfinal)
+        deltaT = int(adalora_allocation_interval)
         config = AdaLoraConfig(
             init_r=rank * 2,        # start with a larger rank ...
             target_r=rank,          # ... and prune down to this average rank
@@ -152,8 +155,22 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
             rank_budget=adalora_rank_budget,
             rank_config=adalora_rank_config,
             missing_grad_policy=adalora_missing_grad_policy,
+            warmup_steps=tinit,
+            cooldown_start_step=cooldown_start,
+            allocation_interval=adalora_allocation_interval,
         )
         model.nash_rank_allocation_interval = int(adalora_allocation_interval)
+        print(
+            "NBS rank schedule: warm-up steps 1-{}, allocation window {}-{}, "
+            "cooldown steps {}-{} (interval={})".format(
+                tinit,
+                tinit + 1,
+                max(tinit, cooldown_start - 1),
+                cooldown_start,
+                total_step,
+                adalora_allocation_interval,
+            )
+        )
     model.from_pretrained
     print_trainable_parameters(model)
     return model

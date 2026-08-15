@@ -25,7 +25,8 @@ class NashRankAllocator:
     def __init__(self, model, target_rank, min_rank=None, max_rank=None,
                  rank_budget=None, ema_beta=0.9, eps=1e-8,
                  adapter_name="default", rank_config=None,
-                 missing_grad_policy="zero"):
+                 missing_grad_policy="zero", warmup_steps=0,
+                 cooldown_start_step=None, allocation_interval=1):
         self.model = model
         self.adapter_name = adapter_name
         self.target_rank = int(target_rank)
@@ -38,6 +39,17 @@ class NashRankAllocator:
         if missing_grad_policy not in ("zero", "hold"):
             raise ValueError("missing_grad_policy must be 'zero' or 'hold'")
         self.missing_grad_policy = missing_grad_policy
+        self.warmup_steps = int(warmup_steps)
+        self.cooldown_start_step = (
+            None if cooldown_start_step is None else int(cooldown_start_step)
+        )
+        self.allocation_interval = int(allocation_interval)
+        if self.warmup_steps < 0:
+            raise ValueError("warmup_steps must be non-negative")
+        if self.cooldown_start_step is not None and self.cooldown_start_step < 1:
+            raise ValueError("cooldown_start_step must be positive")
+        if self.allocation_interval <= 0:
+            raise ValueError("allocation_interval must be positive")
         self.rank_config = rank_config or {}
         self.min_rank_spec = min_rank
         self.max_rank_spec = max_rank
@@ -74,16 +86,58 @@ class NashRankAllocator:
         if self.rank_budget > sum(self.max_ranks.values()):
             raise ValueError("rank_budget exceeds the available AdaLoRA slots")
 
+        initial_ranks = self._initial_budget_ranks()
         for name, module in self.layers.items():
             self.sensitivity[name] = 0.0
-            # The Nash allocation starts from every layer's minimum rank.
-            # The remaining global budget is distributed by allocate().
-            self.ranks[name] = self.min_ranks[name]
+            # Warm-up starts with a feasible, approximately uniform allocation
+            # that already consumes the full budget.  NBS reallocation itself
+            # still starts from every layer's minimum rank in _choose_ranks().
+            self.ranks[name] = initial_ranks[name]
             self.spectral_shadow[name] = (
                 module.lora_E[self.adapter_name].detach().float().reshape(-1).clone()
             )
 
         self._apply_allocation(self.ranks)
+
+    def _initial_budget_ranks(self):
+        """Fill the global budget as uniformly as layer bounds permit."""
+        ranks = OrderedDict(
+            (name, self.min_ranks[name]) for name in self.layers
+        )
+        remaining = self.rank_budget - sum(ranks.values())
+        tie_breaker = {name: index for index, name in enumerate(self.layers)}
+        heap = [
+            (ranks[name], tie_breaker[name], name)
+            for name in self.layers if ranks[name] < self.max_ranks[name]
+        ]
+        heapq.heapify(heap)
+        for _ in range(remaining):
+            if not heap:
+                raise RuntimeError("could not fill rank budget within layer bounds")
+            _, _, selected = heapq.heappop(heap)
+            ranks[selected] += 1
+            if ranks[selected] < self.max_ranks[selected]:
+                heapq.heappush(
+                    heap, (ranks[selected], tie_breaker[selected], selected)
+                )
+        return ranks
+
+    def schedule_phase(self, step):
+        """Return the training-time phase for a one-based optimizer step."""
+        step = int(step)
+        if step <= self.warmup_steps:
+            return "warmup"
+        if self.cooldown_start_step is not None and step >= self.cooldown_start_step:
+            return "cooldown"
+        return "allocation"
+
+    def should_allocate(self, step):
+        """Whether this optimizer step is an eligible NBS reallocation point."""
+        step = int(step)
+        return (
+            self.schedule_phase(step) == "allocation"
+            and step % self.allocation_interval == 0
+        )
 
     def _layer_rank_config(self, name):
         """Resolve an exact or glob-style per-layer rank override."""
@@ -292,12 +346,15 @@ class NashRankAllocator:
     def state_dict(self):
         """Return allocator state separately from the PEFT adapter state."""
         return {
-            "version": 1,
+            "version": 2,
             "target_rank": self.target_rank,
             "rank_budget": self.rank_budget,
             "ema_beta": self.ema_beta,
             "eps": self.eps,
             "missing_grad_policy": self.missing_grad_policy,
+            "warmup_steps": self.warmup_steps,
+            "cooldown_start_step": self.cooldown_start_step,
+            "allocation_interval": self.allocation_interval,
             "min_ranks": dict(self.min_ranks),
             "max_ranks": dict(self.max_ranks),
             "sensitivity": dict(self.sensitivity),
@@ -316,6 +373,14 @@ class NashRankAllocator:
             if name not in state.get("spectral_shadow", {}):
                 raise ValueError(f"allocator checkpoint is missing layer {name}")
         self.sensitivity.update(state.get("sensitivity", {}))
+        self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
+        cooldown_start = state.get("cooldown_start_step", self.cooldown_start_step)
+        self.cooldown_start_step = (
+            None if cooldown_start is None else int(cooldown_start)
+        )
+        self.allocation_interval = int(
+            state.get("allocation_interval", self.allocation_interval)
+        )
         self.ema_step = int(state.get("ema_step", 0))
         self.ranks.update({name: int(value) for name, value in state.get("ranks", {}).items()})
         for name in self.layers:
@@ -340,9 +405,12 @@ class NashRankAllocator:
                 e.copy_((raw * self.masks[name]).view_as(e))
 
     def step(self, step=None):
-        """Consume current gradients and apply a new sequential allocation."""
+        """Consume gradients and follow the configured training-time schedule."""
         self.update_sensitivity()
-        return self.allocate(step)
+        if step is None or self.should_allocate(step):
+            return self.allocate(step)
+        self.enforce_masks()
+        return dict(self.ranks)
 
     def allocate(self, step=None):
         """Allocate ranks using the most recently updated sensitivities."""

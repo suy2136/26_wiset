@@ -63,6 +63,36 @@ def check_rank_bounds_and_budget():
     print("[PASS] layer-wise min/max bounds and global rank budget")
 
 
+def check_initial_budget_and_schedule():
+    model = FakeAdaModel(n_layers=4, rank=6)
+    allocator = NashRankAllocator(
+        model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=5,
+        rank_budget=8,
+        warmup_steps=3,
+        cooldown_start_step=9,
+        allocation_interval=2,
+    )
+    ranks = allocator.active_rank_summary()
+    assert sum(ranks.values()) == 8, ranks
+    assert set(ranks.values()) == {2}, ranks
+    assert allocator.schedule_phase(1) == "warmup"
+    assert allocator.schedule_phase(3) == "warmup"
+    assert allocator.schedule_phase(4) == "allocation"
+    assert allocator.schedule_phase(9) == "cooldown"
+    assert not allocator.should_allocate(2)
+    assert allocator.should_allocate(4)
+    assert allocator.should_allocate(8)
+    assert not allocator.should_allocate(9)
+    assert not allocator.should_allocate(10)
+    for name, module in allocator.layers.items():
+        active = int((module.lora_E["default"].detach().reshape(-1) != 0).sum())
+        assert active == ranks[name], (name, active, ranks[name])
+    print("[PASS] full-budget uniform warm-up and fixed cooldown schedule")
+
+
 def check_sensitivity_weights():
     model = FakeAdaModel(n_layers=2, rank=4)
     allocator = NashRankAllocator(model, target_rank=2, min_rank=1, ema_beta=0.5)
@@ -128,6 +158,9 @@ def check_shadow_reallocation_and_restore():
         layer.lora_E["default"].detach(),
         "masked lora_E was not restored",
     )
+    assert restored.warmup_steps == allocator.warmup_steps
+    assert restored.cooldown_start_step == allocator.cooldown_start_step
+    assert restored.allocation_interval == allocator.allocation_interval
     print("[PASS] shadow-based reallocation independence and checkpoint restoration")
 
 
@@ -194,7 +227,7 @@ def check_optional_real_adalora():
         allocator.update_sensitivity()
         torch.nn.utils.clip_grad_norm_(wrapped.parameters(), 1.0)
         optimizer.step()
-        if (step + 1) % 2 == 0 or step == 3:
+        if allocator.should_allocate(step + 1):
             allocator.allocate(step + 1)
         else:
             allocator.enforce_masks()
@@ -288,6 +321,7 @@ def check_optional_real_adalora():
 def main():
     torch.manual_seed(0)
     check_rank_bounds_and_budget()
+    check_initial_budget_and_schedule()
     check_sensitivity_weights()
     check_utility_concavity_and_gain_monotonicity()
     check_shadow_reallocation_and_restore()

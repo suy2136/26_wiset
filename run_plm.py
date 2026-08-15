@@ -206,7 +206,6 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     # Read the accumulated, unclipped A/B gradients first so
                     # sensitivity matches the raw gradient-norm definition.
                     allocator = pipeline.plm.nash_rank_allocator
-                    interval = pipeline.plm.nash_rank_allocation_interval
                     allocator.update_sensitivity()
                 if args.rank != -1 and args.use_adalora:
                     # Clip once per effective batch, after sensitivity has been
@@ -217,19 +216,14 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     # Allocation/mask enforcement happens after optimizer.step
                     # and before zero_grad, while the next forward sees the
                     # selected rank mask.
-                    is_final_update = (
-                        epoch == args.epochs - 1 and
-                        step + 1 == len(dataloader_train)
-                    )
-                    if is_final_update:
-                        # Do not change the rank topology immediately before
-                        # the final validation.  Keep the most recently
-                        # trained allocation and only re-zero inactive E
-                        # components that optimizer.step() may have updated.
-                        allocator.enforce_masks()
-                    elif (opt_step + 1) % interval == 0:
-                        allocator.allocate(opt_step + 1)
+                    current_opt_step = opt_step + 1
+                    if allocator.should_allocate(current_opt_step):
+                        allocator.allocate(current_opt_step)
                     else:
+                        # During warm-up, between allocation intervals, and
+                        # throughout cooldown, preserve the existing topology.
+                        # This also prevents a final-step allocation directly
+                        # before validation.
                         allocator.enforce_masks()
                 optimizer.zero_grad()
                 opt_step += 1
