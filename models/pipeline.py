@@ -160,14 +160,7 @@ class Pipeline(nn.Module):
         x = self.embed_ln(x)
 
         outputlist = []
-        # next(self.plm.parameters()).dtype is unreliable once a LoRA adapter is loaded:
-        # get_peft_model()/load_adapter() leave lora_A/lora_B in fp32 (mixed-precision
-        # master weights) while the frozen base weights stay fp16, and whichever happens
-        # to be first in parameter-iteration order decides the (wrong, if fp32) result --
-        # this silently produced fp32 inputs_embeds into a fp16 frozen linear and crashed
-        # with a dtype mismatch during real (adapter-loaded) evaluation. embed_tokens is
-        # never LoRA-adapted, so its weight dtype reliably reflects the frozen base dtype.
-        plm_dtype = self.plm.get_input_embeddings().weight.dtype
+        plm_dtype = self._plm_compute_dtype()
         # KV-cache the growing sequence instead of re-feeding it from scratch every step:
         # causal attention means a token's hidden state only depends on itself and earlier
         # tokens, so incrementally feeding just the newest token (with past_key_values
@@ -214,9 +207,29 @@ class Pipeline(nn.Module):
         
         x = self.embed_ln(x)
 
-        plm_dtype = self.plm.get_input_embeddings().weight.dtype  # see auto_regressive() for why not next(self.plm.parameters()).dtype
+        plm_dtype = self._plm_compute_dtype()
         outputs = self.plm(inputs_embeds=x.to(plm_dtype), attention_mask = torch.ones(x.shape[0], x.shape[1], dtype=torch.long, device=self.device), teacher_forcing=True)
         return outputs.logits.float()
+
+    def _plm_compute_dtype(self):
+        """Return the dtype expected by the frozen base projection weights.
+
+        PEFT AdaLoRA can keep ``lora_A``/``lora_B`` in fp32 while the frozen
+        base linear weights are fp16.  Prefer the actual weight of an adapted
+        linear layer so both forward paths use a matching input dtype.
+        """
+        for module in self.plm.modules():
+            if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+                continue
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+                return weight.dtype
+
+        embedding = self.plm.get_input_embeddings()
+        weight = getattr(embedding, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+            return weight.dtype
+        raise RuntimeError("Could not determine the PLM input dtype from its base weights")
     
     def inference(self, batch, future, video_user_info) -> torch.Tensor:
         """
