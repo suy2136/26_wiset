@@ -218,6 +218,16 @@ class Pipeline(nn.Module):
         base linear weights are fp16.  Prefer the actual weight of an adapted
         linear layer so both forward paths use a matching input dtype.
         """
+        # PEFT 0.6.x AdaLoRA uses SVDLinear as the actual frozen projection.
+        # Prefer it explicitly so delegation/proxy attributes on parent PEFT
+        # wrappers cannot make us select an fp32 adapter dtype first.
+        for module in self.plm.modules():
+            if module.__class__.__name__ != "SVDLinear":
+                continue
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+                return weight.dtype
+
         for module in self.plm.modules():
             if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
                 continue

@@ -151,7 +151,7 @@ def check_optional_real_adalora():
         def __init__(self, d=8):
             super().__init__()
             self.layers = nn.ModuleList([TinyAttn(d), TinyAttn(d)])
-            self.head = nn.Linear(d, d)
+            self.head = nn.Linear(d, d, bias=False)
 
         def gradient_checkpointing_enable(self):
             pass
@@ -188,6 +188,24 @@ def check_optional_real_adalora():
     ranks = allocator.active_rank_summary()
     assert sum(ranks.values()) == 4, ranks
     print("[PASS] real PEFT AdaLoRA forward/backward and custom allocator smoke test")
+
+    # PEFT 0.6.2 keeps AdaLoRA A/B/E in fp32 even when the frozen base model
+    # is fp16.  Its stock SVDLinear forward cannot multiply those mixed
+    # dtypes, so exercise the compatibility forward installed by peft_model().
+    mixed = peft_model(
+        TinyModel().half(), "llama", rank=2,
+        task_type=TaskType.FEATURE_EXTRACTION, use_adalora=True,
+        total_step=2, adalora_min_rank=1, adalora_rank_budget=4,
+        adalora_allocation_interval=1,
+    )
+    mixed_output = mixed(input_ids=torch.randn(4, 8, dtype=torch.float16))
+    mixed_output.float().pow(2).mean().backward()
+    mixed_allocator = mixed.nash_rank_allocator
+    assert any(
+        module.lora_A["default"].grad is not None
+        for module in mixed_allocator.layers.values()
+    )
+    print("[PASS] PEFT 0.6.2 fp16-base/fp32-AdaLoRA mixed-dtype forward/backward")
 
 
 def main():
