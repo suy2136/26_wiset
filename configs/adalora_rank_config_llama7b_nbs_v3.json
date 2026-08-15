@@ -1,0 +1,10 @@
+{
+  "*.layers.*.self_attn.q_proj": {
+    "min_rank": 8,
+    "max_rank": 64
+  },
+  "*.layers.*.self_attn.v_proj": {
+    "min_rank": 8,
+    "max_rank": 64
+  }
+}

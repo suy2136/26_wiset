@@ -3,8 +3,9 @@ set -u
 set -o pipefail
 
 VARIANT="${1:-}"
-if [[ "$VARIANT" != "nbs" && "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|plain}"
+if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
+      "$VARIANT" != "nbs_v3" && "$VARIANT" != "plain" ]]; then
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|plain}"
   exit 2
 fi
 
@@ -23,16 +24,32 @@ RUN_DIR="$ARTIFACT_ROOT/$VARIANT/$RUN_ID"
 mkdir -p "$RUN_DIR/figures"
 printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 
-if [[ "$VARIANT" == "nbs" ]]; then
+if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || "$VARIANT" == "nbs_v3" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
+  RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
+  RANK_BUDGET=2048
+  EXPERIMENT_ARGS=()
+  if [[ "$VARIANT" == "nbs_v2" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v2"
+    DISPLAY_NAME="NBS-NetLLM v2"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_nbs_v2.json"
+    EXPERIMENT_ARGS=(--experiment-tag nbs_v2)
+  elif [[ "$VARIANT" == "nbs_v3" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v3"
+    DISPLAY_NAME="NBS-NetLLM v3"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_nbs_v3.json"
+    RANK_BUDGET=1536
+    EXPERIMENT_ARGS=(--experiment-tag nbs_v3)
+  fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
     --use-adalora
-    --adalora-rank-config configs/adalora_rank_config_llama7b.json
-    --adalora-rank-budget 2048
+    --adalora-rank-config "$RANK_CONFIG"
+    --adalora-rank-budget "$RANK_BUDGET"
     --adalora-allocation-interval 10
     --adalora-diagnostics-path "$NBS_DIAGNOSTICS"
+    "${EXPERIMENT_ARGS[@]}"
   )
 else
   MODEL_TAG="llama_base_low_rank"
@@ -69,9 +86,10 @@ run_logged() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\n' \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$CHECKPOINT_INTERVAL" "$EVAL_PROGRESS_INTERVAL" \
-  "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" > "$RUN_DIR/metadata.env"
+  "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
+  "${RANK_BUDGET:-}" > "$RUN_DIR/metadata.env"
 
 TRAIN_CMD=(
   python run_plm.py
@@ -168,7 +186,7 @@ PLOT_CMD=(
   --result-csv "$RUN_DIR/results.csv"
   --output-dir "$RUN_DIR/figures"
 )
-if [[ "$VARIANT" == "nbs" ]]; then
+if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || "$VARIANT" == "nbs_v3" ]]; then
   PLOT_CMD+=(--allocator-state "$BEST_MODEL/nash_rank_allocator.pt")
   PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
 fi

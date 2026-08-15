@@ -423,6 +423,9 @@ def run(args):
         # same rank/hyperparams (same directory formula otherwise) -- same convention as
         # the multimodal_tag above, for the same reason.
         low_rank_tag = f'{args.plm_type}_{args.plm_size}_low_rank' + ('_adalora' if args.use_adalora else '')
+        experiment_tag = getattr(args, 'experiment_tag', None)
+        if experiment_tag is not None:
+            low_rank_tag += f'_{experiment_tag}'
         models_dir = os.path.join(cfg.plms_finetuned_dir, low_rank_tag,
                               f'freeze_plm_{args.freeze_plm}', multimodal_tag, args.train_dataset, f'{args.dataset_frequency}Hz')
         results_dir = os.path.join(cfg.results_dir, low_rank_tag,
@@ -689,6 +692,8 @@ if __name__ == '__main__':
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
+    parser.add_argument('--experiment-tag', choices=['nbs_v2', 'nbs_v3'], default=None,
+                        help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
                                                                                                      'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\

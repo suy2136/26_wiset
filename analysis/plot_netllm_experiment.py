@@ -25,7 +25,9 @@ VALID_RE = re.compile(r"Valid loss\s+(?P<loss>[-+0-9.eE]+)")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--variant", choices=("nbs", "plain"), required=True)
+    parser.add_argument(
+        "--variant", choices=("nbs", "nbs_v2", "nbs_v3", "plain"), required=True
+    )
     parser.add_argument("--train-log", type=Path, required=True)
     parser.add_argument("--result-csv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -177,7 +179,13 @@ def main() -> None:
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
     train_finite = finite_losses(train_curve)
     valid_finite = finite_losses(valid_curve)
-    display_name = "NBS-NetLLM" if args.variant == "nbs" else "NetLLM"
+    display_names = {
+        "nbs": "NBS-NetLLM",
+        "nbs_v2": "NBS-NetLLM v2",
+        "nbs_v3": "NBS-NetLLM v3",
+        "plain": "NetLLM",
+    }
+    display_name = display_names[args.variant]
 
     summary = {
         "variant": args.variant,
