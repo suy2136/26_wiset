@@ -7,6 +7,7 @@ compatible.
 """
 
 from collections import OrderedDict
+from fnmatch import fnmatchcase
 import heapq
 
 import torch
@@ -56,7 +57,7 @@ class NashRankAllocator:
         self.min_ranks = OrderedDict()
         self.max_ranks = OrderedDict()
         for name in self.layers:
-            config = self.rank_config.get(name, {})
+            config = self._layer_rank_config(name)
             self.min_ranks[name] = self._resolve_bound(
                 name, self.min_rank_spec, config.get("min_rank"),
                 default=max(1, target_rank // 2), label="min_rank")
@@ -83,6 +84,23 @@ class NashRankAllocator:
             )
 
         self._apply_allocation(self.ranks)
+
+    def _layer_rank_config(self, name):
+        """Resolve an exact or glob-style per-layer rank override."""
+        exact = self.rank_config.get(name)
+        if exact is not None:
+            return exact
+        matches = [
+            (pattern, value) for pattern, value in self.rank_config.items()
+            if isinstance(pattern, str) and fnmatchcase(name, pattern)
+        ]
+        if not matches:
+            return {}
+        matches.sort(
+            key=lambda item: sum(ch not in "*?" for ch in item[0]),
+            reverse=True,
+        )
+        return matches[0][1]
 
     def _find_layers(self):
         layers = OrderedDict()

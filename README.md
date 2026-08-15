@@ -100,6 +100,24 @@ python run_plm.py --adapt --multimodal-mode patch-selection \
 않습니다. AdaLoRA를 함께 쓰려면 `--use-adalora` 플래그를 추가하세요 (`--rank`가 `target_r`이
 되고, `init_r = rank * 2`에서 시작해 학습 중 pruning됩니다).
 
+논문 방식으로 LoRA layer별 minimum/maximum rank를 지정하려면
+`configs/adalora_rank_config_llama7b.json`을 사용할 수 있습니다. 설정 키는 exact module
+name 또는 glob 패턴이며, 예시 파일은 Llama의 모든 q/v projection에 `min_rank=8`,
+`max_rank=64`를 적용합니다. `--rank 32`인 경우 전체 rank budget은 기본적으로
+`target_rank × LoRA layer 수`로 계산됩니다.
+
+```bash
+python run_plm.py --adapt --multimodal-mode baseline \
+    --train-dataset Jin2022 --test-dataset Jin2022 \
+    --plm-type llama --plm-size base --rank 32 --epochs 1 \
+    --use-adalora \
+    --adalora-rank-config configs/adalora_rank_config_llama7b.json \
+    --adalora-rank-budget 2048
+```
+
+rank 설정에 glob 패턴을 사용하면 Llama layer를 하나씩 나열하지 않아도 됩니다. exact
+module name이 glob보다 우선하며, 여러 glob이 매칭되면 더 구체적인 패턴이 우선합니다.
+
 Selector / Speculative decoding은 학습된 pipeline을 감싸는 추론 전용 wrapper이며, 사용 예시는
 `analysis/eval_3condition.py`, `analysis/verify_selectable_pipeline_equivalence.py`,
 `analysis/verify_speculative_pipeline.py`를 참고하세요.
