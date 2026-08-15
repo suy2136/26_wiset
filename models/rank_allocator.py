@@ -9,6 +9,7 @@ compatible.
 from collections import OrderedDict
 from fnmatch import fnmatchcase
 import heapq
+import re
 
 import torch
 
@@ -59,6 +60,7 @@ class NashRankAllocator:
         self.masks = OrderedDict()
         self.spectral_shadow = OrderedDict()
         self.last_gains = OrderedDict()
+        self.last_diagnostics = []
         self.last_step = None
         self.ema_step = 0
 
@@ -98,6 +100,7 @@ class NashRankAllocator:
             )
 
         self._apply_allocation(self.ranks)
+        self.snapshot_diagnostics(step=0, event="initialization")
 
     def _initial_budget_ranks(self):
         """Fill the global budget as uniformly as layer bounds permit."""
@@ -304,7 +307,69 @@ class NashRankAllocator:
                 heapq.heappush(
                     heap, (-next_gain, tie_breaker[selected], selected)
                 )
-        return ranks, utilities
+        return ranks, utilities, weights
+
+    @staticmethod
+    def _module_coordinates(name):
+        """Extract human-readable Transformer layer and projection labels."""
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
+        layer_index = int(match.group(1)) if match else None
+        module_type = name.rsplit(".", 1)[-1]
+        return layer_index, module_type
+
+    def _build_diagnostics(self, step, event, ranks, previous_ranks,
+                           utilities, weights):
+        corrected = self._bias_corrected_sensitivity()
+        phase = self.schedule_phase(step)
+        total_rank = sum(int(value) for value in ranks.values())
+        rows = []
+        for name in self.layers:
+            rank = int(ranks[name])
+            min_rank = int(self.min_ranks[name])
+            max_rank = int(self.max_ranks[name])
+            layer_index, module_type = self._module_coordinates(name)
+            utility = utilities[name]
+            next_gain = None
+            if rank < max_rank:
+                next_gain = self._marginal_gain(utility, rank, weights[name])
+            rows.append({
+                "optimizer_step": int(step),
+                "phase": phase,
+                "event": event,
+                "layer_name": name,
+                "transformer_layer_index": layer_index,
+                "module_type": module_type,
+                "rank": rank,
+                "sensitivity": float(corrected[name]),
+                "alpha": float(weights[name]),
+                "spectral_energy_total": float(
+                    self._spectral_energy(name).sum().item()
+                ),
+                "utility": float(utility[rank].item()),
+                "next_marginal_gain": next_gain,
+                "min_rank": min_rank,
+                "max_rank": max_rank,
+                "at_min_rank": int(rank == min_rank),
+                "at_max_rank": int(rank == max_rank),
+                "rank_delta": rank - int(previous_ranks.get(name, rank)),
+                "total_rank": total_rank,
+                "rank_budget": int(self.rank_budget),
+            })
+        return rows
+
+    def snapshot_diagnostics(self, step, event="snapshot"):
+        """Capture per-layer statistics without changing the active ranks."""
+        weights = self._weights()
+        utilities = {name: self._utility(name) for name in self.layers}
+        self.last_diagnostics = self._build_diagnostics(
+            step=step,
+            event=event,
+            ranks=self.ranks,
+            previous_ranks=self.ranks,
+            utilities=utilities,
+            weights=weights,
+        )
+        return list(self.last_diagnostics)
 
     def _refresh_spectral_shadow(self):
         """Capture current nonzero E values before enforcing the previous mask."""
@@ -415,10 +480,20 @@ class NashRankAllocator:
     def allocate(self, step=None):
         """Allocate ranks using the most recently updated sensitivities."""
         self._refresh_spectral_shadow()
-        ranks, energies = self._choose_ranks()
+        previous_ranks = dict(self.ranks)
+        ranks, utilities, weights = self._choose_ranks()
         self.ranks = OrderedDict(ranks)
-        self._apply_allocation(self.ranks, energies)
+        self._apply_allocation(self.ranks, utilities)
         self.last_step = step
+        diagnostic_step = self.ema_step if step is None else step
+        self.last_diagnostics = self._build_diagnostics(
+            step=diagnostic_step,
+            event="allocation",
+            ranks=self.ranks,
+            previous_ranks=previous_ranks,
+            utilities=utilities,
+            weights=weights,
+        )
         return dict(self.ranks)
 
     def active_rank_summary(self):

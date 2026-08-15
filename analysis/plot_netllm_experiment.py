@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--result-csv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allocator-state", type=Path)
+    parser.add_argument("--allocator-diagnostics", type=Path)
     return parser.parse_args()
 
 
@@ -101,6 +102,68 @@ def read_allocator_state(path: Path | None) -> dict[str, Any] | None:
     }
 
 
+def read_allocator_diagnostics(path: Path | None) -> list[dict[str, str]]:
+    if path is None or not path.exists():
+        return []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        return list(csv.DictReader(handle))
+
+
+def plot_rank_trajectory(rows: list[dict[str, str]], output_dir: Path) -> Path | None:
+    if not rows:
+        return None
+    event_keys = []
+    seen_events = set()
+    layer_meta: dict[str, tuple[int, int, str]] = {}
+    values = {}
+    module_order = {"q_proj": 0, "v_proj": 1}
+    for row in rows:
+        key = (int(row["optimizer_step"]), row["event"])
+        if key not in seen_events:
+            seen_events.add(key)
+            event_keys.append(key)
+        name = row["layer_name"]
+        layer_text = row.get("transformer_layer_index", "")
+        layer_index = int(layer_text) if layer_text else 10**9
+        module_type = row.get("module_type", "")
+        layer_meta[name] = (
+            layer_index, module_order.get(module_type, 99), module_type
+        )
+        values[(key, name)] = int(row["rank"])
+    layer_names = sorted(layer_meta, key=lambda name: (*layer_meta[name], name))
+    matrix = [
+        [values.get((event, name), math.nan) for event in event_keys]
+        for name in layer_names
+    ]
+    labels = []
+    for name in layer_names:
+        layer_index, _, module_type = layer_meta[name]
+        labels.append(
+            name if layer_index == 10**9 else f"L{layer_index} {module_type}"
+        )
+
+    width = max(12, min(28, 0.32 * len(event_keys)))
+    figure, axis = plt.subplots(figsize=(width, 14), constrained_layout=True)
+    image = axis.imshow(matrix, aspect="auto", interpolation="nearest", cmap="viridis")
+    axis.set_title("NBS rank trajectory")
+    axis.set_xlabel("Optimizer step / event")
+    axis.set_ylabel("LoRA module")
+    axis.set_xticks(range(len(event_keys)))
+    axis.set_xticklabels(
+        [f"{step}\n{event}" for step, event in event_keys],
+        rotation=60,
+        ha="right",
+        fontsize=7,
+    )
+    axis.set_yticks(range(len(labels)))
+    axis.set_yticklabels(labels, fontsize=7)
+    figure.colorbar(image, ax=axis, label="Allocated rank")
+    path = output_dir / "nbs_rank_trajectory.png"
+    figure.savefig(path, dpi=180)
+    plt.close(figure)
+    return path
+
+
 def finite_losses(curve: list[dict[str, float]]) -> list[dict[str, float]]:
     return [point for point in curve if math.isfinite(point["loss"])]
 
@@ -111,6 +174,7 @@ def main() -> None:
     train_curve, valid_curve = parse_train_log(args.train_log)
     aggregate, per_pair = read_results(args.result_csv)
     allocator = read_allocator_state(args.allocator_state)
+    diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
     train_finite = finite_losses(train_curve)
     valid_finite = finite_losses(valid_curve)
     display_name = "NBS-NetLLM" if args.variant == "nbs" else "NetLLM"
@@ -126,7 +190,21 @@ def main() -> None:
         "train_curve": train_curve,
         "valid_curve": valid_curve,
         "allocator": allocator,
-        "source_files": {"train_log": str(args.train_log), "result_csv": str(args.result_csv)},
+        "allocator_diagnostics": {
+            "path": str(args.allocator_diagnostics) if args.allocator_diagnostics else None,
+            "row_count": len(diagnostic_rows),
+            "event_count": len({
+                (row.get("optimizer_step"), row.get("event"))
+                for row in diagnostic_rows
+            }),
+        },
+        "source_files": {
+            "train_log": str(args.train_log),
+            "result_csv": str(args.result_csv),
+            "allocator_diagnostics": (
+                str(args.allocator_diagnostics) if args.allocator_diagnostics else None
+            ),
+        },
     }
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -195,6 +273,9 @@ def main() -> None:
     plt.close(fig)
     print(f"Summary saved at {summary_path}")
     print(f"Figure saved at {figure_path}")
+    trajectory_path = plot_rank_trajectory(diagnostic_rows, args.output_dir)
+    if trajectory_path is not None:
+        print(f"Rank trajectory saved at {trajectory_path}")
 
 
 if __name__ == "__main__":

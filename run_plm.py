@@ -1,5 +1,6 @@
 import sys
 import argparse
+import csv
 import copy
 import json
 import math
@@ -21,6 +22,40 @@ from torch.utils.data import DataLoader
 from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
 from models.low_rank import peft_model, print_trainable_parameters
+
+
+NASH_DIAGNOSTIC_FIELDS = [
+    'optimizer_step', 'phase', 'event', 'layer_name',
+    'transformer_layer_index', 'module_type', 'rank', 'sensitivity',
+    'alpha', 'spectral_energy_total', 'utility', 'next_marginal_gain',
+    'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
+    'total_rank', 'rank_budget',
+]
+
+
+def _initialize_nash_diagnostics(path, append=False):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    mode = 'a' if append and os.path.exists(path) else 'w'
+    with open(path, mode, newline='', encoding='utf-8') as handle:
+        if mode == 'w' or handle.tell() == 0:
+            csv.DictWriter(handle, fieldnames=NASH_DIAGNOSTIC_FIELDS).writeheader()
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _append_nash_diagnostics(path, rows):
+    """Durably append one diagnostic event so interruptions preserve history."""
+    if not rows:
+        return
+    with open(path, 'a', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=NASH_DIAGNOSTIC_FIELDS, extrasaction='ignore'
+        )
+        writer.writerows(rows)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def save_model(args, model, save_dir):
@@ -104,6 +139,21 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     if args.resume:
         pipeline = load_model(args, pipeline, args.resume_path)
         print('Resume weights for training from:', args.resume_path)
+
+    allocator = None
+    nash_diagnostics_path = None
+    if args.rank != -1 and args.use_adalora:
+        allocator = pipeline.plm.nash_rank_allocator
+        nash_diagnostics_path = args.adalora_diagnostics_path or os.path.join(
+            models_dir, file_prefix, 'nbs_rank_diagnostics.csv'
+        )
+        _initialize_nash_diagnostics(nash_diagnostics_path, append=args.resume)
+        initial_event = 'resume' if args.resume else 'initialization'
+        _append_nash_diagnostics(
+            nash_diagnostics_path,
+            allocator.snapshot_diagnostics(step=0, event=initial_event),
+        )
+        print('NBS rank diagnostics saved at', nash_diagnostics_path)
 
     if not args.freeze_plm:
         no_decay = ['bias', 'LayerNorm.weight']
@@ -205,7 +255,6 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 if args.rank != -1 and args.use_adalora:
                     # Read the accumulated, unclipped A/B gradients first so
                     # sensitivity matches the raw gradient-norm definition.
-                    allocator = pipeline.plm.nash_rank_allocator
                     allocator.update_sensitivity()
                 if args.rank != -1 and args.use_adalora:
                     # Clip once per effective batch, after sensitivity has been
@@ -219,12 +268,40 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     current_opt_step = opt_step + 1
                     if allocator.should_allocate(current_opt_step):
                         allocator.allocate(current_opt_step)
+                        _append_nash_diagnostics(
+                            nash_diagnostics_path, allocator.last_diagnostics
+                        )
                     else:
                         # During warm-up, between allocation intervals, and
                         # throughout cooldown, preserve the existing topology.
                         # This also prevents a final-step allocation directly
                         # before validation.
                         allocator.enforce_masks()
+                        if current_opt_step == allocator.warmup_steps:
+                            _append_nash_diagnostics(
+                                nash_diagnostics_path,
+                                allocator.snapshot_diagnostics(
+                                    current_opt_step, event='warmup_end'
+                                ),
+                            )
+                        if current_opt_step == allocator.cooldown_start_step:
+                            _append_nash_diagnostics(
+                                nash_diagnostics_path,
+                                allocator.snapshot_diagnostics(
+                                    current_opt_step, event='cooldown_start'
+                                ),
+                            )
+                    is_final_update = (
+                        epoch == args.epochs - 1 and
+                        step + 1 == len(dataloader_train)
+                    )
+                    if is_final_update:
+                        _append_nash_diagnostics(
+                            nash_diagnostics_path,
+                            allocator.snapshot_diagnostics(
+                                current_opt_step, event='training_end'
+                            ),
+                        )
                 optimizer.zero_grad()
                 opt_step += 1
 
@@ -609,6 +686,9 @@ if __name__ == '__main__':
                         help='JSON file mapping LoRA module names to min_rank/max_rank overrides.')
     parser.add_argument('--adalora-missing-grad-policy', choices=['zero', 'hold'], default='zero',
                         help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
+    parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
+                        help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
+                             'Defaults to the current training artifact directory.')
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
                                                                                                      'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\

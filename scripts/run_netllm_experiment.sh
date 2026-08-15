@@ -26,11 +26,13 @@ printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 if [[ "$VARIANT" == "nbs" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
+  NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
     --use-adalora
     --adalora-rank-config configs/adalora_rank_config_llama7b.json
     --adalora-rank-budget 2048
     --adalora-allocation-interval 10
+    --adalora-diagnostics-path "$NBS_DIAGNOSTICS"
   )
 else
   MODEL_TAG="llama_base_low_rank"
@@ -67,9 +69,9 @@ run_logged() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\n' \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$CHECKPOINT_INTERVAL" "$EVAL_PROGRESS_INTERVAL" \
-  "$BEST_MODEL" "$RESULT_CSV" > "$RUN_DIR/metadata.env"
+  "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" > "$RUN_DIR/metadata.env"
 
 TRAIN_CMD=(
   python run_plm.py
@@ -168,6 +170,7 @@ PLOT_CMD=(
 )
 if [[ "$VARIANT" == "nbs" ]]; then
   PLOT_CMD+=(--allocator-state "$BEST_MODEL/nash_rank_allocator.pt")
+  PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
 fi
 
 write_status "visualization" "running" 0

@@ -90,6 +90,23 @@ def check_initial_budget_and_schedule():
     for name, module in allocator.layers.items():
         active = int((module.lora_E["default"].detach().reshape(-1) != 0).sum())
         assert active == ranks[name], (name, active, ranks[name])
+    rows = allocator.snapshot_diagnostics(step=3, event="warmup_end")
+    assert len(rows) == 4
+    required = {
+        "optimizer_step", "phase", "event", "layer_name",
+        "transformer_layer_index", "module_type", "rank", "sensitivity",
+        "alpha", "spectral_energy_total", "utility",
+        "next_marginal_gain", "at_min_rank", "at_max_rank", "rank_delta",
+        "total_rank", "rank_budget",
+    }
+    assert required.issubset(rows[0]), rows[0].keys()
+    assert abs(sum(row["alpha"] for row in rows) - 1.0) < 1e-6
+    assert all(row["rank_delta"] == 0 for row in rows)
+    assert all(row["total_rank"] == 8 for row in rows)
+    allocator.allocate(step=4)
+    assert len(allocator.last_diagnostics) == 4
+    assert all(row["event"] == "allocation" for row in allocator.last_diagnostics)
+    assert all(row["total_rank"] == 8 for row in allocator.last_diagnostics)
     print("[PASS] full-budget uniform warm-up and fixed cooldown schedule")
 
 
