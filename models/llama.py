@@ -47,6 +47,14 @@ class LlamaNetworkingHeadModel(LlamaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # PEFT 0.6.x can expose fp32 adapter/embedding-facing tensors while
+        # the frozen Llama decoder remains fp16.  Anchor inputs_embeds to an
+        # unadapted base projection dtype before entering the decoder so q/k/v
+        # all receive the dtype expected by their frozen weights.
+        if inputs_embeds is not None:
+            base_dtype = self.model.layers[0].self_attn.k_proj.weight.dtype
+            inputs_embeds = inputs_embeds.to(base_dtype)
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,

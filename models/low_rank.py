@@ -91,8 +91,10 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
     """
     for param in plm.parameters():
         param.requires_grad = False
-        if param.ndim == 1:
-            param.data = param.data.to(torch.float32)
+        # Keep frozen normalization weights in the dtype selected by
+        # from_pretrained().  Upcasting every 1-D parameter to fp32 promotes
+        # LlamaRMSNorm outputs to fp32, which then breaks the following
+        # unadapted fp16 k/o projections outside autocast.
 
     plm.gradient_checkpointing_enable()
     plm.enable_input_require_grads()

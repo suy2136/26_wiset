@@ -147,10 +147,24 @@ def check_optional_real_adalora():
             self.v_proj = nn.Linear(d, d, bias=False)
             self.o_proj = nn.Linear(d, d, bias=False)
 
+    class TinyRMSNorm(nn.Module):
+        def __init__(self, d=8, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(d))
+            self.eps = eps
+
+        def forward(self, hidden_states):
+            input_dtype = hidden_states.dtype
+            values = hidden_states.float()
+            variance = values.pow(2).mean(-1, keepdim=True)
+            values = values * torch.rsqrt(variance + self.eps)
+            return self.weight * values.to(input_dtype)
+
     class TinyModel(nn.Module):
         def __init__(self, d=8):
             super().__init__()
             self.layers = nn.ModuleList([TinyAttn(d), TinyAttn(d)])
+            self.norm = TinyRMSNorm(d)
             self.head = nn.Linear(d, d, bias=False)
 
         def gradient_checkpointing_enable(self):
@@ -160,7 +174,7 @@ def check_optional_real_adalora():
             pass
 
         def forward(self, input_ids=None, **kwargs):
-            x = input_ids
+            x = self.norm(input_ids)
             for layer in self.layers:
                 x = layer.q_proj(x) + layer.k_proj(x) + layer.v_proj(x) + layer.o_proj(x)
             return self.head(x)
