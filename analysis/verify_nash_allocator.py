@@ -221,6 +221,69 @@ def check_optional_real_adalora():
     )
     print("[PASS] PEFT 0.6.2 fp16-base/fp32-AdaLoRA mixed-dtype forward/backward")
 
+    # Exercise the actual Llama decoder path beyond q/k/v: RMSNorm, rotary
+    # attention, o_proj, MLP, final norm, fp32 networking head, checkpointed
+    # backward, optimizer update, sensitivity, and Nash allocation.
+    from transformers import LlamaConfig
+    from models.llama import LlamaNetworkingHeadModel
+    from models.networking_head import NetworkingHead
+
+    llama_config = LlamaConfig(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        max_position_embeddings=32,
+        use_cache=False,
+    )
+    tiny_llama = LlamaNetworkingHeadModel(llama_config).half()
+    tiny_llama = peft_model(
+        tiny_llama, "llama", rank=2,
+        task_type=TaskType.FEATURE_EXTRACTION, use_adalora=True,
+        total_step=2, adalora_min_rank=1, adalora_rank_budget=4,
+        adalora_allocation_interval=1,
+    )
+    tiny_llama.set_networking_head(
+        NetworkingHead(input_dim=16, output_dim=3, fut_window=2).float()
+    )
+    tiny_optimizer = torch.optim.AdamW(
+        (parameter for parameter in tiny_llama.parameters() if parameter.requires_grad),
+        lr=1e-3,
+    )
+    llama_output = tiny_llama(
+        inputs_embeds=torch.randn(1, 4, 16, dtype=torch.float32, requires_grad=True),
+        attention_mask=torch.ones(1, 4, dtype=torch.long),
+        teacher_forcing=True,
+    )
+    assert llama_output.logits.dtype == torch.float32
+    llama_output.logits.pow(2).mean().backward()
+    tiny_allocator = tiny_llama.nash_rank_allocator
+    tiny_allocator.update_sensitivity()
+    tiny_optimizer.step()
+    tiny_allocator.allocate(step=1)
+    tiny_optimizer.zero_grad()
+    assert sum(tiny_allocator.active_rank_summary().values()) == 4
+    print("[PASS] tiny fp16 Llama decoder/head/backward/optimizer/Nash-allocation integration")
+
+    tiny_llama.eval()
+    with torch.no_grad():
+        cached_first = tiny_llama(
+            inputs_embeds=torch.randn(1, 3, 16, dtype=torch.float32),
+            attention_mask=torch.ones(1, 3, dtype=torch.long),
+            use_cache=True,
+        )
+        assert cached_first.past_key_values is not None
+        cached_next = tiny_llama(
+            inputs_embeds=torch.randn(1, 1, 16, dtype=torch.float32),
+            attention_mask=torch.ones(1, 4, dtype=torch.long),
+            past_key_values=cached_first.past_key_values,
+            use_cache=True,
+        )
+        assert cached_next.logits.dtype == torch.float32
+        assert cached_next.logits.shape == (1, 1, 3)
+    print("[PASS] tiny fp16 Llama autoregressive KV-cache validation path")
+
 
 def main():
     torch.manual_seed(0)
