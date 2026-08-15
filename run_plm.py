@@ -1,6 +1,7 @@
 import sys
 import argparse
 import copy
+import json
 import math
 import os
 import random
@@ -31,6 +32,9 @@ def save_model(args, model, save_dir):
         model.plm.save_pretrained(save_dir)
         # save other modules except plm
         torch.save(model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
+        allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        if allocator is not None:
+            torch.save(allocator.state_dict(), os.path.join(save_dir, 'nash_rank_allocator.pt'))
     else:
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
@@ -75,6 +79,10 @@ def load_model(args, model, model_dir):
         model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
         model.modules_except_plm.load_state_dict(torch.load(os.path.join(model_dir, 'modules_except_plm.bin')))
+        allocator_state_path = os.path.join(model_dir, 'nash_rank_allocator.pt')
+        allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        if allocator is not None and os.path.exists(allocator_state_path):
+            allocator.load_state_dict(torch.load(allocator_state_path, map_location='cpu'))
     else:
         # low rank matrices are disabled, load whole model
         model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
@@ -188,17 +196,35 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             tot_loss += loss.item()
             loss = loss / grad_accum_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
+            if not (args.rank != -1 and args.use_adalora):
+                # Preserve the existing non-AdaLoRA training behavior.
+                torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
 
             # perform gradient accumulation update
             if ((step + 1) % grad_accum_steps == 0) or (step + 1 == len(dataloader_train)):
+                if args.rank != -1 and args.use_adalora:
+                    # Read the accumulated, unclipped A/B gradients first so
+                    # sensitivity matches the raw gradient-norm definition.
+                    allocator = pipeline.plm.nash_rank_allocator
+                    interval = pipeline.plm.nash_rank_allocation_interval
+                    allocator.update_sensitivity()
+                if args.rank != -1 and args.use_adalora:
+                    # Clip once per effective batch, after sensitivity has been
+                    # measured and immediately before the optimizer update.
+                    torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
                 optimizer.step()
                 if args.rank != -1 and args.use_adalora:
-                    # AdaLoRA rank reallocation -- MUST run after optimizer.step() and
-                    # BEFORE zero_grad(), since importance scores are computed from the
-                    # parameter grads that zero_grad() would clear. Without this call,
-                    # AdaLoRA silently behaves like fixed-rank LoRA (no pruning).
-                    pipeline.plm.base_model.update_and_allocate(opt_step)
+                    # Allocation/mask enforcement happens after optimizer.step
+                    # and before zero_grad, while the next forward sees the
+                    # selected rank mask.
+                    is_final_update = (
+                        epoch == args.epochs - 1 and
+                        step + 1 == len(dataloader_train)
+                    )
+                    if (opt_step + 1) % interval == 0 or is_final_update:
+                        allocator.allocate(opt_step + 1)
+                    else:
+                        allocator.enforce_masks()
                 optimizer.zero_grad()
                 opt_step += 1
 
@@ -378,8 +404,24 @@ def run(args):
             print(f'[AdaLoRA] total optimizer steps = {total_step} '
                   f'(steps_per_epoch={steps_per_epoch}, epochs={args.epochs})')
 
+    adalora_rank_config = None
+    if args.adalora_rank_config is not None:
+        with open(args.adalora_rank_config, 'r', encoding='utf-8') as handle:
+            adalora_rank_config = json.load(handle)
+
     if args.rank != -1:
-        plm = peft_model(plm, args.plm_type, args.rank, use_adalora=args.use_adalora, total_step=total_step)
+        plm = peft_model(
+            plm, args.plm_type, args.rank,
+            use_adalora=args.use_adalora,
+            total_step=total_step,
+            adalora_min_rank=args.adalora_min_rank,
+            adalora_ema_beta=args.adalora_ema_beta,
+            adalora_eps=args.adalora_eps,
+            adalora_allocation_interval=args.adalora_allocation_interval,
+            adalora_rank_budget=args.adalora_rank_budget,
+            adalora_rank_config=adalora_rank_config,
+            adalora_missing_grad_policy=args.adalora_missing_grad_policy,
+        )
 
     # set up networking head
     input_dim = plm.hidden_size
@@ -540,8 +582,22 @@ if __name__ == '__main__':
     parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
-                              'Only has an effect when --rank != -1. Starts at init_r=rank*2 and '
-                              'prunes down to target_r=rank over training.')
+                              'Only has an effect when --rank != -1. Uses gradient/spectral '
+                              'Nash rank allocation over init_r=rank*2 slots.')
+    parser.add_argument('--adalora-min-rank', type=int, default=None,
+                        help='Minimum rank per LoRA layer for Nash allocation (default: rank//2).')
+    parser.add_argument('--adalora-ema-beta', type=float, default=0.9,
+                        help='EMA coefficient for layer gradient sensitivity.')
+    parser.add_argument('--adalora-eps', type=float, default=1e-8,
+                        help='Epsilon used by normalized utility and Nash gain.')
+    parser.add_argument('--adalora-allocation-interval', type=int, default=10,
+                        help='Optimizer-step interval between custom rank allocations.')
+    parser.add_argument('--adalora-rank-budget', type=int, default=None,
+                        help='Global active rank budget R (default: target rank multiplied by layer count).')
+    parser.add_argument('--adalora-rank-config', type=str, default=None,
+                        help='JSON file mapping LoRA module names to min_rank/max_rank overrides.')
+    parser.add_argument('--adalora-missing-grad-policy', choices=['zero', 'hold'], default='zero',
+                        help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
                                                                                                      'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\

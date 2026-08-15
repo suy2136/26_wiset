@@ -2,6 +2,8 @@ from peft import LoraConfig, AdaLoraConfig, get_peft_model, TaskType
 import torch
 import torch.nn as nn
 
+from models.rank_allocator import NashRankAllocator
+
 
 TARGET_MODULES = {
     'llama': ["q_proj", "v_proj"],
@@ -26,14 +28,16 @@ def print_trainable_parameters(model):
 
 
 def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
-                use_adalora=False, total_step=None):
+                use_adalora=False, total_step=None, adalora_min_rank=None,
+                adalora_ema_beta=0.9, adalora_eps=1e-8,
+                adalora_allocation_interval=10, adalora_rank_budget=None,
+                adalora_rank_config=None, adalora_missing_grad_policy="zero"):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Starts at init_r=rank*2 and prunes the rank budget down to target_r=rank
-        over training (see docs on the AdaLoRA integration for the exact schedule
-        and the required `model.base_model.update_and_allocate(step)` call the
-        training loop must make after every optimizer.step() and before
-        zero_grad() -- without it, AdaLoRA silently behaves like fixed-rank LoRA).
+        over training.  When use_adalora=True, the training loop calls the
+        project's NashRankAllocator after optimizer.step() and before
+        zero_grad(), using lora_A/lora_B gradients and lora_E energy.
     :param total_step: required when use_adalora=True. Total number of OPTIMIZER
         update steps (post grad-accumulation) over the whole run, used to derive
         the rank-pruning warmup/cooldown schedule.
@@ -81,6 +85,23 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         )
 
     model = get_peft_model(plm, config)
+    if use_adalora:
+        if adalora_allocation_interval <= 0:
+            raise ValueError("adalora_allocation_interval must be positive")
+        # The custom allocator keeps PEFT's physical init_r slots and applies
+        # rank selection through lora_E masks, so adapter checkpoint format and
+        # the existing AdaLoRA forward path remain unchanged.
+        model.nash_rank_allocator = NashRankAllocator(
+            model,
+            target_rank=rank,
+            min_rank=adalora_min_rank,
+            ema_beta=adalora_ema_beta,
+            eps=adalora_eps,
+            rank_budget=adalora_rank_budget,
+            rank_config=adalora_rank_config,
+            missing_grad_policy=adalora_missing_grad_policy,
+        )
+        model.nash_rank_allocation_interval = int(adalora_allocation_interval)
     model.from_pretrained
     print_trainable_parameters(model)
     return model
