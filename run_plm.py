@@ -280,6 +280,10 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                   f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
     result_path = os.path.join(results_dir, file_prefix + '_results.csv')
+    partial_result_path = os.path.join(results_dir, file_prefix + '_partial_results.csv')
+    progress_interval = getattr(args, 'save_test_progress_per_steps', None)
+    if progress_interval is not None and progress_interval <= 0:
+        raise ValueError('--save-test-progress-per-steps must be positive')
     notebook = ResultNotebook()
 
     model_path = args.model_path if args.model_path is not None else best_model_path
@@ -299,7 +303,7 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     # but a real correctness issue for anyone using --adapt --test together.
     pipeline.eval()
     with torch.no_grad():
-        for history, future, video_user_info in dataloader_test:
+        for test_step, (history, future, video_user_info) in enumerate(dataloader_test, start=1):
             history, future = history.to(args.device), future.to(args.device)
             history = normalize_data(history, args.train_dataset)
             pred, gt = pipeline.inference(history, future, video_user_info)
@@ -310,9 +314,13 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             timesteps.append(int(video_user_info[2]))
             videos, users, timesteps = torch.IntTensor(videos), torch.IntTensor(users), torch.IntTensor(timesteps)
             notebook.record(pred, gt, videos, users, timesteps)
+            if progress_interval is not None and test_step % progress_interval == 0:
+                notebook.write(partial_result_path, write_predictions=False)
+                print(f'Partial evaluation results saved after {test_step} batches at {partial_result_path}')
         notebook.write(result_path)
         print("show detail result:")
-        notebook.write_detail(result_path)
+        detail_result_path = result_path.replace('_results.csv', '_per_sample_results.csv')
+        notebook.write_detail(detail_result_path)
 
 
 def run(args):
@@ -579,6 +587,9 @@ if __name__ == '__main__':
                              'from clamp-repeated tail frames.')
     parser.add_argument('--save-checkpoint-per-epoch', action="store", dest='save_checkpoint_per_epoch', help='save checkpoint per epoch', type=int)
     parser.add_argument('--save-checkpoint-per-step', action="store", dest='save_checkpoint_per_step', help='save checkpoint per step', type=int)
+    parser.add_argument('--save-test-progress-per-steps', type=int, default=None,
+                        help='Write a partial evaluation summary CSV every N test batches. '
+                             'Useful for preserving progress if a long evaluation is interrupted.')
     parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '

@@ -11,6 +11,9 @@ data/images/
 data/data/
 data/ft_plms/
 data/models/
+data/results/
+data/experiment_runs/
+data/viewports/
 
 # Original archives / provisioning zips
 *.zip

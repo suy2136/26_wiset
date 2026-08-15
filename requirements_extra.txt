@@ -3,3 +3,4 @@
 # transformers==4.34.1, peft==0.6.2).
 torchvision
 opencv-python
+matplotlib==3.7.5

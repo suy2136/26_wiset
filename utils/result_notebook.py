@@ -1,4 +1,5 @@
 import csv
+import os
 import numpy as np
 from collections import defaultdict
 from prettytable import PrettyTable
@@ -40,7 +41,7 @@ class ResultNotebook:
             video, user, timestep = videos[i], users[i], timesteps[i]
             self.prediction_record[video, user].append(self.prediction_note(timestep, prediction[i], ground_truth[i]))
 
-    def write(self, result_path):
+    def write(self, result_path, write_predictions=True):
         header = ['video', 'user', 'mae', 'rmse', ]
     
         def write_row(writer, pt, video, user, pred, gt):
@@ -81,23 +82,25 @@ class ResultNotebook:
             print('Results saved at', result_path)
             file.close()
         
-        details_path = result_path.replace('result_', 'details_')
-        with open(details_path, 'w') as file:
-            for i in range(len(total_pred)):
-                pred_line = 'pred: '
-                for j in range(len(total_pred[i, 0])):
-                    pred_line += f'axis {j + 1}: '
-                    pred_line += ', '.join(map(str, total_pred[i, :, j]))
-                    pred_line = pred_line[:-1] +'. '
-                file.write(pred_line + '\n')
-                gt_line = 'gt: '
-                for j in range(len(total_gt[i, 0])):
-                    gt_line += f'axis {j + 1}: '
-                    gt_line += ', '.join(map(str, total_gt[i, :, j]))
-                    gt_line = gt_line[:-1] +'. '
-                file.write(gt_line + '\n')
-            print('Detail results saved at', details_path)
-            file.close()
+        if write_predictions:
+            stem, _ = os.path.splitext(result_path)
+            details_path = stem.replace('_results', '_predictions') + '.txt'
+            with open(details_path, 'w') as file:
+                for i in range(len(total_pred)):
+                    pred_line = 'pred: '
+                    for j in range(len(total_pred[i, 0])):
+                        pred_line += f'axis {j + 1}: '
+                        pred_line += ', '.join(map(str, total_pred[i, :, j]))
+                        pred_line = pred_line[:-1] +'. '
+                    file.write(pred_line + '\n')
+                    gt_line = 'gt: '
+                    for j in range(len(total_gt[i, 0])):
+                        gt_line += f'axis {j + 1}: '
+                        gt_line += ', '.join(map(str, total_gt[i, :, j]))
+                        gt_line = gt_line[:-1] +'. '
+                    file.write(gt_line + '\n')
+                print('Detail results saved at', details_path)
+                file.close()
 
     def write_detail(self, result_path):
         header = ['video', 'user', 'mae', 'rmse', ]

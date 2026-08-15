@@ -1,0 +1,201 @@
+"""Create a durable summary and plot for one NetLLM experiment."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+TRAIN_RE = re.compile(
+    r"Epoch\s+(?P<epoch>\d+),\s*global_step\s+(?P<step>\d+),\s*average loss:\s*"
+    r"(?P<loss>[-+0-9.eE]+)"
+)
+VALID_RE = re.compile(r"Valid loss\s+(?P<loss>[-+0-9.eE]+)")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", choices=("nbs", "plain"), required=True)
+    parser.add_argument("--train-log", type=Path, required=True)
+    parser.add_argument("--result-csv", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--allocator-state", type=Path)
+    return parser.parse_args()
+
+
+def parse_train_log(path: Path) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    train_curve = [
+        {
+            "epoch": int(match.group("epoch")),
+            "step": int(match.group("step")),
+            "loss": float(match.group("loss")),
+        }
+        for match in TRAIN_RE.finditer(text)
+    ]
+    valid_curve = [
+        {"index": index + 1, "loss": float(match.group("loss"))}
+        for index, match in enumerate(VALID_RE.finditer(text))
+    ]
+    return train_curve, valid_curve
+
+
+def read_results(path: Path) -> tuple[dict[str, float], list[dict[str, float]]]:
+    aggregate = None
+    per_pair: list[dict[str, float]] = []
+    with path.open(newline="", encoding="utf-8-sig") as handle:
+        for row in csv.DictReader(handle):
+            parsed = {
+                "video": int(float(row["video"])),
+                "user": int(float(row["user"])),
+                "mae": float(row["mae"]),
+                "rmse": float(row["rmse"]),
+            }
+            if parsed["video"] == -1 and parsed["user"] == -1:
+                aggregate = {"mae": parsed["mae"], "rmse": parsed["rmse"]}
+            else:
+                per_pair.append(parsed)
+    if aggregate is None:
+        finite = [row for row in per_pair if math.isfinite(row["mae"]) and math.isfinite(row["rmse"])]
+        if not finite:
+            raise ValueError(f"No finite evaluation metrics found in {path}")
+        aggregate = {
+            "mae": sum(row["mae"] for row in finite) / len(finite),
+            "rmse": sum(row["rmse"] for row in finite) / len(finite),
+        }
+    return aggregate, per_pair
+
+
+def read_allocator_state(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    import torch
+
+    state = torch.load(path, map_location="cpu")
+    ranks = state.get("ranks") or state.get("current_ranks") or state.get("rank_pattern") or {}
+    values = [int(value) for value in ranks.values()]
+    if not values:
+        return {"path": str(path), "layer_count": 0, "ranks": {}}
+    histogram: dict[str, int] = {}
+    for rank in values:
+        histogram[str(rank)] = histogram.get(str(rank), 0) + 1
+    return {
+        "path": str(path),
+        "layer_count": len(values),
+        "total_rank": sum(values),
+        "minimum_rank": min(values),
+        "maximum_rank": max(values),
+        "mean_rank": sum(values) / len(values),
+        "histogram": histogram,
+        "ranks": {str(key): int(value) for key, value in ranks.items()},
+    }
+
+
+def finite_losses(curve: list[dict[str, float]]) -> list[dict[str, float]]:
+    return [point for point in curve if math.isfinite(point["loss"])]
+
+
+def main() -> None:
+    args = parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    train_curve, valid_curve = parse_train_log(args.train_log)
+    aggregate, per_pair = read_results(args.result_csv)
+    allocator = read_allocator_state(args.allocator_state)
+    train_finite = finite_losses(train_curve)
+    valid_finite = finite_losses(valid_curve)
+    display_name = "NBS-NetLLM" if args.variant == "nbs" else "NetLLM"
+
+    summary = {
+        "variant": args.variant,
+        "display_name": display_name,
+        "aggregate_mae": aggregate["mae"],
+        "aggregate_rmse": aggregate["rmse"],
+        "evaluated_pair_count": len(per_pair),
+        "final_reported_train_loss": train_finite[-1]["loss"] if train_finite else None,
+        "best_reported_valid_loss": min((point["loss"] for point in valid_finite), default=None),
+        "train_curve": train_curve,
+        "valid_curve": valid_curve,
+        "allocator": allocator,
+        "source_files": {"train_log": str(args.train_log), "result_csv": str(args.result_csv)},
+    }
+    summary_path = args.output_dir / "summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    fig.suptitle(f"{display_name} training and evaluation")
+    if train_finite:
+        axes[0, 0].plot(
+            [point["step"] for point in train_finite],
+            [point["loss"] for point in train_finite],
+            marker="o",
+        )
+    else:
+        axes[0, 0].text(0.5, 0.5, "No reported training-loss points", ha="center", va="center")
+    axes[0, 0].set(title="Reported training loss", xlabel="Global step", ylabel="Loss")
+    axes[0, 0].grid(alpha=0.25)
+
+    if valid_finite:
+        axes[0, 1].plot(
+            [point["index"] for point in valid_finite],
+            [point["loss"] for point in valid_finite],
+            marker="o",
+            color="#d95f02",
+        )
+    else:
+        axes[0, 1].text(0.5, 0.5, "No validation-loss points", ha="center", va="center")
+    axes[0, 1].set(title="Validation loss", xlabel="Validation event", ylabel="Loss")
+    axes[0, 1].grid(alpha=0.25)
+
+    axes[1, 0].bar(
+        ["MAE", "RMSE"],
+        [aggregate["mae"], aggregate["rmse"]],
+        color=["#1b9e77", "#7570b3"],
+    )
+    axes[1, 0].set_title("Aggregate metrics (lower is better)")
+    axes[1, 0].grid(axis="y", alpha=0.25)
+
+    finite_mae = [row["mae"] for row in per_pair if math.isfinite(row["mae"])]
+    if finite_mae:
+        bins = min(20, max(5, int(math.sqrt(len(finite_mae)))))
+        axes[0, 2].hist(finite_mae, bins=bins, color="#66a61e", alpha=0.85)
+        axes[0, 2].set(title="Per video-user MAE", xlabel="MAE", ylabel="Count")
+    else:
+        axes[0, 2].text(0.5, 0.5, "No per-pair metrics", ha="center", va="center")
+        axes[0, 2].set_title("Per-pair metrics")
+
+    finite_rmse = [row["rmse"] for row in per_pair if math.isfinite(row["rmse"])]
+    if finite_rmse:
+        bins = min(20, max(5, int(math.sqrt(len(finite_rmse)))))
+        axes[1, 1].hist(finite_rmse, bins=bins, color="#e6ab02", alpha=0.85)
+        axes[1, 1].set(title="Per video-user RMSE", xlabel="RMSE", ylabel="Count")
+    else:
+        axes[1, 1].text(0.5, 0.5, "No per-pair metrics", ha="center", va="center")
+        axes[1, 1].set_title("Per-pair metrics")
+
+    if allocator and allocator.get("histogram"):
+        rank_items = sorted((int(rank), count) for rank, count in allocator["histogram"].items())
+        axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
+        axes[1, 2].set(title="NBS allocated ranks", xlabel="Rank", ylabel="Layers")
+    else:
+        axes[1, 2].text(0.5, 0.5, "Uniform rank = 32", ha="center", va="center")
+        axes[1, 2].set_title("LoRA rank allocation")
+
+    figure_path = args.output_dir / f"{args.variant}_training_evaluation.png"
+    fig.savefig(figure_path, dpi=180)
+    plt.close(fig)
+    print(f"Summary saved at {summary_path}")
+    print(f"Figure saved at {figure_path}")
+
+
+if __name__ == "__main__":
+    main()
