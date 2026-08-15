@@ -221,7 +221,19 @@ class Pipeline(nn.Module):
         for module in self.plm.modules():
             if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
                 continue
-            weight = getattr(module, "weight", None)
+            # PEFT 0.6.x may expose a proxy ``module.weight`` whose dtype is
+            # not the dtype used by the underlying frozen Linear.  Resolve
+            # the actual base layer first; this is the weight consumed by
+            # AdaLoRA's ``_linear`` implementation.
+            base_layer = None
+            get_base_layer = getattr(module, "get_base_layer", None)
+            if callable(get_base_layer):
+                base_layer = get_base_layer()
+            if base_layer is None:
+                base_layer = getattr(module, "base_layer", None)
+            weight = getattr(base_layer, "weight", None)
+            if weight is None:
+                weight = getattr(module, "weight", None)
             if isinstance(weight, torch.Tensor) and weight.is_floating_point():
                 return weight.dtype
 
