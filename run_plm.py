@@ -221,7 +221,13 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                         epoch == args.epochs - 1 and
                         step + 1 == len(dataloader_train)
                     )
-                    if (opt_step + 1) % interval == 0 or is_final_update:
+                    if is_final_update:
+                        # Do not change the rank topology immediately before
+                        # the final validation.  Keep the most recently
+                        # trained allocation and only re-zero inactive E
+                        # components that optimizer.step() may have updated.
+                        allocator.enforce_masks()
+                    elif (opt_step + 1) % interval == 0:
                         allocator.allocate(opt_step + 1)
                     else:
                         allocator.enforce_masks()
