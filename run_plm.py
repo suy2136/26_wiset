@@ -29,7 +29,8 @@ NASH_DIAGNOSTIC_FIELDS = [
     'transformer_layer_index', 'module_type', 'rank', 'sensitivity',
     'alpha', 'spectral_energy_total', 'utility', 'next_marginal_gain',
     'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
-    'total_rank', 'rank_budget',
+    'total_rank', 'rank_budget', 'validation_event', 'validation_loss',
+    'validation_position_kind', 'validation_position', 'is_best_validation',
 ]
 
 
@@ -37,6 +38,26 @@ def _initialize_nash_diagnostics(path, append=False):
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
+    if append and os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, newline='', encoding='utf-8') as handle:
+            reader = csv.DictReader(handle)
+            existing_fields = reader.fieldnames or []
+            if existing_fields == NASH_DIAGNOSTIC_FIELDS:
+                return
+            if not set(existing_fields).issubset(NASH_DIAGNOSTIC_FIELDS):
+                raise ValueError(
+                    f'Unsupported NBS diagnostics schema in {path}: {existing_fields}'
+                )
+            existing_rows = list(reader)
+        migrated_path = path + '.schema_upgrade'
+        with open(migrated_path, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=NASH_DIAGNOSTIC_FIELDS)
+            writer.writeheader()
+            writer.writerows(existing_rows)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(migrated_path, path)
+        return
     mode = 'a' if append and os.path.exists(path) else 'w'
     with open(path, mode, newline='', encoding='utf-8') as handle:
         if mode == 'w' or handle.tell() == 0:
@@ -56,6 +77,19 @@ def _append_nash_diagnostics(path, rows):
         writer.writerows(rows)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _last_validation_event(path):
+    """Return the last durable validation index, including after resume."""
+    if path is None or not os.path.exists(path):
+        return 0
+    last_event = 0
+    with open(path, newline='', encoding='utf-8') as handle:
+        for row in csv.DictReader(handle):
+            value = row.get('validation_event')
+            if value:
+                last_event = max(last_event, int(value))
+    return last_event
 
 
 def save_model(args, model, save_dir):
@@ -142,12 +176,14 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
     allocator = None
     nash_diagnostics_path = None
+    validation_event_count = 0
     if args.rank != -1 and args.use_adalora:
         allocator = pipeline.plm.nash_rank_allocator
         nash_diagnostics_path = args.adalora_diagnostics_path or os.path.join(
             models_dir, file_prefix, 'nbs_rank_diagnostics.csv'
         )
         _initialize_nash_diagnostics(nash_diagnostics_path, append=args.resume)
+        validation_event_count = _last_validation_event(nash_diagnostics_path)
         initial_event = 'resume' if args.resume else 'initialization'
         _append_nash_diagnostics(
             nash_diagnostics_path,
@@ -230,6 +266,8 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
     def process_validation(valid_loss, position_kind, position):
         nonlocal best_loss, best_epoch, best_step, non_improving_validations
+        nonlocal validation_event_count
+        validation_event_count += 1
         improved = valid_loss < best_loss - args.early_stopping_min_delta
         if improved:
             best_loss = valid_loss
@@ -245,6 +283,21 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             )
         else:
             non_improving_validations += 1
+
+        if allocator is not None:
+            validation_rows = allocator.snapshot_diagnostics(
+                opt_step,
+                event='best_validation' if improved else 'validation',
+            )
+            for row in validation_rows:
+                row.update({
+                    'validation_event': validation_event_count,
+                    'validation_loss': float(valid_loss),
+                    'validation_position_kind': position_kind,
+                    'validation_position': position,
+                    'is_best_validation': int(improved),
+                })
+            _append_nash_diagnostics(nash_diagnostics_path, validation_rows)
 
         best_position = best_step if position_kind == 'step' else best_epoch
         print(
