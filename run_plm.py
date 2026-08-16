@@ -30,6 +30,7 @@ NASH_DIAGNOSTIC_FIELDS = [
     'alpha', 'spectral_energy_total', 'utility', 'next_marginal_gain',
     'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
     'total_rank', 'rank_budget', 'validation_event', 'validation_loss',
+    'teacher_forcing_validation_loss',
     'validation_position_kind', 'validation_position', 'is_best_validation',
 ]
 
@@ -215,6 +216,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             {'params': pipeline.conv1d.parameters(), 'weight_decay': args.weight_decay, 'lr': multimodal_lr},
         ]
         optimizer = AdamW(optimizer_grouped_parameters)
+
     else:
         # tune everything except the plm itself: pipeline.modules_except_plm is exactly
         # embed_vp, embed_multimodal, embed_ln, conv1d, and plm.networking_head. All of
@@ -226,6 +228,15 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             {'params': pipeline.modules_except_plm.parameters(), 'weight_decay': args.weight_decay, 'lr': args.lr},
         ]
         optimizer = AdamW(optimizer_grouped_parameters)
+
+    # Clip exactly the parameters updated by the optimizer. This includes the
+    # LoRA adapter and the trainable NetLLM heads/embeddings, not just the PLM.
+    gradient_clip_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group['params']
+        if parameter.requires_grad
+    ]
 
     assert args.epochs_per_valid is None or args.steps_per_valid is None, "You can only specify args.epochs_per_valid or args.steps_per_valid."
 
@@ -247,14 +258,22 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
         pipeline.eval()
         with torch.no_grad():
             ps_history_start = len(pipeline.patch_selection_history) if args.multimodal_mode == 'patch-selection' else None
-            valid_loss = []
+            autoregressive_losses = []
+            teacher_forcing_losses = []
             for history, future, video_user_info in dataloader_valid:
                 history, future = history.to(args.device), future.to(args.device)
                 history = normalize_data(history, args.train_dataset)
                 future = normalize_data(future, args.train_dataset)
-                loss = pipeline(history, future, video_user_info, teacher_forcing=False)
-                valid_loss.append(loss.item())
-            valid_loss = sum(valid_loss) / len(valid_loss)
+                autoregressive_loss = pipeline(
+                    history, future, video_user_info, teacher_forcing=False
+                )
+                teacher_forcing_loss = pipeline(
+                    history, future, video_user_info, teacher_forcing=True
+                )
+                autoregressive_losses.append(autoregressive_loss.item())
+                teacher_forcing_losses.append(teacher_forcing_loss.item())
+            autoregressive_loss = sum(autoregressive_losses) / len(autoregressive_losses)
+            teacher_forcing_loss = sum(teacher_forcing_losses) / len(teacher_forcing_losses)
             if ps_history_start is not None:
                 counts = pipeline.patch_selection_history[ps_history_start:]
                 if counts:
@@ -262,9 +281,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     print(f'[patch-selection] valid selected-patch avg={sum(counts)/len(counts):.2f} '
                           f'min={min(counts)} max={max(counts)}')
             pipeline.train()
-            return valid_loss
+            return autoregressive_loss, teacher_forcing_loss
 
-    def process_validation(valid_loss, position_kind, position):
+    def process_validation(valid_loss, teacher_forcing_valid_loss, position_kind, position):
         nonlocal best_loss, best_epoch, best_step, non_improving_validations
         nonlocal validation_event_count
         validation_event_count += 1
@@ -293,6 +312,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 row.update({
                     'validation_event': validation_event_count,
                     'validation_loss': float(valid_loss),
+                    'teacher_forcing_validation_loss': float(teacher_forcing_valid_loss),
                     'validation_position_kind': position_kind,
                     'validation_position': position,
                     'is_best_validation': int(improved),
@@ -300,6 +320,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             _append_nash_diagnostics(nash_diagnostics_path, validation_rows)
 
         best_position = best_step if position_kind == 'step' else best_epoch
+        print('Teacher-forcing validation loss', teacher_forcing_valid_loss)
         print(
             'Valid loss', valid_loss, '-', 'Best loss', best_loss,
             'at', position_kind, best_position,
@@ -346,9 +367,6 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             tot_loss += loss.item()
             loss = loss / grad_accum_steps
             loss.backward()
-            if not (args.rank != -1 and args.use_adalora):
-                # Preserve the existing non-AdaLoRA training behavior.
-                torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
 
             # perform gradient accumulation update
             if ((step + 1) % grad_accum_steps == 0) or (step + 1 == len(dataloader_train)):
@@ -356,10 +374,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     # Read the accumulated, unclipped A/B gradients first so
                     # sensitivity matches the raw gradient-norm definition.
                     allocator.update_sensitivity()
-                if args.rank != -1 and args.use_adalora:
-                    # Clip once per effective batch, after sensitivity has been
-                    # measured and immediately before the optimizer update.
-                    torch.nn.utils.clip_grad_norm_(pipeline.plm.parameters(), 1.0)
+                # Clip once per effective batch, after NBS has measured the raw
+                # accumulated A/B gradients and immediately before optimizer.step().
+                torch.nn.utils.clip_grad_norm_(gradient_clip_parameters, 1.0)
                 optimizer.step()
                 if args.rank != -1 and args.use_adalora:
                     # Allocation/mask enforcement happens after optimizer.step
@@ -417,8 +434,10 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             
             # validation by steps
             if args.steps_per_valid is not None and global_step % args.steps_per_valid == 0:
-                valid_loss = validate()
-                stop_training = process_validation(valid_loss, 'step', global_step)
+                valid_loss, teacher_forcing_valid_loss = validate()
+                stop_training = process_validation(
+                    valid_loss, teacher_forcing_valid_loss, 'step', global_step
+                )
                 if stop_training:
                     break
             
@@ -435,8 +454,10 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
         # validation by epochs
         if args.epochs_per_valid is not None and epoch % args.epochs_per_valid == 0:
-            valid_loss = validate()
-            stop_training = process_validation(valid_loss, 'epoch', epoch)
+            valid_loss, teacher_forcing_valid_loss = validate()
+            stop_training = process_validation(
+                valid_loss, teacher_forcing_valid_loss, 'epoch', epoch
+            )
             if stop_training:
                 break
         

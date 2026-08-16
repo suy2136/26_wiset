@@ -9,6 +9,7 @@ from config import cfg
 from dataset.extract_features import extract_vit_features
 from models.patch_selection import PatchSelectionModule, crop_patches, crop_patches_at, vit_features_for_patches
 from utils.frame_utils import FrameIndexClamper
+from utils.losses import CircularViewportMSELoss
 
 MULTIMODAL_MODES = ('none', 'baseline', 'all-patch', 'patch-selection')
 
@@ -121,7 +122,7 @@ class Pipeline(nn.Module):
                 grid_rows=self.grid_rows, grid_cols=self.grid_cols).to(device)
 
         if loss_func is None:
-            loss_func = nn.MSELoss()
+            loss_func = CircularViewportMSELoss()
         self.loss_fct = loss_func
         self.fut_window = fut_window
     

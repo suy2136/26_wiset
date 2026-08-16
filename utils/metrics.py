@@ -28,10 +28,10 @@ def compute_each_mse(data1, data2, rotation=False):
 
 
 def compute_rmse(data1, data2, rotation=False):
-    rmse = np.sqrt(compute_mse(data1, data2))
+    rmse = np.sqrt(compute_mse(data1, data2, rotation=rotation))
     return rmse
 
 def compute_each_rmse(data1, data2, rotation=False):
-    rmse = np.sqrt(compute_each_mse(data1, data2))
+    rmse = np.sqrt(compute_each_mse(data1, data2, rotation=rotation))
     return rmse
 

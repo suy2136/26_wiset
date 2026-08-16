@@ -21,6 +21,9 @@ TRAIN_RE = re.compile(
     r"(?P<loss>[-+0-9.eE]+)"
 )
 VALID_RE = re.compile(r"Valid loss\s+(?P<loss>[-+0-9.eE]+)")
+TEACHER_FORCING_VALID_RE = re.compile(
+    r"Teacher-forcing validation loss\s+(?P<loss>[-+0-9.eE]+)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +42,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_train_log(path: Path) -> tuple[list[dict[str, float]], list[dict[str, float]]]:
+def parse_train_log(
+    path: Path,
+) -> tuple[
+    list[dict[str, float]],
+    list[dict[str, float]],
+    list[dict[str, float]],
+]:
     text = path.read_text(encoding="utf-8", errors="replace")
     train_curve = [
         {
@@ -53,7 +62,11 @@ def parse_train_log(path: Path) -> tuple[list[dict[str, float]], list[dict[str, 
         {"index": index + 1, "loss": float(match.group("loss"))}
         for index, match in enumerate(VALID_RE.finditer(text))
     ]
-    return train_curve, valid_curve
+    teacher_forcing_valid_curve = [
+        {"index": index + 1, "loss": float(match.group("loss"))}
+        for index, match in enumerate(TEACHER_FORCING_VALID_RE.finditer(text))
+    ]
+    return train_curve, valid_curve, teacher_forcing_valid_curve
 
 
 def read_results(path: Path) -> tuple[dict[str, float], list[dict[str, float]]]:
@@ -176,12 +189,13 @@ def finite_losses(curve: list[dict[str, float]]) -> list[dict[str, float]]:
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    train_curve, valid_curve = parse_train_log(args.train_log)
+    train_curve, valid_curve, teacher_forcing_valid_curve = parse_train_log(args.train_log)
     aggregate, per_pair = read_results(args.result_csv)
     allocator = read_allocator_state(args.allocator_state)
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
     train_finite = finite_losses(train_curve)
     valid_finite = finite_losses(valid_curve)
+    teacher_forcing_valid_finite = finite_losses(teacher_forcing_valid_curve)
     display_names = {
         "nbs": "NBS-NetLLM",
         "nbs_v2": "NBS-NetLLM v2",
@@ -203,8 +217,12 @@ def main() -> None:
         "evaluated_pair_count": len(per_pair),
         "final_reported_train_loss": train_finite[-1]["loss"] if train_finite else None,
         "best_reported_valid_loss": min((point["loss"] for point in valid_finite), default=None),
+        "best_reported_teacher_forcing_valid_loss": min(
+            (point["loss"] for point in teacher_forcing_valid_finite), default=None
+        ),
         "train_curve": train_curve,
         "valid_curve": valid_curve,
+        "teacher_forcing_valid_curve": teacher_forcing_valid_curve,
         "allocator": allocator,
         "allocator_diagnostics": {
             "path": str(args.allocator_diagnostics) if args.allocator_diagnostics else None,
@@ -244,7 +262,18 @@ def main() -> None:
             [point["loss"] for point in valid_finite],
             marker="o",
             color="#d95f02",
+            label="Autoregressive",
         )
+    if teacher_forcing_valid_finite:
+        axes[0, 1].plot(
+            [point["index"] for point in teacher_forcing_valid_finite],
+            [point["loss"] for point in teacher_forcing_valid_finite],
+            marker="o",
+            color="#1b9e77",
+            label="Teacher forcing",
+        )
+    if valid_finite or teacher_forcing_valid_finite:
+        axes[0, 1].legend()
     else:
         axes[0, 1].text(0.5, 0.5, "No validation-loss points", ha="center", va="center")
     axes[0, 1].set(title="Validation loss", xlabel="Validation event", ylabel="Loss")
