@@ -5,8 +5,10 @@ set -o pipefail
 VARIANT="${1:-}"
 if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v3" && "$VARIANT" != "nbs_v4" && \
-      "$VARIANT" != "nbs_v5" && "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|plain}"
+      "$VARIANT" != "nbs_v5" && "$VARIANT" != "nbs_v6" && \
+      "$VARIANT" != "nbs_v7" && "$VARIANT" != "nbs_v8" && \
+      "$VARIANT" != "plain" ]]; then
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|plain}"
   exit 2
 fi
 
@@ -28,7 +30,9 @@ printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 
 SCHEDULED_SAMPLING="False"
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
-      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || "$VARIANT" == "nbs_v5" ]]; then
+      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
+      "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
+      "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
@@ -72,6 +76,42 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
       --scheduled-sampling
       --mix-rate "$MIX_RATE"
+    )
+  elif [[ "$VARIANT" == "nbs_v6" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v6"
+    DISPLAY_NAME="NBS-NetLLM v6 (min4-max32-budget1024)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=1024
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v6
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v7" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v7"
+    DISPLAY_NAME="NBS-NetLLM v7 (min8-max32-budget1024)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min8_max32.json"
+    RANK_BUDGET=1024
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v7
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v8" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v8"
+    DISPLAY_NAME="NBS-NetLLM v8 (min8-max32-budget1280)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min8_max32.json"
+    RANK_BUDGET=1280
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v8
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
@@ -220,7 +260,9 @@ PLOT_CMD=(
   --output-dir "$RUN_DIR/figures"
 )
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
-      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || "$VARIANT" == "nbs_v5" ]]; then
+      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
+      "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
+      "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" ]]; then
   PLOT_CMD+=(--allocator-state "$BEST_MODEL/nash_rank_allocator.pt")
   PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
 fi

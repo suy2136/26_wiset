@@ -795,7 +795,10 @@ if __name__ == '__main__':
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
-    parser.add_argument('--experiment-tag', choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5'], default=None,
+    parser.add_argument('--experiment-tag',
+                        choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
+                                 'nbs_v6', 'nbs_v7', 'nbs_v8'],
+                        default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
