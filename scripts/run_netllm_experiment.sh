@@ -4,17 +4,19 @@ set -o pipefail
 
 VARIANT="${1:-}"
 if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
-      "$VARIANT" != "nbs_v3" && "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|plain}"
+      "$VARIANT" != "nbs_v3" && "$VARIANT" != "nbs_v4" && \
+      "$VARIANT" != "nbs_v5" && "$VARIANT" != "plain" ]]; then
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|plain}"
   exit 2
 fi
 
 EPOCHS="${EPOCHS:-40}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
+VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-$CHECKPOINT_INTERVAL}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
-        "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
-  echo "EPOCHS, CHECKPOINT_INTERVAL, and EVAL_PROGRESS_INTERVAL must be positive integers."
+        "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+  echo "EPOCHS, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL, and EVAL_PROGRESS_INTERVAL must be positive integers."
   exit 2
 fi
 
@@ -24,7 +26,9 @@ RUN_DIR="$ARTIFACT_ROOT/$VARIANT/$RUN_ID"
 mkdir -p "$RUN_DIR/figures"
 printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 
-if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || "$VARIANT" == "nbs_v3" ]]; then
+SCHEDULED_SAMPLING="False"
+if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
+      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || "$VARIANT" == "nbs_v5" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
@@ -41,6 +45,34 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || "$VARIANT" == "nbs_v3" ]]
     RANK_CONFIG="configs/adalora_rank_config_llama7b_nbs_v3.json"
     RANK_BUDGET=1536
     EXPERIMENT_ARGS=(--experiment-tag nbs_v3)
+  elif [[ "$VARIANT" == "nbs_v4" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v4"
+    DISPLAY_NAME="NBS-NetLLM v4"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_nbs_v3.json"
+    RANK_BUDGET=1536
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v4
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v5" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v5"
+    DISPLAY_NAME="NBS-NetLLM v5"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_nbs_v3.json"
+    RANK_BUDGET=1536
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    MIX_RATE=0.1
+    SCHEDULED_SAMPLING="True"
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v5
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+      --scheduled-sampling
+      --mix-rate "$MIX_RATE"
+    )
   fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
@@ -57,8 +89,8 @@ else
   EXTRA_ARGS=()
 fi
 
-TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_False"
-TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_False"
+TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
 MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz"
 BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_model"
 RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz"
@@ -86,10 +118,11 @@ run_logged() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\n' \
-  "$VARIANT" "$RUN_ID" "$EPOCHS" "$CHECKPOINT_INTERVAL" "$EVAL_PROGRESS_INTERVAL" \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+  "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" "$EVAL_PROGRESS_INTERVAL" \
   "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
-  "${RANK_BUDGET:-}" > "$RUN_DIR/metadata.env"
+  "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
+  "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
 
 TRAIN_CMD=(
   python run_plm.py
@@ -106,7 +139,7 @@ TRAIN_CMD=(
   --epochs "$EPOCHS"
   --bs 1
   --grad-accum-steps 32
-  --steps-per-valid "$CHECKPOINT_INTERVAL"
+  --steps-per-valid "$VALIDATION_INTERVAL"
   --save-checkpoint-per-step "$CHECKPOINT_INTERVAL"
   --save-checkpoint-per-epoch 1
   --seed 1
@@ -186,7 +219,8 @@ PLOT_CMD=(
   --result-csv "$RUN_DIR/results.csv"
   --output-dir "$RUN_DIR/figures"
 )
-if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || "$VARIANT" == "nbs_v3" ]]; then
+if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
+      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || "$VARIANT" == "nbs_v5" ]]; then
   PLOT_CMD+=(--allocator-state "$BEST_MODEL/nash_rank_allocator.pt")
   PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
 fi

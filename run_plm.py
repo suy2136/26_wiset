@@ -200,15 +200,16 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     log_loss = 0
     best_loss = float('inf')
     best_epoch, best_step = 0, 0
+    non_improving_validations = 0
+    stop_training = False
+    if args.early_stopping_patience is not None and args.early_stopping_patience <= 0:
+        raise ValueError('--early-stopping-patience must be positive')
+    if args.early_stopping_min_delta < 0:
+        raise ValueError('--early-stopping-min-delta must be non-negative')
 
     def validate():
         pipeline.eval()
         with torch.no_grad():
-            validata_checkpoint_path = os.path.join(checkpoint_path)
-            if not os.path.exists(validata_checkpoint_path):
-                os.makedirs(validata_checkpoint_path)
-            save_model(args, pipeline, validata_checkpoint_path)
-            print(f'Checkpoint saved at', checkpoint_path)
             ps_history_start = len(pipeline.patch_selection_history) if args.multimodal_mode == 'patch-selection' else None
             valid_loss = []
             for history, future, video_user_info in dataloader_valid:
@@ -226,6 +227,50 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                           f'min={min(counts)} max={max(counts)}')
             pipeline.train()
             return valid_loss
+
+    def process_validation(valid_loss, position_kind, position):
+        nonlocal best_loss, best_epoch, best_step, non_improving_validations
+        improved = valid_loss < best_loss - args.early_stopping_min_delta
+        if improved:
+            best_loss = valid_loss
+            if position_kind == 'step':
+                best_step = position
+            else:
+                best_epoch = position
+            non_improving_validations = 0
+            save_model(args, pipeline, best_model_path)
+            print(
+                f'Best model ({position_kind} {position}, average valid loss {best_loss}) '
+                f'saved at', best_model_path
+            )
+        else:
+            non_improving_validations += 1
+
+        best_position = best_step if position_kind == 'step' else best_epoch
+        print(
+            'Valid loss', valid_loss, '-', 'Best loss', best_loss,
+            'at', position_kind, best_position,
+            '- non-improving validations', non_improving_validations,
+        )
+        should_stop = (
+            args.early_stopping_patience is not None
+            and non_improving_validations >= args.early_stopping_patience
+        )
+        if should_stop:
+            print(
+                'Early stopping triggered at', position_kind, position,
+                f'(patience={args.early_stopping_patience}, '
+                f'min_delta={args.early_stopping_min_delta}, best_loss={best_loss})'
+            )
+            if allocator is not None:
+                allocator.enforce_masks()
+                _append_nash_diagnostics(
+                    nash_diagnostics_path,
+                    allocator.snapshot_diagnostics(
+                        opt_step, event='early_stopping'
+                    ),
+                )
+        return should_stop
         
     print(f'Training on {args.train_dataset} - bs: {args.bs} - lr: {args.lr} - seed: {args.seed}')
     for epoch in range(args.epochs):
@@ -240,7 +285,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 if np.random.rand() > args.mix_rate:
                     loss = pipeline(history, future, video_user_info, teacher_forcing=True)
                 else:
-                    loss = pipeline(history, future, video_user_info, teacher_forcing=False)
+                    loss = pipeline.scheduled_sampling_loss(
+                        history, future, video_user_info
+                    )
             else:
                 loss = pipeline(history, future, video_user_info, teacher_forcing=True)
             tot_loss += loss.item()
@@ -318,11 +365,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             # validation by steps
             if args.steps_per_valid is not None and global_step % args.steps_per_valid == 0:
                 valid_loss = validate()
-                if valid_loss < best_loss:
-                    best_loss, best_step = valid_loss, global_step
-                    save_model(args, pipeline, best_model_path)
-                    print(f'Best model (step {best_step}, average valid loss {best_loss}) saved at', best_model_path)
-                print('Valid loss', valid_loss, ' - ', 'Best loss', best_loss, 'at step', best_step)
+                stop_training = process_validation(valid_loss, 'step', global_step)
+                if stop_training:
+                    break
             
             # save checkpoint by save_checkpoint_per_step
             if args.save_checkpoint_per_step is not None and global_step % args.save_checkpoint_per_step == 0:
@@ -332,14 +377,15 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 save_model(args, pipeline, save_checkpoint_path)
                 print('save checkpoint at', save_checkpoint_path)
 
+        if stop_training:
+            break
+
         # validation by epochs
         if args.epochs_per_valid is not None and epoch % args.epochs_per_valid == 0:
             valid_loss = validate()
-            if valid_loss < best_loss:
-                best_loss, best_epoch = valid_loss, epoch
-                save_model(args, pipeline, best_model_path)
-                print(f'Best model (epoch {best_epoch}, average valid loss {best_loss}) saved at', best_model_path)
-            print('Valid loss', valid_loss, ' - ', 'Best loss', best_loss, 'at epoch', best_epoch)
+            stop_training = process_validation(valid_loss, 'epoch', epoch)
+            if stop_training:
+                break
         
         # save checkpoint by save_checkpoint_per_epoch
         if args.save_checkpoint_per_epoch is not None and epoch % args.save_checkpoint_per_epoch == 0 and epoch > 0:
@@ -635,6 +681,10 @@ if __name__ == '__main__':
                         help='(Optional) The number of epochs per validation (default 3).')
     parser.add_argument('--steps-per-valid', action='store', dest='steps_per_valid', type=int,
                         help='(Optional) The number of steps per validation (default 50).')
+    parser.add_argument('--early-stopping-patience', type=int, default=None,
+                        help='Stop after this many consecutive validation events without sufficient improvement.')
+    parser.add_argument('--early-stopping-min-delta', type=float, default=0.0,
+                        help='Minimum validation-loss decrease required to reset early-stopping patience.')
     parser.add_argument('--report-loss-per-steps', action='store', dest='report_loss_per_steps', type=int, default=100,
                         help='(Optional) The number of steps per validation (default 100).')
     parser.add_argument('--lr', action="store", dest='lr', help='(Optional) Neural network learning rate.', type=float)
@@ -692,7 +742,7 @@ if __name__ == '__main__':
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
-    parser.add_argument('--experiment-tag', choices=['nbs_v2', 'nbs_v3'], default=None,
+    parser.add_argument('--experiment-tag', choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5'], default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\

@@ -139,6 +139,30 @@ class Pipeline(nn.Module):
         gt = future.to(pred.device)
         loss = self.loss_fct(pred, gt)
         return loss
+
+    def scheduled_sampling_loss(self, batch, future, video_user_position) -> torch.Tensor:
+        """Train once on detached autoregressive predictions as future inputs.
+
+        Autoregressive generation runs in eval/no-grad mode so Llama can use
+        its KV cache even when gradient checkpointing is enabled.  The actual
+        optimization remains a single teacher-forcing forward/backward pass,
+        with the generated trajectory replacing ground-truth future inputs.
+        This avoids retaining a 20-step autoregressive graph on a 24 GB GPU.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            with torch.no_grad():
+                sampled_future = self.auto_regressive(
+                    batch, future, video_user_position
+                ).detach()
+        finally:
+            if was_training:
+                self.train()
+        pred = self.teaching_forcing(
+            batch, sampled_future, video_user_position
+        )
+        return self.loss_fct(pred, future.to(pred.device))
     
     def auto_regressive(self, x, future, video_user_position) -> torch.Tensor:
         """

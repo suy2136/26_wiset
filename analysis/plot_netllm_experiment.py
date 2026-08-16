@@ -26,7 +26,9 @@ VALID_RE = re.compile(r"Valid loss\s+(?P<loss>[-+0-9.eE]+)")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--variant", choices=("nbs", "nbs_v2", "nbs_v3", "plain"), required=True
+        "--variant",
+        choices=("nbs", "nbs_v2", "nbs_v3", "nbs_v4", "nbs_v5", "plain"),
+        required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
     parser.add_argument("--result-csv", type=Path, required=True)
@@ -183,6 +185,8 @@ def main() -> None:
         "nbs": "NBS-NetLLM",
         "nbs_v2": "NBS-NetLLM v2",
         "nbs_v3": "NBS-NetLLM v3",
+        "nbs_v4": "NBS-NetLLM v4",
+        "nbs_v5": "NBS-NetLLM v5",
         "plain": "NetLLM",
     }
     display_name = display_names[args.variant]
