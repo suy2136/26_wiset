@@ -15,6 +15,30 @@ TARGET_MODULES = {
 }
 
 
+def _adalora_physical_rank(rank, rank_config):
+    """Choose the physical AdaLoRA width from configured layer ceilings.
+
+    The custom allocator masks physical ``lora_E`` slots instead of resizing
+    tensors during training.  Consequently the physical width must cover the
+    largest configured per-layer maximum, but slots beyond that maximum only
+    waste adapter/optimizer memory and introduce spectral candidates that the
+    NBS formulation does not define.
+    """
+    configured_maxima = []
+    if isinstance(rank_config, dict):
+        for layer_config in rank_config.values():
+            if isinstance(layer_config, dict) and layer_config.get("max_rank") is not None:
+                configured_maxima.append(int(layer_config["max_rank"]))
+    physical_rank = max(configured_maxima) if configured_maxima else int(rank) * 2
+    if physical_rank <= 0:
+        raise ValueError("AdaLoRA physical rank must be positive")
+    if physical_rank < int(rank):
+        raise ValueError(
+            f"configured max_rank {physical_rank} is smaller than AdaLoRA target rank {rank}"
+        )
+    return physical_rank
+
+
 def _mixed_precision_adalora_forward(self, x):
     """PEFT 0.6.x SVDLinear forward with explicit mixed-dtype bridges.
 
@@ -81,8 +105,9 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero"):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
-        Starts at init_r=rank*2 and prunes the rank budget down to target_r=rank
-        over training.  When use_adalora=True, the training loop calls the
+        Uses the largest configured layer max_rank as the physical init_r
+        (falling back to rank*2 when no layer configuration is supplied).
+        When use_adalora=True, the training loop calls the
         project's NashRankAllocator after optimizer.step() and before
         zero_grad(), using lora_A/lora_B gradients and lora_E energy.
     :param total_step: required when use_adalora=True. Total number of OPTIMIZER
@@ -113,9 +138,10 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         tfinal = max(tinit + 1, int(total_step * 0.15))
         cooldown_start = max(tinit + 1, total_step - tfinal)
         deltaT = int(adalora_allocation_interval)
+        physical_rank = _adalora_physical_rank(rank, adalora_rank_config)
         config = AdaLoraConfig(
-            init_r=rank * 2,        # start with a larger rank ...
-            target_r=rank,          # ... and prune down to this average rank
+            init_r=physical_rank,
+            target_r=rank,
             tinit=tinit,
             tfinal=tfinal,
             deltaT=deltaT,
@@ -160,6 +186,12 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
             allocation_interval=adalora_allocation_interval,
         )
         model.nash_rank_allocation_interval = int(adalora_allocation_interval)
+        model.nash_physical_rank = int(physical_rank)
+        print(
+            "NBS physical AdaLoRA rank: init_r={} (largest configured max_rank)".format(
+                physical_rank
+            )
+        )
         print(
             "NBS rank schedule: warm-up steps 1-{}, allocation window {}-{}, "
             "cooldown steps {}-{} (interval={})".format(

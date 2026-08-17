@@ -14,13 +14,13 @@ export EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 
 echo "Shared conditions: epochs=$EPOCHS, validation interval=$VALIDATION_INTERVAL, checkpoint interval=$CHECKPOINT_INTERVAL"
 
-echo "[1/3] Starting NBS-NetLLM v6 (min=4, max=32, budget=1024)"
+echo "[1/3] Starting NBS-NetLLM v6 (min=2, max=32, budget=256, initial mean rank=4)"
 bash scripts/run_netllm_experiment.sh nbs_v6
 
-echo "[2/3] Starting NBS-NetLLM v7 (min=8, max=32, budget=1024)"
+echo "[2/3] Starting NBS-NetLLM v7 (min=4, max=32, budget=512, initial mean rank=8)"
 bash scripts/run_netllm_experiment.sh nbs_v7
 
-echo "[3/3] Starting NBS-NetLLM v8 (min=8, max=32, budget=1280)"
+echo "[3/3] Starting NBS-NetLLM v8 (min=4, max=32, budget=768, initial mean rank=12)"
 bash scripts/run_netllm_experiment.sh nbs_v8
 
 echo "All NBS v6/v7/v8 capacity-ablation experiments completed."

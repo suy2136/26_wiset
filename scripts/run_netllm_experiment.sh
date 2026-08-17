@@ -84,9 +84,9 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     )
   elif [[ "$VARIANT" == "nbs_v6" ]]; then
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v6"
-    DISPLAY_NAME="NBS-NetLLM v6 (min4-max32-budget1024)"
-    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
-    RANK_BUDGET=1024
+    DISPLAY_NAME="NBS-NetLLM v6 (min2-max32-budget256, initial-rank4)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=256
     EARLY_STOPPING_PATIENCE=2
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
@@ -96,9 +96,9 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     )
   elif [[ "$VARIANT" == "nbs_v7" ]]; then
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v7"
-    DISPLAY_NAME="NBS-NetLLM v7 (min8-max32-budget1024)"
-    RANK_CONFIG="configs/adalora_rank_config_llama7b_min8_max32.json"
-    RANK_BUDGET=1024
+    DISPLAY_NAME="NBS-NetLLM v7 (min4-max32-budget512, initial-rank8)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=512
     EARLY_STOPPING_PATIENCE=2
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
@@ -108,9 +108,9 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     )
   elif [[ "$VARIANT" == "nbs_v8" ]]; then
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v8"
-    DISPLAY_NAME="NBS-NetLLM v8 (min8-max32-budget1280)"
-    RANK_CONFIG="configs/adalora_rank_config_llama7b_min8_max32.json"
-    RANK_BUDGET=1280
+    DISPLAY_NAME="NBS-NetLLM v8 (min4-max32-budget768, initial-rank12)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=768
     EARLY_STOPPING_PATIENCE=2
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
@@ -136,11 +136,24 @@ fi
 
 TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
 TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
-MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz"
-BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_model"
-RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz"
-RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_results.csv"
-PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_partial_results.csv"
+MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz/$RUN_ID"
+if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
+  BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
+  BEST_POST_NBS_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_post_nbs_model"
+  FINAL_NBS_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/final_nbs_model"
+else
+  BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_model"
+  BEST_POST_NBS_MODEL=""
+  FINAL_NBS_MODEL=""
+fi
+RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz/$RUN_ID"
+if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
+  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar_results.csv"
+  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar_partial_results.csv"
+else
+  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_results.csv"
+  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_partial_results.csv"
+fi
 
 write_status() {
   local stage="$1"
@@ -161,12 +174,27 @@ run_logged() {
   return "$exit_code"
 }
 
+checkpoint_complete() {
+  local checkpoint_path="$1"
+  local canonical_path
+  canonical_path="$(resolve_checkpoint "$checkpoint_path")" || return 1
+  [[ -f "$canonical_path/adapter_model.bin" && \
+     -f "$canonical_path/modules_except_plm.bin" && \
+     -f "$canonical_path/nash_rank_allocator.pt" && \
+     -f "$checkpoint_path/checkpoint_metadata.json" ]]
+}
+
+resolve_checkpoint() {
+  python analysis/resolve_checkpoint_alias.py "$1"
+}
+
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" \
-  "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
+  "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \
+  "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
   "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
 
@@ -182,6 +210,7 @@ TRAIN_CMD=(
   --fp16
   --gradient-checkpointing
   --rank 32
+  --experiment-run-id "$RUN_ID"
   --epochs "$EPOCHS"
   --bs 1
   --grad-accum-steps 32
@@ -206,86 +235,171 @@ else
   exit "$code"
 fi
 
-if [[ ! -d "$BEST_MODEL" ]]; then
+if [[ -n "${NBS_DIAGNOSTICS:-}" ]] && ! checkpoint_complete "$BEST_MODEL"; then
+  write_status "training" "failed_missing_best_model" 3
+  echo "Training exited but the best AR checkpoint is incomplete: $BEST_MODEL"
+  exit 3
+elif [[ -z "${NBS_DIAGNOSTICS:-}" && ! -d "$BEST_MODEL" ]]; then
   write_status "training" "failed_missing_best_model" 3
   echo "Training exited but best_model was not found: $BEST_MODEL"
   exit 3
 fi
-write_status "evaluation" "running" 0
-touch "$RUN_DIR/evaluation.started"
-
-TEST_CMD=(
-  python run_plm.py
-  --test
-  --train-dataset Jin2022
-  --test-dataset Jin2022
-  --plm-type llama
-  --plm-size base
-  --device cuda
-  --device-out cuda
-  --fp16
-  --rank 32
-  --model-path "$BEST_MODEL"
-  --epochs "$EPOCHS"
-  --bs 1
-  --grad-accum-steps 32
-  --save-test-progress-per-steps "$EVAL_PROGRESS_INTERVAL"
-  --seed 1
-  "${EXTRA_ARGS[@]}"
-)
-
-echo "[$DISPLAY_NAME] evaluation started"
-if run_logged "$RUN_DIR/test.log" env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "${TEST_CMD[@]}"; then
-  :
+if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
+  CHECKPOINT_ROLES=(best_ar best_post_nbs final_nbs)
+  CHECKPOINT_PATHS=("$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL")
 else
-  code=$?
-  if [[ -f "$PARTIAL_RESULT_CSV" && "$PARTIAL_RESULT_CSV" -nt "$RUN_DIR/evaluation.started" ]]; then
-    cp "$PARTIAL_RESULT_CSV" "$RUN_DIR/partial_results.csv"
+  CHECKPOINT_ROLES=(best)
+  CHECKPOINT_PATHS=("$BEST_MODEL")
+fi
+declare -A EVALUATED_DIR_BY_CHECKPOINT=()
+declare -A EVALUATED_ROLE_BY_CHECKPOINT=()
+
+for index in "${!CHECKPOINT_ROLES[@]}"; do
+  ROLE="${CHECKPOINT_ROLES[$index]}"
+  MODEL_PATH="${CHECKPOINT_PATHS[$index]}"
+  if [[ -n "${NBS_DIAGNOSTICS:-}" ]] && ! checkpoint_complete "$MODEL_PATH"; then
+    if [[ "$ROLE" == "best_post_nbs" ]]; then
+      mkdir -p "$RUN_DIR/evaluations/$ROLE"
+      printf 'No successful NBS allocation occurred before validation; checkpoint unavailable.\n' \
+        > "$RUN_DIR/evaluations/$ROLE/skipped.txt"
+      echo "[$DISPLAY_NAME] skipping $ROLE evaluation: checkpoint unavailable"
+      continue
+    fi
+    write_status "evaluation_${ROLE}" "failed_missing_checkpoint" 3
+    echo "Required checkpoint was not found: $MODEL_PATH"
+    exit 3
   fi
-  write_status "evaluation" "failed" "$code"
-  echo "Evaluation failed. Completed training outputs were preserved."
-  exit "$code"
-fi
 
-if [[ ! -f "$RESULT_CSV" || ! "$RESULT_CSV" -nt "$RUN_DIR/evaluation.started" ]]; then
-  write_status "evaluation" "failed_missing_results" 4
-  echo "Evaluation exited but no newly written result CSV was found: $RESULT_CSV"
-  exit 4
-fi
+  EVALUATION_TAG_ARGS=()
+  if [[ "$ROLE" == "best" ]]; then
+    ROLE_DIR="$RUN_DIR"
+    ROLE_RESULT_CSV="$RESULT_CSV"
+    ROLE_PARTIAL_RESULT_CSV="$PARTIAL_RESULT_CSV"
+  else
+    ROLE_DIR="$RUN_DIR/evaluations/$ROLE"
+    ROLE_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}_results.csv"
+    ROLE_PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}_partial_results.csv"
+    EVALUATION_TAG_ARGS=(--evaluation-tag "$ROLE")
+  fi
+  CANONICAL_MODEL_PATH="$(resolve_checkpoint "$MODEL_PATH")"
+  mkdir -p "$ROLE_DIR/figures"
+  PREDICTIONS_FILE="${ROLE_RESULT_CSV/_results.csv/_predictions.txt}"
+  PER_SAMPLE_FILE="${ROLE_RESULT_CSV/_results.csv/_per_sample_results.csv}"
+  REUSED_FROM_DIR="${EVALUATED_DIR_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
+  REUSED_FROM_ROLE="${EVALUATED_ROLE_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
 
-cp "$RESULT_CSV" "$RUN_DIR/results.csv"
-PREDICTIONS_FILE="${RESULT_CSV/_results.csv/_predictions.txt}"
-PER_SAMPLE_FILE="${RESULT_CSV/_results.csv/_per_sample_results.csv}"
-[[ -f "$PREDICTIONS_FILE" ]] && cp "$PREDICTIONS_FILE" "$RUN_DIR/predictions.txt"
-[[ -f "$PER_SAMPLE_FILE" ]] && cp "$PER_SAMPLE_FILE" "$RUN_DIR/per_sample_results.csv"
-if [[ -f "$PARTIAL_RESULT_CSV" && "$PARTIAL_RESULT_CSV" -nt "$RUN_DIR/evaluation.started" ]]; then
-  cp "$PARTIAL_RESULT_CSV" "$RUN_DIR/partial_results.csv"
-fi
+  if [[ -n "$REUSED_FROM_DIR" ]]; then
+    write_status "evaluation_${ROLE}" "reused" 0
+    mkdir -p "$(dirname "$ROLE_RESULT_CSV")"
+    cp "$REUSED_FROM_DIR/results.csv" "$ROLE_RESULT_CSV"
+    cp "$REUSED_FROM_DIR/results.csv" "$ROLE_DIR/results.csv"
+    if [[ -f "$REUSED_FROM_DIR/predictions.txt" ]]; then
+      cp "$REUSED_FROM_DIR/predictions.txt" "$PREDICTIONS_FILE"
+      cp "$REUSED_FROM_DIR/predictions.txt" "$ROLE_DIR/predictions.txt"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/per_sample_results.csv" ]]; then
+      cp "$REUSED_FROM_DIR/per_sample_results.csv" "$PER_SAMPLE_FILE"
+      cp "$REUSED_FROM_DIR/per_sample_results.csv" "$ROLE_DIR/per_sample_results.csv"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/partial_results.csv" ]]; then
+      cp "$REUSED_FROM_DIR/partial_results.csv" "$ROLE_PARTIAL_RESULT_CSV"
+      cp "$REUSED_FROM_DIR/partial_results.csv" "$ROLE_DIR/partial_results.csv"
+    fi
+    printf '{\n  "checkpoint_role": "%s",\n  "reused_from_role": "%s",\n  "canonical_checkpoint": "%s"\n}\n' \
+      "$ROLE" "$REUSED_FROM_ROLE" "$CANONICAL_MODEL_PATH" \
+      > "$ROLE_DIR/evaluation_reused.json"
+    printf 'Evaluation reused from %s because both roles resolve to %s\n' \
+      "$REUSED_FROM_ROLE" "$CANONICAL_MODEL_PATH" > "$ROLE_DIR/test.log"
+    echo "[$DISPLAY_NAME] $ROLE evaluation reused from $REUSED_FROM_ROLE"
+  else
+    touch "$ROLE_DIR/evaluation.started"
+    write_status "evaluation_${ROLE}" "running" 0
 
-PLOT_CMD=(
-  python analysis/plot_netllm_experiment.py
-  --variant "$VARIANT"
-  --train-log "$RUN_DIR/train.log"
-  --result-csv "$RUN_DIR/results.csv"
-  --output-dir "$RUN_DIR/figures"
-)
-if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
-      "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
-      "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
-      "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" ]]; then
-  PLOT_CMD+=(--allocator-state "$BEST_MODEL/nash_rank_allocator.pt")
-  PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
-fi
+    TEST_CMD=(
+      python run_plm.py
+      --test
+      --train-dataset Jin2022
+      --test-dataset Jin2022
+      --plm-type llama
+      --plm-size base
+      --device cuda
+      --device-out cuda
+      --fp16
+      --rank 32
+      --experiment-run-id "$RUN_ID"
+      --model-path "$MODEL_PATH"
+      "${EVALUATION_TAG_ARGS[@]}"
+      --epochs "$EPOCHS"
+      --bs 1
+      --grad-accum-steps 32
+      --save-test-progress-per-steps "$EVAL_PROGRESS_INTERVAL"
+      --seed 1
+      "${EXTRA_ARGS[@]}"
+    )
 
-write_status "visualization" "running" 0
-if run_logged "$RUN_DIR/plot.log" "${PLOT_CMD[@]}"; then
-  :
-else
-  code=$?
-  write_status "visualization" "failed" "$code"
-  echo "Visualization failed, but training/evaluation outputs were preserved."
-  exit "$code"
-fi
+    echo "[$DISPLAY_NAME] $ROLE evaluation started"
+    if run_logged "$ROLE_DIR/test.log" env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "${TEST_CMD[@]}"; then
+      :
+    else
+      code=$?
+      if [[ -f "$ROLE_PARTIAL_RESULT_CSV" && \
+            "$ROLE_PARTIAL_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
+        cp "$ROLE_PARTIAL_RESULT_CSV" "$ROLE_DIR/partial_results.csv"
+      fi
+      write_status "evaluation_${ROLE}" "failed" "$code"
+      echo "$ROLE evaluation failed. Completed outputs were preserved."
+      exit "$code"
+    fi
+
+    if [[ ! -f "$ROLE_RESULT_CSV" || \
+          ! "$ROLE_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
+      write_status "evaluation_${ROLE}" "failed_missing_results" 4
+      echo "Evaluation exited but no newly written result CSV was found: $ROLE_RESULT_CSV"
+      exit 4
+    fi
+
+    cp "$ROLE_RESULT_CSV" "$ROLE_DIR/results.csv"
+    [[ -f "$PREDICTIONS_FILE" ]] && cp "$PREDICTIONS_FILE" "$ROLE_DIR/predictions.txt"
+    [[ -f "$PER_SAMPLE_FILE" ]] && cp "$PER_SAMPLE_FILE" "$ROLE_DIR/per_sample_results.csv"
+    if [[ -f "$ROLE_PARTIAL_RESULT_CSV" && \
+          "$ROLE_PARTIAL_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
+      cp "$ROLE_PARTIAL_RESULT_CSV" "$ROLE_DIR/partial_results.csv"
+    fi
+    EVALUATED_DIR_BY_CHECKPOINT["$CANONICAL_MODEL_PATH"]="$ROLE_DIR"
+    EVALUATED_ROLE_BY_CHECKPOINT["$CANONICAL_MODEL_PATH"]="$ROLE"
+  fi
+
+  PLOT_CMD=(
+    python analysis/plot_netllm_experiment.py
+    --variant "$VARIANT"
+    --train-log "$RUN_DIR/train.log"
+    --result-csv "$ROLE_DIR/results.csv"
+    --output-dir "$ROLE_DIR/figures"
+    --checkpoint-role "$ROLE"
+  )
+  if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
+    PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
+    PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
+  fi
+
+  write_status "visualization_${ROLE}" "running" 0
+  if run_logged "$ROLE_DIR/plot.log" "${PLOT_CMD[@]}"; then
+    :
+  else
+    code=$?
+    write_status "visualization_${ROLE}" "failed" "$code"
+    echo "$ROLE visualization failed, but training/evaluation outputs were preserved."
+    exit "$code"
+  fi
+
+  # Preserve the historical top-level files as aliases of the primary result.
+  if [[ "$ROLE" == "best_ar" ]]; then
+    cp "$ROLE_DIR/results.csv" "$RUN_DIR/results.csv"
+    [[ -f "$ROLE_DIR/predictions.txt" ]] && cp "$ROLE_DIR/predictions.txt" "$RUN_DIR/predictions.txt"
+    [[ -f "$ROLE_DIR/per_sample_results.csv" ]] && cp "$ROLE_DIR/per_sample_results.csv" "$RUN_DIR/per_sample_results.csv"
+    cp -a "$ROLE_DIR/figures/." "$RUN_DIR/figures/"
+  fi
+done
 
 write_status "complete" "complete" 0
 echo "[$DISPLAY_NAME] complete: $RUN_DIR"

@@ -26,11 +26,10 @@ Two checks:
    torch.kthvalue requires k >= 1. Every masking step then raises
    "kthvalue(): selected number k out of range" -- deterministically, regardless
    of model size (verified at both n_layers=2 and n_layers=8). This is a real
-   constraint of this peft version, not a test artifact: AdaLoRA here requires
-   init_r > target_r to run at all. Our actual integration (models/low_rank.py's
-   peft_model()) always sets init_r=rank*2 > target_r=rank, so it never hits
-   this -- it only surfaces if someone constructs an AdaLoraConfig with
-   init_r == target_r directly, as this equivalence check originally tried to.
+   constraint of PEFT's built-in pruning path, not a test artifact. The custom
+   NBS integration does not call that path; without a layer-rank configuration
+   it retains the rank*2 fallback exercised by this equivalence test. The issue
+   only surfaces if PEFT's own masking method is invoked with equal ranks.
 
 Caveat, stated explicitly: this is NOT a bit-exact equivalence gate like the
 KV-cache threshold=0 check. AdaLoRA's SVD parameterization (A * diag(E) * B,
@@ -171,11 +170,10 @@ def check_2_init_eq_target_sanity():
     # selected number k out of range" -- regardless of model/toy-model size (this
     # was verified directly: the crash reproduces identically at n_layers=2 and
     # n_layers=8). This is a real peft==0.6.2 constraint, not a test artifact: as
-    # written, AdaLoRA in this version REQUIRES init_r > target_r to run at all.
-    # Our actual integration (models/low_rank.py's peft_model(), Check 1 above)
-    # always sets init_r=rank*2 > target_r=rank, so it never hits this -- but the
-    # literal "init_r == target_r" sanity check the equivalence-gate idea called
-    # for isn't constructible in this peft version. Closest available substitute:
+    # written, PEFT's built-in AdaLoRA pruning requires init_r > target_r.
+    # Check 1 supplies no rank config and therefore exercises our rank*2 fallback.
+    # The literal "init_r == target_r" built-in pruning check is not constructible
+    # in this PEFT version. Closest available substitute:
     # minimal headroom (init_r = target_r + 1), which still exercises the real
     # pruning/masking code path instead of skipping it.
     init_r = rank + 1

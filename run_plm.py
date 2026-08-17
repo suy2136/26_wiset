@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
 from models.low_rank import peft_model, print_trainable_parameters
+from models.rank_allocator import RankAllocationConstraintError
 
 
 NASH_DIAGNOSTIC_FIELDS = [
@@ -32,7 +33,10 @@ NASH_DIAGNOSTIC_FIELDS = [
     'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
     'total_rank', 'rank_budget', 'validation_event', 'validation_loss',
     'teacher_forcing_validation_loss',
+    'allocation_error', 'allocation_error_message', 'requested_rank',
+    'allocation_error_action',
     'validation_position_kind', 'validation_position', 'is_best_validation',
+    'nbs_allocation_started', 'is_best_post_nbs_validation',
 ]
 
 
@@ -109,10 +113,91 @@ def _save_allocator_snapshot(path, allocator, diagnostics, metadata):
             os.remove(temporary_path)
 
 
-def save_model(args, model, save_dir):
+def _write_json_atomic(path, payload):
+    temporary_path = path + '.tmp'
+    try:
+        with open(temporary_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+CHECKPOINT_PAYLOAD_FILES = (
+    'adapter_model.bin',
+    'adapter_model.safetensors',
+    'adapter_config.json',
+    'modules_except_plm.bin',
+    'nash_rank_allocator.pt',
+    'model.bin',
+    'README.md',
+    'checkpoint_alias.json',
+    'checkpoint_metadata.json',
+)
+
+
+def _resolve_checkpoint_alias(model_dir):
+    """Resolve a role directory to its physical checkpoint without cycles."""
+    current = os.path.abspath(model_dir)
+    visited = set()
+    while True:
+        if current in visited:
+            raise ValueError(f'Checkpoint alias cycle detected at {current}')
+        visited.add(current)
+        alias_path = os.path.join(current, 'checkpoint_alias.json')
+        if not os.path.exists(alias_path):
+            return current
+        with open(alias_path, 'r', encoding='utf-8') as handle:
+            alias = json.load(handle)
+        target = alias.get('alias_of')
+        if not target:
+            raise ValueError(f'Checkpoint alias has no alias_of target: {alias_path}')
+        current = (
+            os.path.abspath(target)
+            if os.path.isabs(target)
+            else os.path.abspath(os.path.join(current, target))
+        )
+
+
+def save_checkpoint_alias(alias_dir, canonical_dir, metadata):
+    """Store one logical checkpoint role without duplicating model tensors."""
+    alias_absolute = os.path.abspath(alias_dir)
+    canonical_absolute = _resolve_checkpoint_alias(canonical_dir)
+    if alias_absolute == canonical_absolute:
+        raise ValueError('Checkpoint alias cannot target itself')
+    if not os.path.isdir(canonical_absolute):
+        raise FileNotFoundError(
+            f'Canonical checkpoint does not exist: {canonical_absolute}'
+        )
+    os.makedirs(alias_dir, exist_ok=True)
+    for filename in CHECKPOINT_PAYLOAD_FILES:
+        path = os.path.join(alias_dir, filename)
+        if os.path.isfile(path):
+            os.remove(path)
+    relative_target = os.path.relpath(
+        canonical_absolute, alias_absolute
+    )
+    alias_metadata = dict(metadata)
+    alias_metadata.update({'is_alias': True, 'alias_of': relative_target})
+    _write_json_atomic(
+        os.path.join(alias_dir, 'checkpoint_alias.json'), alias_metadata
+    )
+    _write_json_atomic(
+        os.path.join(alias_dir, 'checkpoint_metadata.json'), alias_metadata
+    )
+
+
+def save_model(args, model, save_dir, metadata=None):
     """
     save fune-tune model
     """
+    os.makedirs(save_dir, exist_ok=True)
+    alias_path = os.path.join(save_dir, 'checkpoint_alias.json')
+    if os.path.isfile(alias_path):
+        os.remove(alias_path)
     if args.rank != -1:
         # save low rank matrices
         model.plm.save_pretrained(save_dir)
@@ -124,6 +209,10 @@ def save_model(args, model, save_dir):
     else:
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
+    if metadata is not None:
+        _write_json_atomic(
+            os.path.join(save_dir, 'checkpoint_metadata.json'), metadata
+        )
 
 
 def _resize_adalora_to_ckpt(plm, adapter_bin, adapter_name='default'):
@@ -158,6 +247,7 @@ def load_model(args, model, model_dir):
 
     :return: the pretrained model corresponding to using model_dir
     """
+    model_dir = _resolve_checkpoint_alias(model_dir)
     if args.rank != -1:
         if args.use_adalora:
             _resize_adalora_to_ckpt(model.plm, os.path.join(model_dir, 'adapter_model.bin'))
@@ -183,9 +273,12 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
          args.save_checkpoint_per_epoch is not None) and
             not os.path.exists(checkpoint_path)):
         os.makedirs(checkpoint_path)
-    best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
-    if not os.path.exists(best_model_path):
-        os.makedirs(best_model_path)
+    checkpoint_root = os.path.join(models_dir, file_prefix)
+    best_model_path = os.path.join(
+        checkpoint_root, 'best_ar_model' if args.use_adalora else 'best_model'
+    )
+    best_post_nbs_model_path = os.path.join(checkpoint_root, 'best_post_nbs_model')
+    final_nbs_model_path = os.path.join(checkpoint_root, 'final_nbs_model')
     console_log = open(os.path.join(models_dir, file_prefix + '_console.log'), 'w')
     sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
 
@@ -269,7 +362,15 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     tot_loss = 0
     log_loss = 0
     best_loss = float('inf')
+    best_post_nbs_loss = float('inf')
     best_epoch, best_step = 0, 0
+    best_post_nbs_epoch, best_post_nbs_step = 0, 0
+    saved_checkpoint_steps = {
+        'best_ar': None,
+        'best_post_nbs': None,
+    }
+    last_valid_loss = None
+    last_teacher_forcing_valid_loss = None
     non_improving_validations = 0
     stop_training = False
     if args.early_stopping_patience is not None and args.early_stopping_patience <= 0:
@@ -308,8 +409,13 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
     def process_validation(valid_loss, teacher_forcing_valid_loss, position_kind, position):
         nonlocal best_loss, best_epoch, best_step, non_improving_validations
+        nonlocal best_post_nbs_loss, best_post_nbs_epoch, best_post_nbs_step
+        nonlocal last_valid_loss, last_teacher_forcing_valid_loss
         nonlocal validation_event_count
         validation_event_count += 1
+        last_valid_loss = float(valid_loss)
+        last_teacher_forcing_valid_loss = float(teacher_forcing_valid_loss)
+        allocation_started = allocator is not None and allocator.last_step is not None
         improved = valid_loss < best_loss - args.early_stopping_min_delta
         if improved:
             best_loss = valid_loss
@@ -318,13 +424,61 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             else:
                 best_epoch = position
             non_improving_validations = 0
-            save_model(args, pipeline, best_model_path)
+            save_model(args, pipeline, best_model_path, metadata={
+                'checkpoint_role': 'best_ar',
+                'optimizer_step': int(opt_step),
+                'validation_event': int(validation_event_count),
+                'validation_position_kind': position_kind,
+                'validation_position': int(position),
+                'validation_loss': float(valid_loss),
+                'teacher_forcing_validation_loss': float(teacher_forcing_valid_loss),
+                'nbs_allocation_started': bool(allocation_started),
+            })
+            saved_checkpoint_steps['best_ar'] = int(opt_step)
             print(
                 f'Best model ({position_kind} {position}, average valid loss {best_loss}) '
                 f'saved at', best_model_path
             )
         else:
             non_improving_validations += 1
+
+        post_nbs_improved = (
+            allocation_started
+            and valid_loss < best_post_nbs_loss - args.early_stopping_min_delta
+        )
+        if post_nbs_improved:
+            best_post_nbs_loss = float(valid_loss)
+            if position_kind == 'step':
+                best_post_nbs_step = position
+            else:
+                best_post_nbs_epoch = position
+            post_metadata = {
+                'checkpoint_role': 'best_post_nbs',
+                'optimizer_step': int(opt_step),
+                'validation_event': int(validation_event_count),
+                'validation_position_kind': position_kind,
+                'validation_position': int(position),
+                'validation_loss': float(valid_loss),
+                'teacher_forcing_validation_loss': float(teacher_forcing_valid_loss),
+                'nbs_allocation_started': True,
+                'first_successful_allocation_step': int(allocator.last_step),
+            }
+            if saved_checkpoint_steps['best_ar'] == int(opt_step):
+                save_checkpoint_alias(
+                    best_post_nbs_model_path, best_model_path, post_metadata
+                )
+                storage_description = f'alias of {best_model_path}'
+            else:
+                save_model(
+                    args, pipeline, best_post_nbs_model_path,
+                    metadata=post_metadata,
+                )
+                storage_description = best_post_nbs_model_path
+            saved_checkpoint_steps['best_post_nbs'] = int(opt_step)
+            print(
+                f'Best post-NBS model ({position_kind} {position}, average valid loss '
+                f'{best_post_nbs_loss}) saved as', storage_description
+            )
 
         if allocator is not None:
             validation_rows = allocator.snapshot_diagnostics(
@@ -339,6 +493,8 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     'validation_position_kind': position_kind,
                     'validation_position': position,
                     'is_best_validation': int(improved),
+                    'nbs_allocation_started': int(allocation_started),
+                    'is_best_post_nbs_validation': int(post_nbs_improved),
                 })
             _append_nash_diagnostics(nash_diagnostics_path, validation_rows)
             snapshot_path = os.path.join(
@@ -359,6 +515,8 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                         teacher_forcing_valid_loss
                     ),
                     'is_best_validation': bool(improved),
+                    'nbs_allocation_started': bool(allocation_started),
+                    'is_best_post_nbs_validation': bool(post_nbs_improved),
                 },
             )
             print('NBS allocator snapshot saved at', snapshot_path)
@@ -428,10 +586,48 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     # selected rank mask.
                     current_opt_step = opt_step + 1
                     if allocator.should_allocate(current_opt_step):
-                        allocator.allocate(current_opt_step)
-                        _append_nash_diagnostics(
-                            nash_diagnostics_path, allocator.last_diagnostics
-                        )
+                        try:
+                            allocator.allocate(current_opt_step)
+                        except RankAllocationConstraintError as exc:
+                            # The candidate was rejected before any mask was
+                            # changed. Preserve the latest spectral shadow from
+                            # this optimizer update, then restore the previous
+                            # valid mask and continue training.
+                            allocator.enforce_masks()
+                            violation_by_layer = {
+                                violation['layer_name']: violation
+                                for violation in exc.violations
+                                if violation['layer_name'] is not None
+                            }
+                            error_rows = allocator.snapshot_diagnostics(
+                                current_opt_step, event='allocation_error'
+                            )
+                            for row in error_rows:
+                                violation = violation_by_layer.get(row['layer_name'])
+                                row.update({
+                                    'allocation_error': 1,
+                                    'allocation_error_message': str(exc),
+                                    'requested_rank': (
+                                        violation['requested_rank']
+                                        if violation is not None else ''
+                                    ),
+                                    'allocation_error_action': (
+                                        'candidate rejected; previous valid mask preserved'
+                                    ),
+                                })
+                            _append_nash_diagnostics(
+                                nash_diagnostics_path, error_rows
+                            )
+                            print(
+                                '[NBS ALLOCATION ERROR]',
+                                f'optimizer_step={current_opt_step}', str(exc),
+                                'Action: candidate rejected; previous valid rank mask preserved.',
+                                flush=True,
+                            )
+                        else:
+                            _append_nash_diagnostics(
+                                nash_diagnostics_path, allocator.last_diagnostics
+                            )
                     else:
                         # During warm-up, between allocation intervals, and
                         # throughout cooldown, preserve the existing topology.
@@ -513,15 +709,55 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             save_model(args, pipeline, save_checkpoint_path)
             print('save checkpoint at', save_checkpoint_path)
 
+    if allocator is not None:
+        allocator.enforce_masks()
+        final_rows = allocator.snapshot_diagnostics(opt_step, event='final_nbs_model')
+        _append_nash_diagnostics(nash_diagnostics_path, final_rows)
+        final_metadata = {
+            'checkpoint_role': 'final_nbs',
+            'optimizer_step': int(opt_step),
+            'global_step': int(global_step),
+            'validation_event': int(validation_event_count),
+            'validation_loss': last_valid_loss,
+            'teacher_forcing_validation_loss': last_teacher_forcing_valid_loss,
+            'nbs_allocation_started': bool(allocator.last_step is not None),
+            'last_successful_allocation_step': allocator.last_step,
+            'stopped_early': bool(stop_training),
+        }
+        if saved_checkpoint_steps['best_ar'] == int(opt_step):
+            save_checkpoint_alias(
+                final_nbs_model_path, best_model_path, final_metadata
+            )
+            final_storage_description = f'alias of {best_model_path}'
+        elif saved_checkpoint_steps['best_post_nbs'] == int(opt_step):
+            save_checkpoint_alias(
+                final_nbs_model_path, best_post_nbs_model_path, final_metadata
+            )
+            final_storage_description = f'alias of {best_post_nbs_model_path}'
+        else:
+            save_model(
+                args, pipeline, final_nbs_model_path, metadata=final_metadata
+            )
+            final_storage_description = final_nbs_model_path
+        print('Final NBS model saved as', final_storage_description)
+
     print('Done adaptation, average training loss =', tot_loss / global_step)
 
 
 def test(args, pipeline, dataloader_test, models_dir, results_dir):
     file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_axes_ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
                   f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
-    best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
-    result_path = os.path.join(results_dir, file_prefix + '_results.csv')
-    partial_result_path = os.path.join(results_dir, file_prefix + '_partial_results.csv')
+    default_model_name = 'best_ar_model' if args.use_adalora else 'best_model'
+    best_model_path = os.path.join(models_dir, file_prefix, default_model_name)
+    evaluation_suffix = (
+        f'_checkpoint_{args.evaluation_tag}' if args.evaluation_tag is not None else ''
+    )
+    result_path = os.path.join(
+        results_dir, file_prefix + evaluation_suffix + '_results.csv'
+    )
+    partial_result_path = os.path.join(
+        results_dir, file_prefix + evaluation_suffix + '_partial_results.csv'
+    )
     progress_interval = getattr(args, 'save_test_progress_per_steps', None)
     if progress_interval is not None and progress_interval <= 0:
         raise ValueError('--save-test-progress-per-steps must be positive')
@@ -599,6 +835,11 @@ def run(args):
                               f'freeze_plm_{args.freeze_plm}', multimodal_tag, args.train_dataset, f'{args.dataset_frequency}Hz')
         results_dir = os.path.join(cfg.results_dir, f'{args.plm_type}_{args.plm_size}',
                                f'freeze_plm_{args.freeze_plm}', multimodal_tag, args.test_dataset, f'{args.dataset_frequency}Hz')
+    if args.experiment_run_id is not None:
+        # Long ablation runs must not reuse stale checkpoints/results from an
+        # earlier invocation with the same variant and hyperparameter prefix.
+        models_dir = os.path.join(models_dir, args.experiment_run_id)
+        results_dir = os.path.join(results_dir, args.experiment_run_id)
     if not os.path.exists(models_dir): 
         os.makedirs(models_dir)
     if not os.path.exists(results_dir):
@@ -762,6 +1003,12 @@ if __name__ == '__main__':
     parser.add_argument('--plm-type', action="store", dest='plm_type', help='type of plm.', default='t5-lm')
     parser.add_argument('--plm-size', action="store", dest='plm_size', help='size of plm.', default='base')
     parser.add_argument('--model-path', action="store", dest='model_path', type=str, help='(Optional) The directory of model weights to be loaded for testing.')
+    parser.add_argument(
+        '--evaluation-tag',
+        choices=['best_ar', 'best_post_nbs', 'final_nbs'],
+        default=None,
+        help='Optional checkpoint role appended to evaluation result filenames.',
+    )
     parser.add_argument('--device', action='store', dest='device', help='the device (cuda or cpu) to run experiment.')
     parser.add_argument('--device-out', action='store', dest='device_out', help='the device (cuda or cpu) to place the split of model near the output.')
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='the device (cuda or cpu) to place the split of model between the input and output.')
@@ -842,7 +1089,7 @@ if __name__ == '__main__':
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
                               'Only has an effect when --rank != -1. Uses gradient/spectral '
-                              'Nash rank allocation over init_r=rank*2 slots.')
+                              'Nash rank allocation over physical slots sized to the largest configured max_rank.')
     parser.add_argument('--adalora-min-rank', type=int, default=None,
                         help='Minimum rank per LoRA layer for Nash allocation (default: rank//2).')
     parser.add_argument('--adalora-ema-beta', type=float, default=0.9,
@@ -865,6 +1112,11 @@ if __name__ == '__main__':
                                  'nbs_v6', 'nbs_v7', 'nbs_v8'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
+    parser.add_argument(
+        '--experiment-run-id',
+        default=None,
+        help='Optional run-specific subdirectory preventing stale checkpoint/result reuse.',
+    )
     parser.add_argument('--resume-path', action="store", dest='resume_path', help='using for resume')
     parser.add_argument('--scheduled-sampling', action="store_true", dest='scheduled_sampling', help='using scheduled sampling, a common method to reduce exposure bias to improve '\
                                                                                                      'sequence generation by mixing teacher-forcing generation and auto-regressive generation. '\

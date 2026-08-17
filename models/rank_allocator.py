@@ -14,10 +14,22 @@ import re
 import torch
 
 
+class RankAllocationConstraintError(ValueError):
+    """A proposed allocation violates layer bounds or the global budget."""
+
+    def __init__(self, violations, requested_ranks):
+        self.violations = list(violations)
+        self.requested_ranks = dict(requested_ranks)
+        detail = "; ".join(violation["message"] for violation in self.violations)
+        super().__init__(detail)
+
+
 class NashRankAllocator:
     """Allocate a global LoRA rank budget with a weighted Nash gain.
 
-    ``max_rank`` is the number of slots physically present in each adapter.
+    ``max_rank`` is the maximum number of active slots allowed in each adapter;
+    it may be smaller than the physical AdaLoRA rank.  Candidate components are
+    selected by energy from all physical slots, never by their storage index.
     ``rank_budget`` is the desired sum of active slots across all layers.
     Rank allocation is recomputed from the current gradients and ``lora_E``
     values whenever :meth:`step` is called.
@@ -257,13 +269,16 @@ class NashRankAllocator:
         return dict(zip(self.layers.keys(), values.tolist()))
 
     def _spectral_energy(self, name):
+        """Return the strongest ``max_rank`` energies from every physical slot."""
         energy = self.spectral_shadow[name].abs().square()
         max_rank = self.max_ranks[name]
         if energy.numel() < max_rank:
             energy = torch.nn.functional.pad(energy, (0, max_rank - energy.numel()))
-        elif energy.numel() > max_rank:
-            energy = energy[:max_rank]
-        return torch.sort(energy, descending=True).values
+        # Sort before applying the configured ceiling.  Physical AdaLoRA uses
+        # init_r slots (often rank * 2), and useful components can occupy any
+        # slot; slicing first would permanently exclude high-energy components
+        # whose storage index happens to be >= max_rank.
+        return torch.sort(energy, descending=True).values[:max_rank]
 
     def _utility(self, name):
         """Build U_l(r) for r=0..r_l_max from the shadow spectrum."""
@@ -405,18 +420,91 @@ class NashRankAllocator:
             self.spectral_shadow[name] = shadow.detach().clone()
 
     def _apply_allocation(self, ranks, energies=None):
+        # Validate the complete candidate before mutating any lora_E tensor or
+        # mask.  This makes a rejected allocation transactional: callers can
+        # catch RankAllocationConstraintError and safely retain the previous
+        # valid topology without a partially applied result.
+        self._validate_rank_allocation(ranks)
         for name, module in self.layers.items():
             e = module.lora_E[self.adapter_name]
             raw = self.spectral_shadow[name].to(device=e.device, dtype=e.dtype)
             max_rank = self.max_ranks[name]
-            energy = raw[:max_rank].abs().square()
-            k = min(int(ranks[name]), energy.numel())
+            # Rank is a count ceiling, not a prefix of physical slot indices.
+            # Select the strongest active components across the full init_r
+            # vector while activating no more than max_rank of them.
+            energy = raw.abs().square()
+            k = min(int(ranks[name]), max_rank, energy.numel())
             indices = torch.topk(energy, k=k, largest=True, sorted=False).indices
             mask = torch.zeros_like(raw)
             mask[indices] = 1.0
             with torch.no_grad():
                 e.copy_((raw * mask).view_as(e))
             self.masks[name] = mask
+
+    def _validate_rank_allocation(self, ranks):
+        """Reject an invalid complete allocation before it changes the model."""
+        requested = dict(ranks)
+        violations = []
+        expected_names = set(self.layers)
+        missing = expected_names.difference(requested)
+        unexpected = set(requested).difference(expected_names)
+        for name in sorted(missing):
+            violations.append({
+                "layer_name": name,
+                "requested_rank": None,
+                "min_rank": self.min_ranks[name],
+                "max_rank": self.max_ranks[name],
+                "reason": "missing_layer",
+                "message": f"allocation is missing layer {name}",
+            })
+        for name in sorted(unexpected):
+            violations.append({
+                "layer_name": name,
+                "requested_rank": requested[name],
+                "min_rank": None,
+                "max_rank": None,
+                "reason": "unexpected_layer",
+                "message": f"allocation contains unexpected layer {name}",
+            })
+
+        validated_ranks = {}
+        for name in self.layers:
+            if name not in requested:
+                continue
+            rank = int(requested[name])
+            validated_ranks[name] = rank
+            minimum = int(self.min_ranks[name])
+            maximum = int(self.max_ranks[name])
+            if rank < minimum or rank > maximum:
+                violations.append({
+                    "layer_name": name,
+                    "requested_rank": rank,
+                    "min_rank": minimum,
+                    "max_rank": maximum,
+                    "reason": "rank_out_of_bounds",
+                    "message": (
+                        f"layer {name} requested rank {rank}, allowed range "
+                        f"is [{minimum}, {maximum}]"
+                    ),
+                })
+
+        if len(validated_ranks) == len(self.layers):
+            requested_total = sum(validated_ranks.values())
+            if requested_total != self.rank_budget:
+                violations.append({
+                    "layer_name": None,
+                    "requested_rank": requested_total,
+                    "min_rank": self.rank_budget,
+                    "max_rank": self.rank_budget,
+                    "reason": "global_budget_mismatch",
+                    "message": (
+                        f"allocation total rank {requested_total} does not match "
+                        f"global budget {self.rank_budget}"
+                    ),
+                })
+
+        if violations:
+            raise RankAllocationConstraintError(violations, requested)
 
     def enforce_masks(self):
         """Keep previously deactivated spectral slots zero after optimizer.step()."""
@@ -504,8 +592,10 @@ class NashRankAllocator:
         self._refresh_spectral_shadow()
         previous_ranks = dict(self.ranks)
         ranks, utilities, weights = self._choose_ranks()
+        # Do not publish candidate ranks until the full allocation has passed
+        # validation and its masks have been applied successfully.
+        self._apply_allocation(ranks, utilities)
         self.ranks = OrderedDict(ranks)
-        self._apply_allocation(self.ranks, utilities)
         self.last_step = step
         diagnostic_step = self.ema_step if step is None else step
         self.last_diagnostics = self._build_diagnostics(

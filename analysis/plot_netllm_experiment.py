@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allocator-state", type=Path)
     parser.add_argument("--allocator-diagnostics", type=Path)
+    parser.add_argument(
+        "--checkpoint-role",
+        choices=("best", "best_ar", "best_post_nbs", "final_nbs"),
+        default="best",
+    )
     return parser.parse_args()
 
 
@@ -202,16 +207,21 @@ def main() -> None:
         "nbs_v3": "NBS-NetLLM v3",
         "nbs_v4": "NBS-NetLLM v4",
         "nbs_v5": "NBS-NetLLM v5",
-        "nbs_v6": "NBS-NetLLM v6 (min4-max32-budget1024)",
-        "nbs_v7": "NBS-NetLLM v7 (min8-max32-budget1024)",
-        "nbs_v8": "NBS-NetLLM v8 (min8-max32-budget1280)",
+        "nbs_v6": "NBS-NetLLM v6 (min2-max32-budget256)",
+        "nbs_v7": "NBS-NetLLM v7 (min4-max32-budget512)",
+        "nbs_v8": "NBS-NetLLM v8 (min4-max32-budget768)",
         "plain": "NetLLM",
     }
     display_name = display_names[args.variant]
+    display_title = (
+        display_name if args.checkpoint_role == "best"
+        else f"{display_name} [{args.checkpoint_role}]"
+    )
 
     summary = {
         "variant": args.variant,
         "display_name": display_name,
+        "checkpoint_role": args.checkpoint_role,
         "aggregate_mae": aggregate["mae"],
         "aggregate_rmse": aggregate["rmse"],
         "evaluated_pair_count": len(per_pair),
@@ -244,7 +254,7 @@ def main() -> None:
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
 
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
-    fig.suptitle(f"{display_name} training and evaluation")
+    fig.suptitle(f"{display_title} training and evaluation")
     if train_finite:
         axes[0, 0].plot(
             [point["step"] for point in train_finite],

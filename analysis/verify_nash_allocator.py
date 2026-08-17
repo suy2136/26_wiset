@@ -8,13 +8,14 @@ shadow-based reallocation, and allocator checkpoint restoration.
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
 
-from models.rank_allocator import NashRankAllocator
+from models.rank_allocator import NashRankAllocator, RankAllocationConstraintError
 
 
 class FakeAdaLayer(nn.Module):
@@ -147,6 +148,75 @@ def check_utility_concavity_and_gain_monotonicity():
     print("[PASS] normalized spectral utility concavity and diminishing gains")
 
 
+def check_max_rank_uses_all_physical_slots():
+    model = FakeAdaModel(n_layers=1, rank=6)
+    layer = next(module for _, module in model.named_modules() if isinstance(module, FakeAdaLayer))
+    with torch.no_grad():
+        layer.lora_E["default"].copy_(
+            torch.tensor([[1.0], [2.0], [3.0], [100.0], [90.0], [80.0]])
+        )
+
+    allocator = NashRankAllocator(
+        model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=3,
+        rank_budget=2,
+    )
+    name, adapted_layer = next(iter(allocator.layers.items()))
+    torch.testing.assert_close(
+        allocator._spectral_energy(name),
+        torch.tensor([10000.0, 8100.0, 6400.0]),
+    )
+    active_indices = set(
+        torch.nonzero(
+            adapted_layer.lora_E["default"].detach().reshape(-1),
+            as_tuple=True,
+        )[0].tolist()
+    )
+    assert active_indices == {3, 4}, active_indices
+    assert allocator.active_rank_summary()[name] == 2
+    print("[PASS] max_rank selects top-energy components across all physical slots")
+
+
+def check_invalid_allocation_is_transactional():
+    model = FakeAdaModel(n_layers=2, rank=6)
+    allocator = NashRankAllocator(
+        model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=3,
+        rank_budget=4,
+    )
+    previous_ranks = allocator.active_rank_summary()
+    previous_masks = {
+        name: mask.clone() for name, mask in allocator.masks.items()
+    }
+    previous_values = {
+        name: module.lora_E["default"].detach().clone()
+        for name, module in allocator.layers.items()
+    }
+    invalid = dict(previous_ranks)
+    invalid[next(iter(invalid))] = 4
+    try:
+        allocator._apply_allocation(invalid)
+    except RankAllocationConstraintError as exc:
+        assert any(
+            violation["reason"] == "rank_out_of_bounds"
+            for violation in exc.violations
+        )
+    else:
+        raise AssertionError("invalid allocation did not raise a constraint error")
+
+    assert allocator.active_rank_summary() == previous_ranks
+    for name, module in allocator.layers.items():
+        torch.testing.assert_close(allocator.masks[name], previous_masks[name])
+        torch.testing.assert_close(
+            module.lora_E["default"].detach(), previous_values[name]
+        )
+    print("[PASS] invalid allocation is rejected without partial mask changes")
+
+
 def check_shadow_reallocation_and_restore():
     model = FakeAdaModel(n_layers=1, rank=6)
     allocator = NashRankAllocator(model, target_rank=2, min_rank=1, max_rank=6)
@@ -238,6 +308,15 @@ def check_optional_real_adalora():
         TinyModel(), "llama", rank=2, task_type=TaskType.FEATURE_EXTRACTION,
         use_adalora=True, total_step=4, adalora_min_rank=1,
         adalora_rank_budget=4, adalora_allocation_interval=2,
+        adalora_rank_config={
+            "*.layers.*.q_proj": {"min_rank": 1, "max_rank": 2},
+            "*.layers.*.v_proj": {"min_rank": 1, "max_rank": 2},
+        },
+    )
+    assert wrapped.nash_physical_rank == 2
+    assert all(
+        module.lora_E["default"].numel() == 2
+        for module in wrapped.nash_rank_allocator.layers.values()
     )
     optimizer = torch.optim.AdamW(wrapped.parameters(), lr=1e-2)
     for step in range(4):
@@ -255,6 +334,9 @@ def check_optional_real_adalora():
         optimizer.zero_grad()
     ranks = allocator.active_rank_summary()
     assert sum(ranks.values()) == 4, ranks
+    with tempfile.TemporaryDirectory() as checkpoint_dir:
+        wrapped.save_pretrained(checkpoint_dir)
+        assert os.path.exists(os.path.join(checkpoint_dir, "adapter_model.bin"))
     print("[PASS] real PEFT AdaLoRA forward/backward and custom allocator smoke test")
 
     # PEFT 0.6.2 keeps AdaLoRA A/B/E in fp32 even when the frozen base model
@@ -345,6 +427,8 @@ def main():
     check_initial_budget_and_schedule()
     check_sensitivity_weights()
     check_utility_concavity_and_gain_monotonicity()
+    check_max_rank_uses_all_physical_slots()
+    check_invalid_allocation_is_transactional()
     check_shadow_reallocation_and_restore()
     check_optional_real_adalora()
     print("All Nash allocator checks completed.")
