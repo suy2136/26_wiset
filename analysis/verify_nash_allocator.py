@@ -96,6 +96,7 @@ def check_initial_budget_and_schedule():
         "optimizer_step", "phase", "event", "layer_name",
         "transformer_layer_index", "module_type", "rank", "sensitivity",
         "alpha", "spectral_energy_total", "utility",
+        "next_utility_increment", "next_marginal_utility_gain",
         "next_marginal_gain", "at_min_rank", "at_max_rank", "rank_delta",
         "total_rank", "rank_budget",
     }
@@ -140,6 +141,9 @@ def check_utility_concavity_and_gain_monotonicity():
     weight = 1.0
     gains = [allocator._marginal_gain(utility, rank, weight) for rank in range(6)]
     assert all(gains[i] >= gains[i + 1] - 1e-7 for i in range(5)), gains
+    for rank in range(6):
+        marginal_utility_gain = allocator._marginal_utility_gain(utility, rank)
+        assert abs(gains[rank] - weight * marginal_utility_gain) < 1e-8
     print("[PASS] normalized spectral utility concavity and diminishing gains")
 
 

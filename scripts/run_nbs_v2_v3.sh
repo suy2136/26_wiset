@@ -8,6 +8,8 @@ cd "$REPO_ROOT"
 # Match the completed v1/plain experiments unless explicitly overridden.
 export EPOCHS="${EPOCHS:-4}"
 export CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-8820}"
+export VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-$CHECKPOINT_INTERVAL}"
+export SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 export EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 
 echo "Shared conditions: epochs=$EPOCHS, validation/checkpoint interval=$CHECKPOINT_INTERVAL"

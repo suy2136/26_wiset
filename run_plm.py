@@ -27,7 +27,8 @@ from models.low_rank import peft_model, print_trainable_parameters
 NASH_DIAGNOSTIC_FIELDS = [
     'optimizer_step', 'phase', 'event', 'layer_name',
     'transformer_layer_index', 'module_type', 'rank', 'sensitivity',
-    'alpha', 'spectral_energy_total', 'utility', 'next_marginal_gain',
+    'alpha', 'spectral_energy_total', 'utility', 'next_utility_increment',
+    'next_marginal_utility_gain', 'next_marginal_gain',
     'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
     'total_rank', 'rank_budget', 'validation_event', 'validation_loss',
     'teacher_forcing_validation_loss',
@@ -91,6 +92,21 @@ def _last_validation_event(path):
             if value:
                 last_event = max(last_event, int(value))
     return last_event
+
+
+def _save_allocator_snapshot(path, allocator, diagnostics, metadata):
+    """Atomically save a small, model-free allocator state snapshot."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    snapshot = allocator.state_dict()
+    snapshot['snapshot_metadata'] = dict(metadata)
+    snapshot['diagnostics'] = copy.deepcopy(diagnostics)
+    temporary_path = path + '.tmp'
+    try:
+        torch.save(snapshot, temporary_path)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 def save_model(args, model, save_dir):
@@ -163,7 +179,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
                   f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     checkpoint_path = os.path.join(models_dir, file_prefix, 'checkpoint')
-    if not os.path.exists(checkpoint_path):
+    if ((args.save_checkpoint_per_step is not None or
+         args.save_checkpoint_per_epoch is not None) and
+            not os.path.exists(checkpoint_path)):
         os.makedirs(checkpoint_path)
     best_model_path = os.path.join(models_dir, file_prefix, 'best_model')
     if not os.path.exists(best_model_path):
@@ -177,6 +195,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
     allocator = None
     nash_diagnostics_path = None
+    allocator_snapshot_dir = None
     validation_event_count = 0
     if args.rank != -1 and args.use_adalora:
         allocator = pipeline.plm.nash_rank_allocator
@@ -184,6 +203,10 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             models_dir, file_prefix, 'nbs_rank_diagnostics.csv'
         )
         _initialize_nash_diagnostics(nash_diagnostics_path, append=args.resume)
+        allocator_snapshot_dir = os.path.join(
+            os.path.dirname(nash_diagnostics_path), 'rank_snapshots'
+        )
+        os.makedirs(allocator_snapshot_dir, exist_ok=True)
         validation_event_count = _last_validation_event(nash_diagnostics_path)
         initial_event = 'resume' if args.resume else 'initialization'
         _append_nash_diagnostics(
@@ -318,6 +341,27 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     'is_best_validation': int(improved),
                 })
             _append_nash_diagnostics(nash_diagnostics_path, validation_rows)
+            snapshot_path = os.path.join(
+                allocator_snapshot_dir,
+                f'validation_{validation_event_count:04d}_{position_kind}_{position}.pt',
+            )
+            _save_allocator_snapshot(
+                snapshot_path,
+                allocator,
+                validation_rows,
+                {
+                    'optimizer_step': int(opt_step),
+                    'validation_event': int(validation_event_count),
+                    'validation_position_kind': position_kind,
+                    'validation_position': int(position),
+                    'validation_loss': float(valid_loss),
+                    'teacher_forcing_validation_loss': float(
+                        teacher_forcing_valid_loss
+                    ),
+                    'is_best_validation': bool(improved),
+                },
+            )
+            print('NBS allocator snapshot saved at', snapshot_path)
 
         best_position = best_step if position_kind == 'step' else best_epoch
         print('Teacher-forcing validation loss', teacher_forcing_valid_loss)

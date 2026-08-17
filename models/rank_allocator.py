@@ -273,9 +273,23 @@ class NashRankAllocator:
         return self.eps + cumulative / total
 
     def _marginal_gain(self, utility, rank, weight):
+        marginal_utility_gain = self._marginal_utility_gain(utility, rank)
+        if marginal_utility_gain == float("-inf"):
+            return float("-inf")
+        return float(weight * marginal_utility_gain)
+
+    @staticmethod
+    def _utility_increment(utility, rank):
         if rank + 1 >= utility.numel():
             return float("-inf")
-        return float(weight * torch.log(utility[rank + 1] / utility[rank]).item())
+        return float((utility[rank + 1] - utility[rank]).item())
+
+    @staticmethod
+    def _marginal_utility_gain(utility, rank):
+        """Unweighted log utility gain for adding the next rank unit."""
+        if rank + 1 >= utility.numel():
+            return float("-inf")
+        return float(torch.log(utility[rank + 1] / utility[rank]).item())
 
     def _choose_ranks(self):
         weights = self._weights()
@@ -330,7 +344,13 @@ class NashRankAllocator:
             layer_index, module_type = self._module_coordinates(name)
             utility = utilities[name]
             next_gain = None
+            next_utility_increment = None
+            next_marginal_utility_gain = None
             if rank < max_rank:
+                next_utility_increment = self._utility_increment(utility, rank)
+                next_marginal_utility_gain = self._marginal_utility_gain(
+                    utility, rank
+                )
                 next_gain = self._marginal_gain(utility, rank, weights[name])
             rows.append({
                 "optimizer_step": int(step),
@@ -346,6 +366,8 @@ class NashRankAllocator:
                     self._spectral_energy(name).sum().item()
                 ),
                 "utility": float(utility[rank].item()),
+                "next_utility_increment": next_utility_increment,
+                "next_marginal_utility_gain": next_marginal_utility_gain,
                 "next_marginal_gain": next_gain,
                 "min_rank": min_rank,
                 "max_rank": max_rank,

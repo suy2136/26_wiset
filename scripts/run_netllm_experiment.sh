@@ -14,11 +14,16 @@ fi
 
 EPOCHS="${EPOCHS:-40}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
-VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-$CHECKPOINT_INTERVAL}"
+VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-500}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
+SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
         "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "EPOCHS, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL, and EVAL_PROGRESS_INTERVAL must be positive integers."
+  exit 2
+fi
+if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1" ]]; then
+  echo "SAVE_PERIODIC_CHECKPOINTS must be 0 or 1."
   exit 2
 fi
 
@@ -158,8 +163,9 @@ run_logged() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
-  "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" "$EVAL_PROGRESS_INTERVAL" \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nbest_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+  "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
+  "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" \
   "$BEST_MODEL" "$RESULT_CSV" "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
   "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
@@ -180,11 +186,15 @@ TRAIN_CMD=(
   --bs 1
   --grad-accum-steps 32
   --steps-per-valid "$VALIDATION_INTERVAL"
-  --save-checkpoint-per-step "$CHECKPOINT_INTERVAL"
-  --save-checkpoint-per-epoch 1
   --seed 1
   "${EXTRA_ARGS[@]}"
 )
+if [[ "$SAVE_PERIODIC_CHECKPOINTS" == "1" ]]; then
+  TRAIN_CMD+=(
+    --save-checkpoint-per-step "$CHECKPOINT_INTERVAL"
+    --save-checkpoint-per-epoch 1
+  )
+fi
 
 echo "[$DISPLAY_NAME] training started; artifacts: $RUN_DIR"
 if run_logged "$RUN_DIR/train.log" env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "${TRAIN_CMD[@]}"; then

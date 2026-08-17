@@ -1,5 +1,10 @@
 """Regression checks for viewport loss and rotation-aware evaluation metrics."""
 
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import numpy as np
 import torch
 
