@@ -7,8 +7,9 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v3" && "$VARIANT" != "nbs_v4" && \
       "$VARIANT" != "nbs_v5" && "$VARIANT" != "nbs_v6" && \
       "$VARIANT" != "nbs_v7" && "$VARIANT" != "nbs_v8" && \
+      "$VARIANT" != "nbs_v9" && "$VARIANT" != "nbs_v10" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|plain}"
   exit 2
 fi
 
@@ -37,7 +38,8 @@ SCHEDULED_SAMPLING="False"
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
       "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
-      "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" ]]; then
+      "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" || \
+      "$VARIANT" == "nbs_v9" || "$VARIANT" == "nbs_v10" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
@@ -115,6 +117,30 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
       --experiment-tag nbs_v8
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v9" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v9"
+    DISPLAY_NAME="NBS-NetLLM v9 (min4-max32-budget896, initial-rank14)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=896
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v9
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v10" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v10"
+    DISPLAY_NAME="NBS-NetLLM v10 (min4-max32-budget640, initial-rank10)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=640
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v10
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
