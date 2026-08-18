@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         "--variant",
         choices=("nbs", "nbs_v2", "nbs_v3", "nbs_v4", "nbs_v5",
                  "nbs_v6", "nbs_v7", "nbs_v8", "nbs_v9", "nbs_v10",
-                 "plain"),
+                 "nbs_v11", "nbs_v12", "uniform_r12", "plain"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allocator-state", type=Path)
     parser.add_argument("--allocator-diagnostics", type=Path)
+    parser.add_argument("--latency-json", type=Path)
     parser.add_argument(
         "--checkpoint-role",
         choices=("best", "best_ar", "best_post_nbs", "final_nbs"),
@@ -133,6 +134,13 @@ def read_allocator_diagnostics(path: Path | None) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def read_latency(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def plot_rank_trajectory(rows: list[dict[str, str]], output_dir: Path) -> Path | None:
     if not rows:
         return None
@@ -199,6 +207,7 @@ def main() -> None:
     aggregate, per_pair = read_results(args.result_csv)
     allocator = read_allocator_state(args.allocator_state)
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
+    latency = read_latency(args.latency_json)
     train_finite = finite_losses(train_curve)
     valid_finite = finite_losses(valid_curve)
     teacher_forcing_valid_finite = finite_losses(teacher_forcing_valid_curve)
@@ -213,6 +222,9 @@ def main() -> None:
         "nbs_v8": "NBS-NetLLM v8 (min4-max32-budget768)",
         "nbs_v9": "NBS-NetLLM v9 (min4-max32-budget896)",
         "nbs_v10": "NBS-NetLLM v10 (min4-max32-budget640)",
+        "nbs_v11": "NBS-NetLLM v11 (min2-max32-budget768)",
+        "nbs_v12": "NBS-NetLLM v12 (min4-max32-budget736)",
+        "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
         "plain": "NetLLM",
     }
     display_name = display_names[args.variant]
@@ -245,12 +257,14 @@ def main() -> None:
                 for row in diagnostic_rows
             }),
         },
+        "inference_latency": latency,
         "source_files": {
             "train_log": str(args.train_log),
             "result_csv": str(args.result_csv),
             "allocator_diagnostics": (
                 str(args.allocator_diagnostics) if args.allocator_diagnostics else None
             ),
+            "latency_json": str(args.latency_json) if args.latency_json else None,
         },
     }
     summary_path = args.output_dir / "summary.json"
@@ -299,6 +313,17 @@ def main() -> None:
     )
     axes[1, 0].set_title("Aggregate metrics (lower is better)")
     axes[1, 0].grid(axis="y", alpha=0.25)
+    if latency and latency.get("mean_s") is not None:
+        axes[1, 0].text(
+            0.98, 0.96,
+            "Latency: mean {:.1f} ms\np50 {:.1f} ms / p95 {:.1f} ms".format(
+                latency["mean_s"] * 1000.0,
+                latency["median_s"] * 1000.0,
+                latency["p95_s"] * 1000.0,
+            ),
+            transform=axes[1, 0].transAxes,
+            ha="right", va="top", fontsize=9,
+        )
 
     finite_mae = [row["mae"] for row in per_pair if math.isfinite(row["mae"])]
     if finite_mae:
@@ -323,7 +348,10 @@ def main() -> None:
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
         axes[1, 2].set(title="NBS allocated ranks", xlabel="Rank", ylabel="Layers")
     else:
-        axes[1, 2].text(0.5, 0.5, "Uniform rank = 32", ha="center", va="center")
+        uniform_rank = 12 if args.variant == "uniform_r12" else 32
+        axes[1, 2].text(
+            0.5, 0.5, f"Uniform rank = {uniform_rank}", ha="center", va="center"
+        )
         axes[1, 2].set_title("LoRA rank allocation")
 
     figure_path = args.output_dir / f"{args.variant}_training_evaluation.png"

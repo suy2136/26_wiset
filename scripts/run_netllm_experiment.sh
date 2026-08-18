@@ -8,8 +8,9 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v5" && "$VARIANT" != "nbs_v6" && \
       "$VARIANT" != "nbs_v7" && "$VARIANT" != "nbs_v8" && \
       "$VARIANT" != "nbs_v9" && "$VARIANT" != "nbs_v10" && \
-      "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|plain}"
+      "$VARIANT" != "nbs_v11" && "$VARIANT" != "nbs_v12" && \
+      "$VARIANT" != "uniform_r12" && "$VARIANT" != "plain" ]]; then
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|uniform_r12|plain}"
   exit 2
 fi
 
@@ -18,9 +19,14 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-500}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
+LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
         "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "EPOCHS, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL, and EVAL_PROGRESS_INTERVAL must be positive integers."
+  exit 2
+fi
+if ! [[ "$LATENCY_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
+  echo "LATENCY_WARMUP_STEPS must be a non-negative integer."
   exit 2
 fi
 if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1" ]]; then
@@ -35,11 +41,13 @@ mkdir -p "$RUN_DIR/figures"
 printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 
 SCHEDULED_SAMPLING="False"
+RANK=32
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
       "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
       "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" || \
-      "$VARIANT" == "nbs_v9" || "$VARIANT" == "nbs_v10" ]]; then
+      "$VARIANT" == "nbs_v9" || "$VARIANT" == "nbs_v10" || \
+      "$VARIANT" == "nbs_v11" || "$VARIANT" == "nbs_v12" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
@@ -144,6 +152,30 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
+  elif [[ "$VARIANT" == "nbs_v11" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v11"
+    DISPLAY_NAME="NBS-NetLLM v11 (min2-max32-budget768, initial-rank12)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=768
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v11
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v12" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v12"
+    DISPLAY_NAME="NBS-NetLLM v12 (min4-max32-budget736, initial-mean-rank11.5)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=736
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v12
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
   fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
@@ -154,14 +186,20 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     --adalora-diagnostics-path "$NBS_DIAGNOSTICS"
     "${EXPERIMENT_ARGS[@]}"
   )
+elif [[ "$VARIANT" == "uniform_r12" ]]; then
+  MODEL_TAG="llama_base_low_rank_uniform_r12"
+  DISPLAY_NAME="Uniform-rank NetLLM (rank12, total active rank768)"
+  RANK=12
+  RANK_BUDGET=768
+  EXTRA_ARGS=(--experiment-tag uniform_r12)
 else
   MODEL_TAG="llama_base_low_rank"
   DISPLAY_NAME="NetLLM"
   EXTRA_ARGS=()
 fi
 
-TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
-TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_32_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_0.0002_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
 MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
@@ -216,9 +254,9 @@ resolve_checkpoint() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
-  "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" \
+  "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
   "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \
   "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
@@ -235,7 +273,7 @@ TRAIN_CMD=(
   --device-out cuda
   --fp16
   --gradient-checkpointing
-  --rank 32
+  --rank "$RANK"
   --experiment-run-id "$RUN_ID"
   --epochs "$EPOCHS"
   --bs 1
@@ -311,6 +349,10 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
   mkdir -p "$ROLE_DIR/figures"
   PREDICTIONS_FILE="${ROLE_RESULT_CSV/_results.csv/_predictions.txt}"
   PER_SAMPLE_FILE="${ROLE_RESULT_CSV/_results.csv/_per_sample_results.csv}"
+  LATENCY_FILE="${ROLE_RESULT_CSV/_results.csv/_latency.json}"
+  LATENCY_DETAIL_FILE="${LATENCY_FILE%.json}_per_sample.csv"
+  LATENCY_PARTIAL_FILE="${LATENCY_FILE%.json}_partial.json"
+  LATENCY_PARTIAL_DETAIL_FILE="${LATENCY_FILE%.json}_partial_per_sample.csv"
   REUSED_FROM_DIR="${EVALUATED_DIR_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
   REUSED_FROM_ROLE="${EVALUATED_ROLE_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
 
@@ -330,6 +372,14 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     if [[ -f "$REUSED_FROM_DIR/partial_results.csv" ]]; then
       cp "$REUSED_FROM_DIR/partial_results.csv" "$ROLE_PARTIAL_RESULT_CSV"
       cp "$REUSED_FROM_DIR/partial_results.csv" "$ROLE_DIR/partial_results.csv"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/latency.json" ]]; then
+      cp "$REUSED_FROM_DIR/latency.json" "$LATENCY_FILE"
+      cp "$REUSED_FROM_DIR/latency.json" "$ROLE_DIR/latency.json"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/latency_per_sample.csv" ]]; then
+      cp "$REUSED_FROM_DIR/latency_per_sample.csv" "$LATENCY_DETAIL_FILE"
+      cp "$REUSED_FROM_DIR/latency_per_sample.csv" "$ROLE_DIR/latency_per_sample.csv"
     fi
     printf '{\n  "checkpoint_role": "%s",\n  "reused_from_role": "%s",\n  "canonical_checkpoint": "%s"\n}\n' \
       "$ROLE" "$REUSED_FROM_ROLE" "$CANONICAL_MODEL_PATH" \
@@ -351,7 +401,7 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       --device cuda
       --device-out cuda
       --fp16
-      --rank 32
+      --rank "$RANK"
       --experiment-run-id "$RUN_ID"
       --model-path "$MODEL_PATH"
       "${EVALUATION_TAG_ARGS[@]}"
@@ -359,6 +409,9 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       --bs 1
       --grad-accum-steps 32
       --save-test-progress-per-steps "$EVAL_PROGRESS_INTERVAL"
+      --measure-inference-latency
+      --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
+      --latency-output-path "$LATENCY_FILE"
       --seed 1
       "${EXTRA_ARGS[@]}"
     )
@@ -372,6 +425,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
             "$ROLE_PARTIAL_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
         cp "$ROLE_PARTIAL_RESULT_CSV" "$ROLE_DIR/partial_results.csv"
       fi
+      [[ -f "$LATENCY_PARTIAL_FILE" ]] && cp "$LATENCY_PARTIAL_FILE" "$ROLE_DIR/latency_partial.json"
+      [[ -f "$LATENCY_PARTIAL_DETAIL_FILE" ]] && cp "$LATENCY_PARTIAL_DETAIL_FILE" "$ROLE_DIR/latency_partial_per_sample.csv"
       write_status "evaluation_${ROLE}" "failed" "$code"
       echo "$ROLE evaluation failed. Completed outputs were preserved."
       exit "$code"
@@ -387,12 +442,20 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     cp "$ROLE_RESULT_CSV" "$ROLE_DIR/results.csv"
     [[ -f "$PREDICTIONS_FILE" ]] && cp "$PREDICTIONS_FILE" "$ROLE_DIR/predictions.txt"
     [[ -f "$PER_SAMPLE_FILE" ]] && cp "$PER_SAMPLE_FILE" "$ROLE_DIR/per_sample_results.csv"
+    [[ -f "$LATENCY_FILE" ]] && cp "$LATENCY_FILE" "$ROLE_DIR/latency.json"
+    [[ -f "$LATENCY_DETAIL_FILE" ]] && cp "$LATENCY_DETAIL_FILE" "$ROLE_DIR/latency_per_sample.csv"
     if [[ -f "$ROLE_PARTIAL_RESULT_CSV" && \
           "$ROLE_PARTIAL_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
       cp "$ROLE_PARTIAL_RESULT_CSV" "$ROLE_DIR/partial_results.csv"
     fi
     EVALUATED_DIR_BY_CHECKPOINT["$CANONICAL_MODEL_PATH"]="$ROLE_DIR"
     EVALUATED_ROLE_BY_CHECKPOINT["$CANONICAL_MODEL_PATH"]="$ROLE"
+  fi
+
+  if [[ ! -f "$ROLE_DIR/latency.json" ]]; then
+    write_status "evaluation_${ROLE}" "failed_missing_latency" 5
+    echo "Evaluation completed but latency summary is missing: $ROLE_DIR/latency.json"
+    exit 5
   fi
 
   PLOT_CMD=(
@@ -402,6 +465,7 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     --result-csv "$ROLE_DIR/results.csv"
     --output-dir "$ROLE_DIR/figures"
     --checkpoint-role "$ROLE"
+    --latency-json "$ROLE_DIR/latency.json"
   )
   if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
     PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
@@ -423,6 +487,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     cp "$ROLE_DIR/results.csv" "$RUN_DIR/results.csv"
     [[ -f "$ROLE_DIR/predictions.txt" ]] && cp "$ROLE_DIR/predictions.txt" "$RUN_DIR/predictions.txt"
     [[ -f "$ROLE_DIR/per_sample_results.csv" ]] && cp "$ROLE_DIR/per_sample_results.csv" "$RUN_DIR/per_sample_results.csv"
+    [[ -f "$ROLE_DIR/latency.json" ]] && cp "$ROLE_DIR/latency.json" "$RUN_DIR/latency.json"
+    [[ -f "$ROLE_DIR/latency_per_sample.csv" ]] && cp "$ROLE_DIR/latency_per_sample.csv" "$RUN_DIR/latency_per_sample.csv"
     cp -a "$ROLE_DIR/figures/." "$RUN_DIR/figures/"
   fi
 done

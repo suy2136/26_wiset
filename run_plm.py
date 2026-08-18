@@ -6,6 +6,7 @@ import json
 import math
 import os
 import random
+import time
 import torch
 import numpy as np
 import datetime
@@ -23,6 +24,7 @@ from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
 from models.low_rank import peft_model, print_trainable_parameters
 from models.rank_allocator import RankAllocationConstraintError
+from utils.latency_utils import write_latency_artifacts
 
 
 NASH_DIAGNOSTIC_FIELDS = [
@@ -98,10 +100,11 @@ def _last_validation_event(path):
     return last_event
 
 
-def _save_allocator_snapshot(path, allocator, diagnostics, metadata):
+def _save_allocator_snapshot(path, allocator, diagnostics, metadata,
+                             snapshot_state=None):
     """Atomically save a small, model-free allocator state snapshot."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    snapshot = allocator.state_dict()
+    snapshot = allocator.state_dict() if snapshot_state is None else snapshot_state
     snapshot['snapshot_metadata'] = dict(metadata)
     snapshot['diagnostics'] = copy.deepcopy(diagnostics)
     temporary_path = path + '.tmp'
@@ -300,6 +303,33 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             os.path.dirname(nash_diagnostics_path), 'rank_snapshots'
         )
         os.makedirs(allocator_snapshot_dir, exist_ok=True)
+        pre_mask_snapshot_path = os.path.join(
+            allocator_snapshot_dir, 'pre_mask_initial_spectrum.pt'
+        )
+        if not os.path.exists(pre_mask_snapshot_path):
+            try:
+                pre_mask_state = allocator.pre_mask_spectrum_state_dict()
+            except RuntimeError as exc:
+                print('Pre-mask initial spectrum snapshot unavailable:', exc)
+            else:
+                _save_allocator_snapshot(
+                    pre_mask_snapshot_path,
+                    allocator,
+                    diagnostics=[],
+                    metadata={
+                        'snapshot_kind': 'pre_mask_initialization',
+                        'optimizer_step': 0,
+                        'validation_event': 0,
+                        'validation_position_kind': 'initialization',
+                        'validation_position': 0,
+                        'nbs_allocation_started': False,
+                    },
+                    snapshot_state=pre_mask_state,
+                )
+                print(
+                    'Pre-mask initial spectrum snapshot saved at',
+                    pre_mask_snapshot_path,
+                )
         validation_event_count = _last_validation_event(nash_diagnostics_path)
         initial_event = 'resume' if args.resume else 'initialization'
         _append_nash_diagnostics(
@@ -713,6 +743,27 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
         allocator.enforce_masks()
         final_rows = allocator.snapshot_diagnostics(opt_step, event='final_nbs_model')
         _append_nash_diagnostics(nash_diagnostics_path, final_rows)
+        post_training_snapshot_path = os.path.join(
+            allocator_snapshot_dir, 'post_training_spectral_shadow.pt'
+        )
+        _save_allocator_snapshot(
+            post_training_snapshot_path,
+            allocator,
+            diagnostics=final_rows,
+            metadata={
+                'snapshot_kind': 'post_training',
+                'optimizer_step': int(opt_step),
+                'global_step': int(global_step),
+                'validation_event': int(validation_event_count),
+                'validation_loss': last_valid_loss,
+                'teacher_forcing_validation_loss': last_teacher_forcing_valid_loss,
+                'nbs_allocation_started': bool(allocator.last_step is not None),
+            },
+        )
+        print(
+            'Post-training spectral shadow snapshot saved at',
+            post_training_snapshot_path,
+        )
         final_metadata = {
             'checkpoint_role': 'final_nbs',
             'optimizer_step': int(opt_step),
@@ -762,6 +813,20 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     if progress_interval is not None and progress_interval <= 0:
         raise ValueError('--save-test-progress-per-steps must be positive')
     notebook = ResultNotebook()
+    measure_latency = bool(getattr(args, 'measure_inference_latency', False))
+    latency_warmup_steps = int(getattr(args, 'latency_warmup_steps', 5))
+    latency_deadline_s = float(getattr(args, 'latency_deadline_ms', 1000.0)) / 1000.0
+    if latency_warmup_steps < 0:
+        raise ValueError('--latency-warmup-steps must be non-negative')
+    if latency_deadline_s <= 0:
+        raise ValueError('--latency-deadline-ms must be positive')
+    latency_path = getattr(args, 'latency_output_path', None) or result_path.replace(
+        '_results.csv', '_latency.json'
+    )
+    partial_latency_path = latency_path.replace('.json', '_partial.json')
+    latency_elapsed_s = []
+    latency_records = []
+    latency_peak_memory_mb = float('nan')
 
     model_path = args.model_path if args.model_path is not None else best_model_path
     if os.path.exists(model_path):
@@ -779,11 +844,36 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     # (those came from a separate script that already called pipeline.eval() correctly),
     # but a real correctness issue for anyone using --adapt --test together.
     pipeline.eval()
+    test_step = 0
     with torch.no_grad():
         for test_step, (history, future, video_user_info) in enumerate(dataloader_test, start=1):
             history, future = history.to(args.device), future.to(args.device)
             history = normalize_data(history, args.train_dataset)
+            timed_call = measure_latency and test_step > latency_warmup_steps
+            if timed_call and history.is_cuda:
+                torch.cuda.synchronize(history.device)
+                if not latency_elapsed_s:
+                    torch.cuda.reset_peak_memory_stats(history.device)
+            started_at = time.perf_counter() if timed_call else None
             pred, gt = pipeline.inference(history, future, video_user_info)
+            if timed_call:
+                if history.is_cuda:
+                    torch.cuda.synchronize(history.device)
+                elapsed_s = time.perf_counter() - started_at
+                latency_elapsed_s.append(elapsed_s)
+                batch_size = int(history.shape[0]) if history.ndim > 0 else 1
+                latency_records.append({
+                    'test_step': int(test_step),
+                    'video': int(video_user_info[0]),
+                    'user': int(video_user_info[1]),
+                    'timestep': int(video_user_info[2]),
+                    'batch_size': batch_size,
+                    'latency_ms': elapsed_s * 1000.0,
+                })
+                if history.is_cuda:
+                    latency_peak_memory_mb = (
+                        torch.cuda.max_memory_allocated(history.device) / (1024 ** 2)
+                    )
             pred = denormalize_data(pred, args.test_dataset)
             videos, users, timesteps = [], [], []
             videos.append(int(video_user_info[0]))
@@ -794,10 +884,46 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             if progress_interval is not None and test_step % progress_interval == 0:
                 notebook.write(partial_result_path, write_predictions=False)
                 print(f'Partial evaluation results saved after {test_step} batches at {partial_result_path}')
+                if measure_latency:
+                    write_latency_artifacts(
+                        partial_latency_path,
+                        latency_elapsed_s,
+                        latency_records,
+                        deadline_s=latency_deadline_s,
+                        warmup_calls=min(test_step, latency_warmup_steps),
+                        total_calls=test_step,
+                        peak_memory_mb=latency_peak_memory_mb,
+                    )
+                    print(
+                        f'Partial latency results saved after {test_step} batches at '
+                        f'{partial_latency_path}'
+                    )
         notebook.write(result_path)
         print("show detail result:")
         detail_result_path = result_path.replace('_results.csv', '_per_sample_results.csv')
         notebook.write_detail(detail_result_path)
+        if measure_latency:
+            latency_summary, latency_detail_path = write_latency_artifacts(
+                latency_path,
+                latency_elapsed_s,
+                latency_records,
+                deadline_s=latency_deadline_s,
+                warmup_calls=min(test_step, latency_warmup_steps),
+                total_calls=test_step,
+                peak_memory_mb=latency_peak_memory_mb,
+            )
+            print('Latency summary saved at', latency_path)
+            print('Per-sample latency saved at', latency_detail_path)
+            if latency_summary['mean_s'] is not None:
+                print(
+                    'Inference latency: mean={:.3f} ms, median={:.3f} ms, '
+                    'p95={:.3f} ms over {} calls'.format(
+                        latency_summary['mean_s'] * 1000.0,
+                        latency_summary['median_s'] * 1000.0,
+                        latency_summary['p95_s'] * 1000.0,
+                        latency_summary['measured_calls'],
+                    )
+                )
 
 
 def run(args):
@@ -1085,6 +1211,15 @@ if __name__ == '__main__':
     parser.add_argument('--save-test-progress-per-steps', type=int, default=None,
                         help='Write a partial evaluation summary CSV every N test batches. '
                              'Useful for preserving progress if a long evaluation is interrupted.')
+    parser.add_argument('--measure-inference-latency', action='store_true',
+                        help='Measure pipeline.inference latency during the normal test pass. '
+                             'CUDA calls are synchronized; data loading and metric computation are excluded.')
+    parser.add_argument('--latency-warmup-steps', type=int, default=5,
+                        help='Number of initial evaluation calls excluded from latency statistics.')
+    parser.add_argument('--latency-deadline-ms', type=float, default=1000.0,
+                        help='Optional real-time deadline used to report latency margin (milliseconds).')
+    parser.add_argument('--latency-output-path', type=str, default=None,
+                        help='Optional JSON output path for latency summary; a per-sample CSV is written beside it.')
     parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
@@ -1110,7 +1245,7 @@ if __name__ == '__main__':
     parser.add_argument('--experiment-tag',
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
                                  'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
-                                 'nbs_v10'],
+                                 'nbs_v10', 'nbs_v11', 'nbs_v12', 'uniform_r12'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(

@@ -71,6 +71,8 @@ class NashRankAllocator:
         self.ranks = OrderedDict()
         self.masks = OrderedDict()
         self.spectral_shadow = OrderedDict()
+        self.initial_spectral_shadow = OrderedDict()
+        self.initial_spectrum_is_exact = True
         self.last_gains = OrderedDict()
         self.last_diagnostics = []
         self.last_step = None
@@ -111,6 +113,15 @@ class NashRankAllocator:
                 module.lora_E[self.adapter_name].detach().float().reshape(-1).clone()
             )
 
+        # Preserve the full candidate spectrum before the first rank mask is
+        # ever applied.  The live spectral_shadow is subsequently refreshed
+        # during training, whereas this copy remains an immutable experimental
+        # reference for separating initialization from allocation-conditioned
+        # spectral behavior.
+        self.initial_spectral_shadow = OrderedDict(
+            (name, values.detach().clone())
+            for name, values in self.spectral_shadow.items()
+        )
         self._apply_allocation(self.ranks)
         self.snapshot_diagnostics(step=0, event="initialization")
 
@@ -521,7 +532,7 @@ class NashRankAllocator:
     def state_dict(self):
         """Return allocator state separately from the PEFT adapter state."""
         return {
-            "version": 2,
+            "version": 3,
             "target_rank": self.target_rank,
             "rank_budget": self.rank_budget,
             "ema_beta": self.ema_beta,
@@ -539,8 +550,32 @@ class NashRankAllocator:
             "spectral_shadow": {
                 name: values.detach().cpu() for name, values in self.spectral_shadow.items()
             },
+            "initial_spectral_shadow": {
+                name: values.detach().cpu()
+                for name, values in self.initial_spectral_shadow.items()
+            },
+            "initial_spectrum_is_exact": bool(self.initial_spectrum_is_exact),
             "last_step": self.last_step,
         }
+
+    def pre_mask_spectrum_state_dict(self):
+        """Return a snapshot whose spectrum predates the first rank mask."""
+        if not self.initial_spectrum_is_exact or not self.initial_spectral_shadow:
+            raise RuntimeError(
+                "exact pre-mask spectrum is unavailable in this allocator state"
+            )
+        state = self.state_dict()
+        state["spectral_shadow"] = {
+            name: values.detach().cpu()
+            for name, values in self.initial_spectral_shadow.items()
+        }
+        state["ranks"] = dict(self.max_ranks)
+        state["masks"] = {
+            name: torch.ones_like(values, device="cpu")
+            for name, values in self.initial_spectral_shadow.items()
+        }
+        state["last_step"] = None
+        return state
 
     def load_state_dict(self, state):
         """Restore allocator state after the PEFT adapter has been loaded."""
@@ -558,6 +593,24 @@ class NashRankAllocator:
         )
         self.ema_step = int(state.get("ema_step", 0))
         self.ranks.update({name: int(value) for name, value in state.get("ranks", {}).items()})
+        initial_shadow = state.get("initial_spectral_shadow")
+        initial_exact = bool(state.get("initial_spectrum_is_exact", False))
+        self.initial_spectral_shadow = OrderedDict()
+        if initial_shadow is not None and initial_exact:
+            for name in self.layers:
+                if name not in initial_shadow:
+                    raise ValueError(
+                        f"allocator checkpoint is missing initial spectrum for {name}"
+                    )
+                self.initial_spectral_shadow[name] = (
+                    initial_shadow[name].detach().float().reshape(-1).clone()
+                )
+            self.initial_spectrum_is_exact = True
+        else:
+            # Version <=2 checkpoints did not preserve the pre-mask spectrum.
+            # Do not silently label their current shadow as an initialization
+            # measurement.
+            self.initial_spectrum_is_exact = False
         for name in self.layers:
             module = self.layers[name]
             e = module.lora_E[self.adapter_name]

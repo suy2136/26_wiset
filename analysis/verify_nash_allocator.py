@@ -222,6 +222,15 @@ def check_shadow_reallocation_and_restore():
     allocator = NashRankAllocator(model, target_rank=2, min_rank=1, max_rank=6)
     name, layer = next(iter(allocator.layers.items()))
     original_shadow = allocator.spectral_shadow[name].clone()
+    initial_shadow = allocator.initial_spectral_shadow[name].clone()
+    pre_mask_state = allocator.pre_mask_spectrum_state_dict()
+    assert_close(
+        pre_mask_state["spectral_shadow"][name],
+        initial_shadow.cpu(),
+        "pre-mask snapshot did not preserve the initialization spectrum",
+    )
+    assert pre_mask_state["ranks"][name] == allocator.max_ranks[name]
+    assert torch.all(pre_mask_state["masks"][name] == 1)
     allocator.allocate(step=1)
     masked_before = allocator.masks[name].clone()
 
@@ -233,6 +242,11 @@ def check_shadow_reallocation_and_restore():
     allocator.enforce_masks()
     assert torch.all(allocator.spectral_shadow[name][inactive] == 3.25)
     assert torch.all(layer.lora_E["default"].reshape(-1)[inactive] == 0)
+    assert_close(
+        allocator.initial_spectral_shadow[name],
+        initial_shadow,
+        "immutable pre-mask spectrum changed during training",
+    )
 
     state = allocator.state_dict()
     restored_model = FakeAdaModel(n_layers=1, rank=6)
@@ -244,6 +258,12 @@ def check_shadow_reallocation_and_restore():
         allocator.spectral_shadow[name],
         "spectral shadow was not restored",
     )
+    assert restored.initial_spectrum_is_exact
+    assert_close(
+        restored.initial_spectral_shadow[restored_name],
+        initial_shadow,
+        "pre-mask spectrum was not restored",
+    )
     assert_close(
         restored_layer.lora_E["default"].detach(),
         layer.lora_E["default"].detach(),
@@ -252,7 +272,10 @@ def check_shadow_reallocation_and_restore():
     assert restored.warmup_steps == allocator.warmup_steps
     assert restored.cooldown_start_step == allocator.cooldown_start_step
     assert restored.allocation_interval == allocator.allocation_interval
-    print("[PASS] shadow-based reallocation independence and checkpoint restoration")
+    print(
+        "[PASS] immutable pre-mask spectrum, shadow-based reallocation, "
+        "and checkpoint restoration"
+    )
 
 
 def check_optional_real_adalora():
