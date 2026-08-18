@@ -1109,7 +1109,8 @@ if __name__ == '__main__':
                              'Defaults to the current training artifact directory.')
     parser.add_argument('--experiment-tag',
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
-                                 'nbs_v6', 'nbs_v7', 'nbs_v8'],
+                                 'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
+                                 'nbs_v10'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(

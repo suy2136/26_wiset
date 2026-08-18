@@ -31,7 +31,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--variant",
         choices=("nbs", "nbs_v2", "nbs_v3", "nbs_v4", "nbs_v5",
-                 "nbs_v6", "nbs_v7", "nbs_v8", "plain"),
+                 "nbs_v6", "nbs_v7", "nbs_v8", "nbs_v9", "nbs_v10",
+                 "plain"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
@@ -210,6 +211,8 @@ def main() -> None:
         "nbs_v6": "NBS-NetLLM v6 (min2-max32-budget256)",
         "nbs_v7": "NBS-NetLLM v7 (min4-max32-budget512)",
         "nbs_v8": "NBS-NetLLM v8 (min4-max32-budget768)",
+        "nbs_v9": "NBS-NetLLM v9 (min4-max32-budget896)",
+        "nbs_v10": "NBS-NetLLM v10 (min4-max32-budget640)",
         "plain": "NetLLM",
     }
     display_name = display_names[args.variant]
