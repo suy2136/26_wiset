@@ -9,8 +9,10 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v7" && "$VARIANT" != "nbs_v8" && \
       "$VARIANT" != "nbs_v9" && "$VARIANT" != "nbs_v10" && \
       "$VARIANT" != "nbs_v11" && "$VARIANT" != "nbs_v12" && \
-      "$VARIANT" != "uniform_r12" && "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|uniform_r12|plain}"
+      "$VARIANT" != "nbs_v12_repeat" && "$VARIANT" != "nbs_v13" && \
+      "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
+      "$VARIANT" != "plain" ]]; then
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|uniform_r12|uniform_b736|plain}"
   exit 2
 fi
 
@@ -47,7 +49,8 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
       "$VARIANT" == "nbs_v7" || "$VARIANT" == "nbs_v8" || \
       "$VARIANT" == "nbs_v9" || "$VARIANT" == "nbs_v10" || \
-      "$VARIANT" == "nbs_v11" || "$VARIANT" == "nbs_v12" ]]; then
+      "$VARIANT" == "nbs_v11" || "$VARIANT" == "nbs_v12" || \
+      "$VARIANT" == "nbs_v12_repeat" || "$VARIANT" == "nbs_v13" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
@@ -176,6 +179,30 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
+  elif [[ "$VARIANT" == "nbs_v12_repeat" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v12_repeat"
+    DISPLAY_NAME="NBS-NetLLM v12 repeat (min4-max32-budget736, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=736
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v12_repeat
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v13" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v13"
+    DISPLAY_NAME="NBS-NetLLM v13 (min4-max32-budget720, initial-mean-rank11.25, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=720
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v13
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
   fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
@@ -192,6 +219,16 @@ elif [[ "$VARIANT" == "uniform_r12" ]]; then
   RANK=12
   RANK_BUDGET=768
   EXTRA_ARGS=(--experiment-tag uniform_r12)
+elif [[ "$VARIANT" == "uniform_b736" ]]; then
+  MODEL_TAG="llama_base_low_rank_uniform_b736"
+  DISPLAY_NAME="Fixed near-uniform NetLLM (32x rank11 + 32x rank12, budget736, seed1)"
+  RANK=12
+  RANK_BUDGET=736
+  LORA_RANK_CONFIG="configs/lora_rank_pattern_llama7b_budget736.json"
+  EXTRA_ARGS=(
+    --experiment-tag uniform_b736
+    --lora-rank-config "$LORA_RANK_CONFIG"
+  )
 else
   MODEL_TAG="llama_base_low_rank"
   DISPLAY_NAME="NetLLM"
@@ -254,11 +291,11 @@ resolve_checkpoint() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nseed=1\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
   "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \
-  "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" \
+  "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" "${LORA_RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
   "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
 

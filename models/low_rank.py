@@ -1,4 +1,5 @@
 from peft import LoraConfig, AdaLoraConfig, get_peft_model, TaskType
+import re
 import torch
 import torch.nn as nn
 from types import MethodType
@@ -85,6 +86,37 @@ def _patch_adalora_mixed_precision(model):
     return patched
 
 
+def _verify_fixed_lora_rank_pattern(model, rank_pattern, adapter_name="default"):
+    """Fail early if a PEFT rank pattern did not map one-to-one to LoRA modules."""
+    named_modules = dict(model.named_modules())
+    verified = {}
+    for pattern, expected_rank in rank_pattern.items():
+        matches = [
+            (name, module)
+            for name, module in named_modules.items()
+            if re.match(rf".*\.{pattern}$", name)
+            and hasattr(module, "lora_A")
+            and adapter_name in module.lora_A
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"fixed LoRA rank pattern {pattern!r} matched {len(matches)} modules; expected 1"
+            )
+        module_name, module = matches[0]
+        actual_rank = int(module.lora_A[adapter_name].weight.shape[0])
+        if actual_rank != int(expected_rank):
+            raise ValueError(
+                f"fixed LoRA rank mismatch for {module_name}: "
+                f"configured {expected_rank}, created {actual_rank}"
+            )
+        verified[module_name] = actual_rank
+    print(
+        "Verified fixed LoRA rank pattern: modules={}, total active rank={}".format(
+            len(verified), sum(verified.values())
+        )
+    )
+
+
 def print_trainable_parameters(model):
     trainable_params = 0
     all_param = 0
@@ -102,7 +134,8 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 use_adalora=False, total_step=None, adalora_min_rank=None,
                 adalora_ema_beta=0.9, adalora_eps=1e-8,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
-                adalora_rank_config=None, adalora_missing_grad_policy="zero"):
+                adalora_rank_config=None, adalora_missing_grad_policy="zero",
+                lora_rank_pattern=None):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -153,13 +186,21 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
             total_step=total_step,
         )
     else:
+        rank_pattern = {}
+        if lora_rank_pattern is not None:
+            if not isinstance(lora_rank_pattern, dict):
+                raise TypeError("lora_rank_pattern must be a dictionary")
+            rank_pattern = {str(name): int(value) for name, value in lora_rank_pattern.items()}
+            if any(value <= 0 for value in rank_pattern.values()):
+                raise ValueError("all fixed LoRA ranks must be positive")
         config = LoraConfig(
             r=rank,
             lora_alpha=32,
             target_modules=TARGET_MODULES[plm_type],
             lora_dropout=0.05,
             bias="none",
-            task_type=task_type
+            task_type=task_type,
+            rank_pattern=rank_pattern,
         )
 
     model = get_peft_model(plm, config)
@@ -203,6 +244,8 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_allocation_interval,
             )
         )
+    elif rank_pattern:
+        _verify_fixed_lora_rank_pattern(model, rank_pattern)
     model.from_pretrained
     print_trainable_parameters(model)
     return model

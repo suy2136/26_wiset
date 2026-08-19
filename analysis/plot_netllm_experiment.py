@@ -32,7 +32,8 @@ def parse_args() -> argparse.Namespace:
         "--variant",
         choices=("nbs", "nbs_v2", "nbs_v3", "nbs_v4", "nbs_v5",
                  "nbs_v6", "nbs_v7", "nbs_v8", "nbs_v9", "nbs_v10",
-                 "nbs_v11", "nbs_v12", "uniform_r12", "plain"),
+                 "nbs_v11", "nbs_v12", "nbs_v12_repeat", "nbs_v13",
+                 "uniform_r12", "uniform_b736", "plain"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
@@ -224,7 +225,10 @@ def main() -> None:
         "nbs_v10": "NBS-NetLLM v10 (min4-max32-budget640)",
         "nbs_v11": "NBS-NetLLM v11 (min2-max32-budget768)",
         "nbs_v12": "NBS-NetLLM v12 (min4-max32-budget736)",
+        "nbs_v12_repeat": "NBS-NetLLM v12 repeat (min4-max32-budget736, seed1)",
+        "nbs_v13": "NBS-NetLLM v13 (min4-max32-budget720, seed1)",
         "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
+        "uniform_b736": "Fixed near-uniform NetLLM (ranks11/12, budget736, seed1)",
         "plain": "NetLLM",
     }
     display_name = display_names[args.variant]
@@ -348,10 +352,12 @@ def main() -> None:
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
         axes[1, 2].set(title="NBS allocated ranks", xlabel="Rank", ylabel="Layers")
     else:
-        uniform_rank = 12 if args.variant == "uniform_r12" else 32
-        axes[1, 2].text(
-            0.5, 0.5, f"Uniform rank = {uniform_rank}", ha="center", va="center"
-        )
+        if args.variant == "uniform_b736":
+            rank_text = "Fixed ranks: 32 x 11 + 32 x 12\nTotal budget = 736"
+        else:
+            uniform_rank = 12 if args.variant == "uniform_r12" else 32
+            rank_text = f"Uniform rank = {uniform_rank}"
+        axes[1, 2].text(0.5, 0.5, rank_text, ha="center", va="center")
         axes[1, 2].set_title("LoRA rank allocation")
 
     figure_path = args.output_dir / f"{args.variant}_training_evaluation.png"

@@ -1028,6 +1028,28 @@ def run(args):
         with open(args.adalora_rank_config, 'r', encoding='utf-8') as handle:
             adalora_rank_config = json.load(handle)
 
+    lora_rank_pattern = None
+    if args.lora_rank_config is not None:
+        if args.use_adalora:
+            raise ValueError('--lora-rank-config is only supported by fixed plain LoRA')
+        with open(args.lora_rank_config, 'r', encoding='utf-8') as handle:
+            fixed_rank_config = json.load(handle)
+        lora_rank_pattern = fixed_rank_config.get('rank_pattern')
+        if not isinstance(lora_rank_pattern, dict) or not lora_rank_pattern:
+            raise ValueError('LoRA rank config must contain a non-empty rank_pattern dictionary')
+        configured_budget = sum(int(value) for value in lora_rank_pattern.values())
+        expected_budget = fixed_rank_config.get('total_rank_budget')
+        if expected_budget is not None and configured_budget != int(expected_budget):
+            raise ValueError(
+                f'LoRA rank pattern sums to {configured_budget}, expected {expected_budget}'
+            )
+        print(
+            f'[LoRA] fixed rank pattern: modules={len(lora_rank_pattern)}, '
+            f'total active rank={configured_budget}, '
+            f'range=[{min(map(int, lora_rank_pattern.values()))}, '
+            f'{max(map(int, lora_rank_pattern.values()))}]'
+        )
+
     if args.rank != -1:
         plm = peft_model(
             plm, args.plm_type, args.rank,
@@ -1040,6 +1062,7 @@ def run(args):
             adalora_rank_budget=args.adalora_rank_budget,
             adalora_rank_config=adalora_rank_config,
             adalora_missing_grad_policy=args.adalora_missing_grad_policy,
+            lora_rank_pattern=lora_rank_pattern,
         )
 
     # set up networking head
@@ -1237,6 +1260,8 @@ if __name__ == '__main__':
                         help='Global active rank budget R (default: target rank multiplied by layer count).')
     parser.add_argument('--adalora-rank-config', type=str, default=None,
                         help='JSON file mapping LoRA module names to min_rank/max_rank overrides.')
+    parser.add_argument('--lora-rank-config', type=str, default=None,
+                        help='JSON file containing a fixed plain-LoRA rank_pattern dictionary.')
     parser.add_argument('--adalora-missing-grad-policy', choices=['zero', 'hold'], default='zero',
                         help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
@@ -1245,7 +1270,9 @@ if __name__ == '__main__':
     parser.add_argument('--experiment-tag',
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
                                  'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
-                                 'nbs_v10', 'nbs_v11', 'nbs_v12', 'uniform_r12'],
+                                 'nbs_v10', 'nbs_v11', 'nbs_v12',
+                                 'nbs_v12_repeat', 'nbs_v13',
+                                 'uniform_r12', 'uniform_b736'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
