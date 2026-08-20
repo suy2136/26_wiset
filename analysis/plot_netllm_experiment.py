@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         choices=("nbs", "nbs_v2", "nbs_v3", "nbs_v4", "nbs_v5",
                  "nbs_v6", "nbs_v7", "nbs_v8", "nbs_v9", "nbs_v10",
                  "nbs_v11", "nbs_v12", "nbs_v12_repeat", "nbs_v13",
-                 "nbs_v14", "nbs_v15",
+                 "nbs_v14", "nbs_v15", "nbs_v16", "nbs_v17",
                  "uniform_r12", "uniform_b736", "adalora_peft_r12", "plain"),
         required=True,
     )
@@ -232,6 +232,8 @@ def main() -> None:
         "nbs_v13": "NBS-NetLLM v13 (min4-max32-budget720, seed1)",
         "nbs_v14": "NBS-NetLLM v14 (budget736, lr1.5e-4, ema0.9)",
         "nbs_v15": "NBS-NetLLM v15 (budget736, lr2e-4, ema0.95)",
+        "nbs_v16": "NBS-NetLLM v16 (budget736, lr2.5e-4, ema0.9)",
+        "nbs_v17": "NBS-NetLLM v17 (budget736, lr2e-4, ema0.8)",
         "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
         "uniform_b736": "Fixed near-uniform NetLLM (ranks11/12, budget736, seed1)",
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
