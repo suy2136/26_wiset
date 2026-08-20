@@ -64,6 +64,14 @@ def relative_change(nbs: float, plain: float) -> float | None:
     return (nbs - plain) / plain * 100.0
 
 
+def latency_ms(summary: dict[str, Any], key: str) -> float | None:
+    value = (summary.get("inference_latency") or {}).get(key)
+    if value is None:
+        return None
+    value = float(value) * 1000.0
+    return value if math.isfinite(value) else None
+
+
 def plot_curve(axis: Any, summary: dict[str, Any], key: str, x_key: str, color: str) -> None:
     points = [point for point in summary.get(key, []) if math.isfinite(float(point["loss"]))]
     if points:
@@ -95,6 +103,14 @@ def main() -> None:
         "relative_change_percent_nbs_vs_plain": {
             "mae": relative_change(float(nbs["aggregate_mae"]), float(plain["aggregate_mae"])),
             "rmse": relative_change(float(nbs["aggregate_rmse"]), float(plain["aggregate_rmse"])),
+            "latency_mean": relative_change(
+                latency_ms(nbs, "mean_s") or math.nan,
+                latency_ms(plain, "mean_s") or math.nan,
+            ),
+            "latency_p95": relative_change(
+                latency_ms(nbs, "p95_s") or math.nan,
+                latency_ms(plain, "p95_s") or math.nan,
+            ),
         },
     }
     json_path = output_dir / "comparison.json"
@@ -104,7 +120,11 @@ def main() -> None:
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=("variant", "run_dir", "mae", "rmse", "final_train_loss", "best_valid_loss"),
+            fieldnames=(
+                "variant", "run_dir", "mae", "rmse", "final_train_loss",
+                "best_valid_loss", "latency_mean_ms", "latency_median_ms",
+                "latency_p95_ms",
+            ),
         )
         writer.writeheader()
         for summary in summaries:
@@ -116,12 +136,15 @@ def main() -> None:
                     "rmse": summary["aggregate_rmse"],
                     "final_train_loss": summary.get("final_reported_train_loss"),
                     "best_valid_loss": summary.get("best_reported_valid_loss"),
+                    "latency_mean_ms": latency_ms(summary, "mean_s"),
+                    "latency_median_ms": latency_ms(summary, "median_s"),
+                    "latency_p95_ms": latency_ms(summary, "p95_s"),
                 }
             )
 
     labels = [summary["display_name"] for summary in summaries]
     colors = ["#d95f02", "#1b9e77"]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    fig, axes = plt.subplots(2, 3, figsize=(17, 9), constrained_layout=True)
     fig.suptitle("NBS-NetLLM vs NetLLM")
     axes[0, 0].bar(labels, [summary["aggregate_mae"] for summary in summaries], color=colors)
     axes[0, 0].set_title("Aggregate MAE (lower is better)")
@@ -129,6 +152,16 @@ def main() -> None:
     axes[0, 1].bar(labels, [summary["aggregate_rmse"] for summary in summaries], color=colors)
     axes[0, 1].set_title("Aggregate RMSE (lower is better)")
     axes[0, 1].grid(axis="y", alpha=0.25)
+
+    mean_latencies = [latency_ms(summary, "mean_s") for summary in summaries]
+    if all(value is not None for value in mean_latencies):
+        bars = axes[0, 2].bar(labels, mean_latencies, color=colors)
+        axes[0, 2].bar_label(bars, fmt="%.1f ms", padding=3)
+        axes[0, 2].set_ylabel("Milliseconds per sample")
+    else:
+        axes[0, 2].text(0.5, 0.5, "Latency unavailable", ha="center", va="center")
+    axes[0, 2].set_title("Mean inference latency (lower is better)")
+    axes[0, 2].grid(axis="y", alpha=0.25)
 
     for summary, color in zip(summaries, colors):
         plot_curve(axes[1, 0], summary, "train_curve", "step", color)
@@ -139,6 +172,31 @@ def main() -> None:
         axis.grid(alpha=0.25)
         if axis.lines:
             axis.legend()
+
+    latency_keys = ("mean_s", "median_s", "p95_s")
+    latency_names = ("Mean", "Median", "P95")
+    x_positions = list(range(len(latency_keys)))
+    width = 0.36
+    for index, (summary, color) in enumerate(zip(summaries, colors)):
+        values = [latency_ms(summary, key) for key in latency_keys]
+        if all(value is not None for value in values):
+            offset = (index - 0.5) * width
+            axes[1, 2].bar(
+                [position + offset for position in x_positions],
+                values,
+                width=width,
+                label=summary["display_name"],
+                color=color,
+            )
+    axes[1, 2].set_xticks(x_positions, latency_names)
+    axes[1, 2].set_title("Inference latency distribution")
+    axes[1, 2].set_ylabel("Milliseconds per sample")
+    axes[1, 2].grid(axis="y", alpha=0.25)
+    if axes[1, 2].patches:
+        axes[1, 2].legend()
+
+    for axis in axes[0]:
+        axis.tick_params(axis="x", labelrotation=10)
 
     figure_path = output_dir / "netllm_vs_nbs_comparison.png"
     fig.savefig(figure_path, dpi=180)
