@@ -1271,7 +1271,7 @@ if __name__ == '__main__':
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
                                  'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
                                  'nbs_v10', 'nbs_v11', 'nbs_v12',
-                                 'nbs_v12_repeat', 'nbs_v13',
+                                 'nbs_v12_repeat', 'nbs_v13', 'nbs_v14', 'nbs_v15',
                                  'uniform_r12', 'uniform_b736'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
