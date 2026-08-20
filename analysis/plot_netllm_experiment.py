@@ -43,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allocator-state", type=Path)
     parser.add_argument("--allocator-diagnostics", type=Path)
     parser.add_argument("--latency-json", type=Path)
+    parser.add_argument("--display-name", type=str,
+                        help="Optional plot/summary title override for an inference mode.")
     parser.add_argument(
         "--checkpoint-role",
         choices=("best", "best_ar", "best_post_nbs", "final_nbs"),
@@ -235,7 +237,7 @@ def main() -> None:
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
         "plain": "NetLLM",
     }
-    display_name = display_names[args.variant]
+    display_name = args.display_name or display_names[args.variant]
     display_title = (
         display_name if args.checkpoint_role == "best"
         else f"{display_name} [{args.checkpoint_role}]"
