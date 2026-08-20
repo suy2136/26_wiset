@@ -253,7 +253,35 @@ def check_2_init_eq_target_sanity():
     print()
 
 
+def check_3_stock_peft_allocator_path():
+    print("=" * 70)
+    print("Check 3: project wrapper with stock PEFT AdaLoRA allocator")
+    print("=" * 70)
+    torch.manual_seed(0)
+    rank, total_step = 4, 40
+    wrapped = project_peft_model(
+        TinyLlamaLikeModel(), "llama", rank,
+        task_type=TaskType.FEATURE_EXTRACTION,
+        use_adalora=True, total_step=total_step,
+        adalora_allocator="peft",
+    )
+    assert not hasattr(wrapped, "nash_rank_allocator"), \
+        "stock PEFT baseline must not construct NashRankAllocator"
+    assert all(value == rank * 2 for value in allocated_ranks(wrapped).values())
+    losses = train_loop(wrapped, total_step, seed=3, use_adalora=True)
+    alive = {
+        name: int((wrapped.get_submodule(name).lora_E["default"].abs() > 1e-8).sum().item())
+        for name in allocated_ranks(wrapped)
+    }
+    assert sum(alive.values()) == len(alive) * rank, alive
+    assert all(torch.isfinite(torch.tensor(value)) for value in losses)
+    print(f"  final alive ranks: {alive}")
+    print("  [PASS] stock PEFT allocation runs without creating or using NBS state")
+    print()
+
+
 if __name__ == "__main__":
     check_1_integration_smoke()
     check_2_init_eq_target_sanity()
+    check_3_stock_peft_allocator_path()
     print("All AdaLoRA sanity checks passed.")

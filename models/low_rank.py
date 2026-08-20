@@ -135,7 +135,7 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_ema_beta=0.9, adalora_eps=1e-8,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero",
-                lora_rank_pattern=None):
+                lora_rank_pattern=None, adalora_allocator="nbs"):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -147,6 +147,9 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         update steps (post grad-accumulation) over the whole run, used to derive
         the rank-pruning warmup/cooldown schedule.
     """
+    if adalora_allocator not in ("nbs", "peft"):
+        raise ValueError("adalora_allocator must be 'nbs' or 'peft'")
+
     for param in plm.parameters():
         param.requires_grad = False
         # Keep frozen normalization weights in the dtype selected by
@@ -171,7 +174,11 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         tfinal = max(tinit + 1, int(total_step * 0.15))
         cooldown_start = max(tinit + 1, total_step - tfinal)
         deltaT = int(adalora_allocation_interval)
-        physical_rank = _adalora_physical_rank(rank, adalora_rank_config)
+        physical_rank = (
+            _adalora_physical_rank(rank, adalora_rank_config)
+            if adalora_allocator == "nbs"
+            else int(rank) * 2
+        )
         config = AdaLoraConfig(
             init_r=physical_rank,
             target_r=rank,
@@ -210,40 +217,49 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
             raise RuntimeError("No PEFT AdaLoRA SVDLinear layers were patched for mixed precision")
         if adalora_allocation_interval <= 0:
             raise ValueError("adalora_allocation_interval must be positive")
-        # The custom allocator keeps PEFT's physical init_r slots and applies
-        # rank selection through lora_E masks, so adapter checkpoint format and
-        # the existing AdaLoRA forward path remain unchanged.
-        model.nash_rank_allocator = NashRankAllocator(
-            model,
-            target_rank=rank,
-            min_rank=adalora_min_rank,
-            ema_beta=adalora_ema_beta,
-            eps=adalora_eps,
-            rank_budget=adalora_rank_budget,
-            rank_config=adalora_rank_config,
-            missing_grad_policy=adalora_missing_grad_policy,
-            warmup_steps=tinit,
-            cooldown_start_step=cooldown_start,
-            allocation_interval=adalora_allocation_interval,
-        )
-        model.nash_rank_allocation_interval = int(adalora_allocation_interval)
-        model.nash_physical_rank = int(physical_rank)
-        print(
-            "NBS physical AdaLoRA rank: init_r={} (largest configured max_rank)".format(
-                physical_rank
+        if adalora_allocator == "nbs":
+            # The custom allocator keeps PEFT's physical init_r slots and applies
+            # rank selection through lora_E masks, so adapter checkpoint format and
+            # the existing AdaLoRA forward path remain unchanged.
+            model.nash_rank_allocator = NashRankAllocator(
+                model,
+                target_rank=rank,
+                min_rank=adalora_min_rank,
+                ema_beta=adalora_ema_beta,
+                eps=adalora_eps,
+                rank_budget=adalora_rank_budget,
+                rank_config=adalora_rank_config,
+                missing_grad_policy=adalora_missing_grad_policy,
+                warmup_steps=tinit,
+                cooldown_start_step=cooldown_start,
+                allocation_interval=adalora_allocation_interval,
             )
-        )
-        print(
-            "NBS rank schedule: warm-up steps 1-{}, allocation window {}-{}, "
-            "cooldown steps {}-{} (interval={})".format(
-                tinit,
-                tinit + 1,
-                max(tinit, cooldown_start - 1),
-                cooldown_start,
-                total_step,
-                adalora_allocation_interval,
+            model.nash_rank_allocation_interval = int(adalora_allocation_interval)
+            model.nash_physical_rank = int(physical_rank)
+            print(
+                "NBS physical AdaLoRA rank: init_r={} (largest configured max_rank)".format(
+                    physical_rank
+                )
             )
-        )
+            print(
+                "NBS rank schedule: warm-up steps 1-{}, allocation window {}-{}, "
+                "cooldown steps {}-{} (interval={})".format(
+                    tinit,
+                    tinit + 1,
+                    max(tinit, cooldown_start - 1),
+                    cooldown_start,
+                    total_step,
+                    adalora_allocation_interval,
+                )
+            )
+        else:
+            print(
+                "PEFT AdaLoRA rank schedule: init_r={}, target_r={}, tinit={}, "
+                "tfinal={}, deltaT={}, total_step={}".format(
+                    physical_rank, rank, tinit, tfinal,
+                    adalora_allocation_interval, total_step,
+                )
+            )
     elif rank_pattern:
         _verify_fixed_lora_rank_pattern(model, rank_pattern)
     model.from_pretrained

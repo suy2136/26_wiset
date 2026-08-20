@@ -12,8 +12,9 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v12_repeat" && "$VARIANT" != "nbs_v13" && \
       "$VARIANT" != "nbs_v14" && "$VARIANT" != "nbs_v15" && \
       "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
+      "$VARIANT" != "adalora_peft_r12" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|uniform_r12|uniform_b736|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|uniform_r12|uniform_b736|adalora_peft_r12|plain}"
   exit 2
 fi
 
@@ -47,6 +48,12 @@ printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${VARIANT}_latest.txt"
 
 SCHEDULED_SAMPLING="False"
 RANK=32
+MULTIMODAL_MODE="none"
+MODE_ARGS=()
+INFERENCE_ARGS=()
+INFERENCE_SUFFIX=""
+BEST_MODEL_NAME="best_model"
+ADALORA_ALLOCATOR_MODE="none"
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
       "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
@@ -56,6 +63,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v12_repeat" || "$VARIANT" == "nbs_v13" || \
       "$VARIANT" == "nbs_v14" || "$VARIANT" == "nbs_v15" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
+  ADALORA_ALLOCATOR_MODE="nbs"
   DISPLAY_NAME="NBS-NetLLM"
   RANK_CONFIG="configs/adalora_rank_config_llama7b.json"
   RANK_BUDGET=2048
@@ -239,6 +247,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
     --use-adalora
+    --adalora-allocator nbs
     --adalora-rank-config "$RANK_CONFIG"
     --adalora-rank-budget "$RANK_BUDGET"
     --adalora-ema-beta "$ADALORA_EMA_BETA"
@@ -262,6 +271,33 @@ elif [[ "$VARIANT" == "uniform_b736" ]]; then
     --experiment-tag uniform_b736
     --lora-rank-config "$LORA_RANK_CONFIG"
   )
+elif [[ "$VARIANT" == "adalora_peft_r12" ]]; then
+  MODEL_TAG="llama_base_low_rank_adalora_adalora_peft_r12"
+  ADALORA_ALLOCATOR_MODE="peft"
+  DISPLAY_NAME="Stock PEFT AdaLoRA (target-rank12) + Selector + Speculative"
+  RANK=12
+  RANK_BUDGET=768
+  BEST_MODEL_NAME="best_ar_model"
+  EARLY_STOPPING_PATIENCE=2
+  EARLY_STOPPING_MIN_DELTA=0.0001
+  SELECTOR_RECENT_K_VALUE="${SELECTOR_RECENT_K:-6}"
+  SPECULATIVE_GAMMA_VALUE="${SPECULATIVE_GAMMA:-4}"
+  SPECULATIVE_THRESHOLD_VALUE="${SPECULATIVE_THRESHOLD:-0.3}"
+  INFERENCE_ARGS=(
+    --inference-tag full_stack
+    --selector-recent-k "$SELECTOR_RECENT_K_VALUE"
+    --speculative-gamma "$SPECULATIVE_GAMMA_VALUE"
+    --speculative-threshold "$SPECULATIVE_THRESHOLD_VALUE"
+  )
+  INFERENCE_SUFFIX="_inference_full_stack"
+  EXTRA_ARGS=(
+    --use-adalora
+    --adalora-allocator peft
+    --adalora-allocation-interval 10
+    --experiment-tag adalora_peft_r12
+    --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+    --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+  )
 else
   MODEL_TAG="llama_base_low_rank"
   DISPLAY_NAME="NetLLM"
@@ -270,23 +306,23 @@ fi
 
 TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
 TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
-MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz/$RUN_ID"
+MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
   BEST_POST_NBS_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_post_nbs_model"
   FINAL_NBS_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/final_nbs_model"
 else
-  BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_model"
+  BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/$BEST_MODEL_NAME"
   BEST_POST_NBS_MODEL=""
   FINAL_NBS_MODEL=""
 fi
-RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_none/Jin2022/5Hz/$RUN_ID"
+RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
-  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar_results.csv"
-  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar_partial_results.csv"
+  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar${INFERENCE_SUFFIX}_results.csv"
+  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_best_ar${INFERENCE_SUFFIX}_partial_results.csv"
 else
-  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_results.csv"
-  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_partial_results.csv"
+  RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}${INFERENCE_SUFFIX}_results.csv"
+  PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}${INFERENCE_SUFFIX}_partial_results.csv"
 fi
 
 write_status() {
@@ -318,16 +354,27 @@ checkpoint_complete() {
      -f "$checkpoint_path/checkpoint_metadata.json" ]]
 }
 
+adapter_checkpoint_complete() {
+  local checkpoint_path="$1"
+  local canonical_path
+  canonical_path="$(resolve_checkpoint "$checkpoint_path")" || return 1
+  [[ -f "$canonical_path/adapter_model.bin" && \
+     -f "$canonical_path/modules_except_plm.bin" && \
+     -f "$checkpoint_path/checkpoint_metadata.json" ]]
+}
+
 resolve_checkpoint() {
   python analysis/resolve_checkpoint_alias.py "$1"
 }
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nseed=1\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nseed=1\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
-  "$LEARNING_RATE" "$ADALORA_EMA_BETA" \
+  "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_ALLOCATOR_MODE" "$MULTIMODAL_MODE" \
+  "${PATCH_SELECTION_WEIGHTS:-}" "${PATCH_TOP_K:-}" "${SELECTOR_RECENT_K_VALUE:-}" \
+  "${SPECULATIVE_GAMMA_VALUE:-}" "${SPECULATIVE_THRESHOLD_VALUE:-}" \
   "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \
   "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" "${LORA_RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
@@ -352,6 +399,7 @@ TRAIN_CMD=(
   --steps-per-valid "$VALIDATION_INTERVAL"
   --lr "$LEARNING_RATE"
   --seed 1
+  "${MODE_ARGS[@]}"
   "${EXTRA_ARGS[@]}"
 )
 if [[ "$SAVE_PERIODIC_CHECKPOINTS" == "1" ]]; then
@@ -375,7 +423,7 @@ if [[ -n "${NBS_DIAGNOSTICS:-}" ]] && ! checkpoint_complete "$BEST_MODEL"; then
   write_status "training" "failed_missing_best_model" 3
   echo "Training exited but the best AR checkpoint is incomplete: $BEST_MODEL"
   exit 3
-elif [[ -z "${NBS_DIAGNOSTICS:-}" && ! -d "$BEST_MODEL" ]]; then
+elif [[ -z "${NBS_DIAGNOSTICS:-}" ]] && ! adapter_checkpoint_complete "$BEST_MODEL"; then
   write_status "training" "failed_missing_best_model" 3
   echo "Training exited but best_model was not found: $BEST_MODEL"
   exit 3
@@ -404,6 +452,10 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     write_status "evaluation_${ROLE}" "failed_missing_checkpoint" 3
     echo "Required checkpoint was not found: $MODEL_PATH"
     exit 3
+  elif [[ -z "${NBS_DIAGNOSTICS:-}" ]] && ! adapter_checkpoint_complete "$MODEL_PATH"; then
+    write_status "evaluation_${ROLE}" "failed_missing_checkpoint" 3
+    echo "Required adapter checkpoint is incomplete: $MODEL_PATH"
+    exit 3
   fi
 
   EVALUATION_TAG_ARGS=()
@@ -413,8 +465,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     ROLE_PARTIAL_RESULT_CSV="$PARTIAL_RESULT_CSV"
   else
     ROLE_DIR="$RUN_DIR/evaluations/$ROLE"
-    ROLE_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}_results.csv"
-    ROLE_PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}_partial_results.csv"
+    ROLE_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}${INFERENCE_SUFFIX}_results.csv"
+    ROLE_PARTIAL_RESULT_CSV="$RESULT_ROOT/${TEST_PREFIX}_checkpoint_${ROLE}${INFERENCE_SUFFIX}_partial_results.csv"
     EVALUATION_TAG_ARGS=(--evaluation-tag "$ROLE")
   fi
   CANONICAL_MODEL_PATH="$(resolve_checkpoint "$MODEL_PATH")"
@@ -425,6 +477,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
   LATENCY_DETAIL_FILE="${LATENCY_FILE%.json}_per_sample.csv"
   LATENCY_PARTIAL_FILE="${LATENCY_FILE%.json}_partial.json"
   LATENCY_PARTIAL_DETAIL_FILE="${LATENCY_FILE%.json}_partial_per_sample.csv"
+  INFERENCE_TRACE_FILE="${ROLE_RESULT_CSV/_results.csv/_inference_trace.json}"
+  INFERENCE_TRACE_DETAIL_FILE="${INFERENCE_TRACE_FILE%.json}_per_sample.csv"
   REUSED_FROM_DIR="${EVALUATED_DIR_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
   REUSED_FROM_ROLE="${EVALUATED_ROLE_BY_CHECKPOINT[$CANONICAL_MODEL_PATH]:-}"
 
@@ -452,6 +506,14 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     if [[ -f "$REUSED_FROM_DIR/latency_per_sample.csv" ]]; then
       cp "$REUSED_FROM_DIR/latency_per_sample.csv" "$LATENCY_DETAIL_FILE"
       cp "$REUSED_FROM_DIR/latency_per_sample.csv" "$ROLE_DIR/latency_per_sample.csv"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/inference_trace.json" ]]; then
+      cp "$REUSED_FROM_DIR/inference_trace.json" "$INFERENCE_TRACE_FILE"
+      cp "$REUSED_FROM_DIR/inference_trace.json" "$ROLE_DIR/inference_trace.json"
+    fi
+    if [[ -f "$REUSED_FROM_DIR/inference_trace_per_sample.csv" ]]; then
+      cp "$REUSED_FROM_DIR/inference_trace_per_sample.csv" "$INFERENCE_TRACE_DETAIL_FILE"
+      cp "$REUSED_FROM_DIR/inference_trace_per_sample.csv" "$ROLE_DIR/inference_trace_per_sample.csv"
     fi
     printf '{\n  "checkpoint_role": "%s",\n  "reused_from_role": "%s",\n  "canonical_checkpoint": "%s"\n}\n' \
       "$ROLE" "$REUSED_FROM_ROLE" "$CANONICAL_MODEL_PATH" \
@@ -486,6 +548,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
       --latency-output-path "$LATENCY_FILE"
       --seed 1
+      "${MODE_ARGS[@]}"
+      "${INFERENCE_ARGS[@]}"
       "${EXTRA_ARGS[@]}"
     )
 
@@ -517,6 +581,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     [[ -f "$PER_SAMPLE_FILE" ]] && cp "$PER_SAMPLE_FILE" "$ROLE_DIR/per_sample_results.csv"
     [[ -f "$LATENCY_FILE" ]] && cp "$LATENCY_FILE" "$ROLE_DIR/latency.json"
     [[ -f "$LATENCY_DETAIL_FILE" ]] && cp "$LATENCY_DETAIL_FILE" "$ROLE_DIR/latency_per_sample.csv"
+    [[ -f "$INFERENCE_TRACE_FILE" ]] && cp "$INFERENCE_TRACE_FILE" "$ROLE_DIR/inference_trace.json"
+    [[ -f "$INFERENCE_TRACE_DETAIL_FILE" ]] && cp "$INFERENCE_TRACE_DETAIL_FILE" "$ROLE_DIR/inference_trace_per_sample.csv"
     if [[ -f "$ROLE_PARTIAL_RESULT_CSV" && \
           "$ROLE_PARTIAL_RESULT_CSV" -nt "$ROLE_DIR/evaluation.started" ]]; then
       cp "$ROLE_PARTIAL_RESULT_CSV" "$ROLE_DIR/partial_results.csv"
@@ -529,6 +595,11 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     write_status "evaluation_${ROLE}" "failed_missing_latency" 5
     echo "Evaluation completed but latency summary is missing: $ROLE_DIR/latency.json"
     exit 5
+  fi
+  if [[ -n "$INFERENCE_SUFFIX" && ! -f "$ROLE_DIR/inference_trace.json" ]]; then
+    write_status "evaluation_${ROLE}" "failed_missing_inference_trace" 6
+    echo "Evaluation completed but inference trace is missing: $ROLE_DIR/inference_trace.json"
+    exit 6
   fi
 
   PLOT_CMD=(

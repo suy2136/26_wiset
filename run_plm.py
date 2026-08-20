@@ -22,6 +22,9 @@ from utils.result_notebook import ResultNotebook
 from torch.utils.data import DataLoader
 from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
+from models.selectable_pipeline import LlamaSelectablePipeline
+from models.selectors import RecentKSelector
+from models.speculative_pipeline import LlamaSpeculativeBlockVerifyPipeline
 from models.low_rank import peft_model, print_trainable_parameters
 from models.rank_allocator import RankAllocationConstraintError
 from utils.latency_utils import write_latency_artifacts
@@ -127,6 +130,49 @@ def _write_json_atomic(path, payload):
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
+
+
+def _write_inference_trace_artifacts(path, records, inference_tag):
+    """Persist selector/speculative behavior without including it in latency."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    numeric_fields = (
+        'initial_token_count', 'selected_token_count', 'target_forward_count',
+        'accepted_drafts', 'proposed_drafts',
+    )
+    summary = {
+        'inference_tag': inference_tag,
+        'sample_count': len(records),
+    }
+    for field in numeric_fields:
+        values = [float(row[field]) for row in records if row.get(field) is not None]
+        summary[f'mean_{field}'] = sum(values) / len(values) if values else None
+    initial = summary.get('mean_initial_token_count')
+    selected = summary.get('mean_selected_token_count')
+    summary['mean_token_reduction_percent'] = (
+        (initial - selected) / initial * 100.0
+        if initial not in (None, 0) and selected is not None else None
+    )
+    accepted = sum(float(row.get('accepted_drafts') or 0) for row in records)
+    proposed = sum(float(row.get('proposed_drafts') or 0) for row in records)
+    summary['draft_acceptance_rate'] = accepted / proposed if proposed > 0 else None
+    _write_json_atomic(path, summary)
+
+    detail_path = os.path.splitext(path)[0] + '_per_sample.csv'
+    fields = [
+        'test_step', 'video', 'user', 'timestep', 'selector_enabled',
+        'initial_token_count', 'selected_token_count', 'token_reduction_percent',
+        'target_forward_count', 'accepted_drafts', 'proposed_drafts',
+        'draft_acceptance_rate',
+    ]
+    temporary_path = detail_path + '.tmp'
+    with open(temporary_path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary_path, detail_path)
+    return summary, detail_path
 
 
 CHECKPOINT_PAYLOAD_FILES = (
@@ -293,7 +339,8 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     nash_diagnostics_path = None
     allocator_snapshot_dir = None
     validation_event_count = 0
-    if args.rank != -1 and args.use_adalora:
+    if (args.rank != -1 and args.use_adalora and
+            args.adalora_allocator == 'nbs'):
         allocator = pipeline.plm.nash_rank_allocator
         nash_diagnostics_path = args.adalora_diagnostics_path or os.path.join(
             models_dir, file_prefix, 'nbs_rank_diagnostics.csv'
@@ -602,7 +649,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
             # perform gradient accumulation update
             if ((step + 1) % grad_accum_steps == 0) or (step + 1 == len(dataloader_train)):
-                if args.rank != -1 and args.use_adalora:
+                if allocator is not None:
                     # Read the accumulated, unclipped A/B gradients first so
                     # sensitivity matches the raw gradient-norm definition.
                     allocator.update_sensitivity()
@@ -610,7 +657,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 # accumulated A/B gradients and immediately before optimizer.step().
                 torch.nn.utils.clip_grad_norm_(gradient_clip_parameters, 1.0)
                 optimizer.step()
-                if args.rank != -1 and args.use_adalora:
+                if allocator is not None:
                     # Allocation/mask enforcement happens after optimizer.step
                     # and before zero_grad, while the next forward sees the
                     # selected rank mask.
@@ -689,6 +736,19 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                                 current_opt_step, event='training_end'
                             ),
                         )
+                elif args.rank != -1 and args.use_adalora:
+                    # Stock PEFT AdaLoRA baseline. This deliberately bypasses
+                    # NashRankAllocator and delegates importance scoring and
+                    # pruning to PEFT's own RankAllocator implementation.
+                    current_opt_step = opt_step + 1
+                    update_and_allocate = getattr(
+                        pipeline.plm.base_model, 'update_and_allocate', None
+                    )
+                    if update_and_allocate is None:
+                        raise RuntimeError(
+                            'PEFT AdaLoRA model has no base_model.update_and_allocate()'
+                        )
+                    update_and_allocate(current_opt_step)
                 optimizer.zero_grad()
                 opt_step += 1
 
@@ -803,6 +863,8 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     evaluation_suffix = (
         f'_checkpoint_{args.evaluation_tag}' if args.evaluation_tag is not None else ''
     )
+    if args.inference_tag is not None:
+        evaluation_suffix += f'_inference_{args.inference_tag}'
     result_path = os.path.join(
         results_dir, file_prefix + evaluation_suffix + '_results.csv'
     )
@@ -827,6 +889,11 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     latency_elapsed_s = []
     latency_records = []
     latency_peak_memory_mb = float('nan')
+    inference_trace_records = []
+    inference_trace_path = (
+        args.inference_trace_output_path
+        or result_path.replace('_results.csv', '_inference_trace.json')
+    )
 
     model_path = args.model_path if args.model_path is not None else best_model_path
     if os.path.exists(model_path):
@@ -844,6 +911,29 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     # (those came from a separate script that already called pipeline.eval() correctly),
     # but a real correctness issue for anyone using --adapt --test together.
     pipeline.eval()
+    if args.speculative_gamma is not None:
+        selector = (
+            RecentKSelector(k=args.selector_recent_k)
+            if args.selector_recent_k is not None else None
+        )
+        pipeline = LlamaSpeculativeBlockVerifyPipeline(
+            pipeline,
+            selector=selector,
+            gamma=args.speculative_gamma,
+            acceptance_threshold=args.speculative_threshold,
+        )
+        pipeline.eval()
+        print(
+            '[inference] speculative decoding enabled: '
+            f'gamma={args.speculative_gamma}, threshold={args.speculative_threshold}, '
+            f'selector_recent_k={args.selector_recent_k}'
+        )
+    elif args.selector_recent_k is not None:
+        pipeline = LlamaSelectablePipeline(
+            pipeline, selector=RecentKSelector(k=args.selector_recent_k)
+        )
+        pipeline.eval()
+        print(f'[inference] RecentK selector enabled: k={args.selector_recent_k}')
     test_step = 0
     with torch.no_grad():
         for test_step, (history, future, video_user_info) in enumerate(dataloader_test, start=1):
@@ -856,6 +946,39 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                     torch.cuda.reset_peak_memory_stats(history.device)
             started_at = time.perf_counter() if timed_call else None
             pred, gt = pipeline.inference(history, future, video_user_info)
+            if args.inference_tag is not None:
+                trace = getattr(pipeline, 'last_trace', {}) or {}
+                initial_shape = trace.get('initial_sequence_shape_before_selection')
+                initial_count = (
+                    int(initial_shape[1])
+                    if isinstance(initial_shape, (list, tuple)) and len(initial_shape) > 1
+                    else trace.get('initial_token_count')
+                )
+                selected_count = trace.get('selected_length')
+                accepted_per_iteration = trace.get('accepted_per_iteration') or []
+                proposed_per_iteration = trace.get('proposed_per_iteration') or []
+                accepted = int(sum(accepted_per_iteration))
+                proposed = int(sum(proposed_per_iteration))
+                inference_trace_records.append({
+                    'test_step': int(test_step),
+                    'video': int(video_user_info[0]),
+                    'user': int(video_user_info[1]),
+                    'timestep': int(video_user_info[2]),
+                    'selector_enabled': int(bool(trace.get('selector_enabled'))),
+                    'initial_token_count': initial_count,
+                    'selected_token_count': selected_count,
+                    'token_reduction_percent': (
+                        (initial_count - selected_count) / initial_count * 100.0
+                        if initial_count not in (None, 0) and selected_count is not None
+                        else None
+                    ),
+                    'target_forward_count': trace.get(
+                        'target_forward_count', trace.get('plm_forward_count')
+                    ),
+                    'accepted_drafts': accepted if proposed_per_iteration else None,
+                    'proposed_drafts': proposed if proposed_per_iteration else None,
+                    'draft_acceptance_rate': accepted / proposed if proposed > 0 else None,
+                })
             if timed_call:
                 if history.is_cuda:
                     torch.cuda.synchronize(history.device)
@@ -898,10 +1021,25 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                         f'Partial latency results saved after {test_step} batches at '
                         f'{partial_latency_path}'
                     )
+                if args.inference_tag is not None:
+                    partial_trace_path = inference_trace_path.replace(
+                        '.json', '_partial.json'
+                    )
+                    _write_inference_trace_artifacts(
+                        partial_trace_path, inference_trace_records,
+                        args.inference_tag,
+                    )
         notebook.write(result_path)
         print("show detail result:")
         detail_result_path = result_path.replace('_results.csv', '_per_sample_results.csv')
         notebook.write_detail(detail_result_path)
+        if args.inference_tag is not None:
+            trace_summary, trace_detail_path = _write_inference_trace_artifacts(
+                inference_trace_path, inference_trace_records, args.inference_tag
+            )
+            print('Inference trace summary saved at', inference_trace_path)
+            print('Per-sample inference trace saved at', trace_detail_path)
+            print('Inference trace summary:', trace_summary)
         if measure_latency:
             latency_summary, latency_detail_path = write_latency_artifacts(
                 latency_path,
@@ -966,6 +1104,8 @@ def run(args):
         # earlier invocation with the same variant and hyperparameter prefix.
         models_dir = os.path.join(models_dir, args.experiment_run_id)
         results_dir = os.path.join(results_dir, args.experiment_run_id)
+    if args.results_output_dir is not None:
+        results_dir = args.results_output_dir
     if not os.path.exists(models_dir): 
         os.makedirs(models_dir)
     if not os.path.exists(results_dir):
@@ -1063,6 +1203,7 @@ def run(args):
             adalora_rank_config=adalora_rank_config,
             adalora_missing_grad_policy=args.adalora_missing_grad_policy,
             lora_rank_pattern=lora_rank_pattern,
+            adalora_allocator=args.adalora_allocator,
         )
 
     # set up networking head
@@ -1158,6 +1299,16 @@ if __name__ == '__main__':
         default=None,
         help='Optional checkpoint role appended to evaluation result filenames.',
     )
+    parser.add_argument(
+        '--inference-tag',
+        choices=['selector', 'speculative', 'full_stack'],
+        default=None,
+        help='Optional suffix isolating results produced by an inference wrapper.',
+    )
+    parser.add_argument(
+        '--results-output-dir', type=str, default=None,
+        help='Optional explicit result directory for evaluation-only ablations.',
+    )
     parser.add_argument('--device', action='store', dest='device', help='the device (cuda or cpu) to run experiment.')
     parser.add_argument('--device-out', action='store', dest='device_out', help='the device (cuda or cpu) to place the split of model near the output.')
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='the device (cuda or cpu) to place the split of model between the input and output.')
@@ -1243,6 +1394,14 @@ if __name__ == '__main__':
                         help='Optional real-time deadline used to report latency margin (milliseconds).')
     parser.add_argument('--latency-output-path', type=str, default=None,
                         help='Optional JSON output path for latency summary; a per-sample CSV is written beside it.')
+    parser.add_argument('--selector-recent-k', type=int, default=None,
+                        help='Keep the most recent K trajectory tokens before decoding.')
+    parser.add_argument('--speculative-gamma', type=int, default=None,
+                        help='Enable block-verified speculative decoding with this draft block size.')
+    parser.add_argument('--speculative-threshold', type=float, default=0.3,
+                        help='Acceptance threshold in normalized viewport-coordinate space.')
+    parser.add_argument('--inference-trace-output-path', type=str, default=None,
+                        help='Optional JSON output for selector/speculative trace statistics.')
     parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
@@ -1264,6 +1423,8 @@ if __name__ == '__main__':
                         help='JSON file containing a fixed plain-LoRA rank_pattern dictionary.')
     parser.add_argument('--adalora-missing-grad-policy', choices=['zero', 'hold'], default='zero',
                         help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
+    parser.add_argument('--adalora-allocator', choices=['nbs', 'peft'], default='nbs',
+                        help='Use the proposed NBS allocator or stock PEFT AdaLoRA allocator.')
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
@@ -1271,8 +1432,9 @@ if __name__ == '__main__':
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
                                  'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
                                  'nbs_v10', 'nbs_v11', 'nbs_v12',
-                                 'nbs_v12_repeat', 'nbs_v13', 'nbs_v14', 'nbs_v15',
-                                 'uniform_r12', 'uniform_b736'],
+                                 'nbs_v12_repeat', 'nbs_v13',
+                                 'nbs_v14', 'nbs_v15',
+                                 'uniform_r12', 'uniform_b736', 'adalora_peft_r12'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(

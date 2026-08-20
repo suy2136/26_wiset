@@ -101,6 +101,7 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
         self.target_forward_count = 0
         self.draft_forward_count = 0
         self.accepted_per_iteration: List[int] = []
+        self.proposed_per_iteration: List[int] = []
 
     def set_selector(self, selector: Optional[BaseSelector]) -> None:
         if selector is not None and not isinstance(selector, BaseSelector):
@@ -130,6 +131,7 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
         self.target_forward_count = 0
         self.draft_forward_count = 0
         self.accepted_per_iteration = []
+        self.proposed_per_iteration = []
 
         plm_dtype = pipeline.plm.get_input_embeddings().weight.dtype
         networking_head_linear = pipeline.plm.networking_head.networking_head  # raw Linear+Tanh, bypasses single-position slicing
@@ -157,6 +159,8 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
 
             draft_history = torch.cat((history, *confirmed), dim=1)
             draft = self.draft_model(draft_history, steps=gamma)
+            self.draft_forward_count += 1
+            self.proposed_per_iteration.append(gamma)
 
             chunk_values = [carry] + [draft.coordinates[:, i:i + 1, :] for i in range(gamma)]
             chunk_embeds = torch.cat(
@@ -203,12 +207,19 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
 
         prediction = torch.cat(confirmed, dim=1)[:, :fut_window, :]
         self.last_trace = {
+            "selector_enabled": self.selector is not None,
             "selector_call_count": built["selector_call_count"],
             "protect_multimodal_prefix": built["protect_prefix"],
             "num_image_tokens": built["num_image_tokens"],
+            "initial_sequence_shape_before_selection": list(
+                built["initial_embeddings"].shape
+            ),
+            "initial_token_count": int(built["initial_embeddings"].shape[1]),
+            "selected_length": int(sequence.shape[1]),
             "target_forward_count": self.target_forward_count,
             "draft_forward_count": self.draft_forward_count,
             "accepted_per_iteration": list(self.accepted_per_iteration),
+            "proposed_per_iteration": list(self.proposed_per_iteration),
             "gamma": self.gamma,
             "acceptance_threshold": self.acceptance_threshold,
             "cache_reused": True,
