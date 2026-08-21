@@ -198,7 +198,11 @@ def run(args):
     random.seed(args.seed)
 
     models_dir = os.path.join(cfg.models_dir, args.model, args.train_dataset, f'{args.dataset_frequency}Hz')
-    results_dir = os.path.join(cfg.results_dir, args.model, args.test_dataset, f'{args.dataset_frequency}Hz')
+    results_dir = (
+        args.results_output_dir
+        if args.results_output_dir is not None
+        else os.path.join(cfg.results_dir, args.model, args.test_dataset, f'{args.dataset_frequency}Hz')
+    )
     if not os.path.exists(models_dir):
         os.makedirs(models_dir)
     if not os.path.exists(results_dir):
@@ -237,7 +241,7 @@ def run(args):
         else:
             dataset_test = create_dataset(args.test_dataset, his_window=args.his_window, fut_window=args.fut_window, step=args.sample_step,
                                         frequency=args.dataset_frequency, trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'])[0]
-            dataloader_test = DataLoader(dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
+            dataloader_test = DataLoader(dataset_test, batch_size=args.bs, shuffle=False, pin_memory=True)
             test(args, model, dataloader_test, models_dir, results_dir)
 
 
@@ -290,6 +294,8 @@ if __name__ == '__main__':
                         help='Reference real-time deadline in milliseconds.')
     parser.add_argument('--latency-output-path', type=str, default=None,
                         help='Optional latency summary JSON path; per-sample CSV is written beside it.')
+    parser.add_argument('--results-output-dir', type=str, default=None,
+                        help='Optional explicit directory for result and latency artifacts.')
     args = parser.parse_args()
 
     # for debug --- start
