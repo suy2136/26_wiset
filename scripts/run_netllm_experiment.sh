@@ -12,10 +12,12 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v12_repeat" && "$VARIANT" != "nbs_v13" && \
       "$VARIANT" != "nbs_v14" && "$VARIANT" != "nbs_v15" && \
       "$VARIANT" != "nbs_v16" && "$VARIANT" != "nbs_v17" && \
+      "$VARIANT" != "nbs_v18" && "$VARIANT" != "nbs_v19" && \
+      "$VARIANT" != "nbs_v20" && \
       "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
       "$VARIANT" != "adalora_peft_r12" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|uniform_r12|uniform_b736|adalora_peft_r12|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|uniform_r12|uniform_b736|adalora_peft_r12|plain}"
   exit 2
 fi
 
@@ -27,6 +29,7 @@ SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
 ADALORA_EMA_BETA="${ADALORA_EMA_BETA:-0.9}"
+SEED="${SEED:-1}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
         "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
   echo "EPOCHS, CHECKPOINT_INTERVAL, VALIDATION_INTERVAL, and EVAL_PROGRESS_INTERVAL must be positive integers."
@@ -34,6 +37,10 @@ if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ &&
 fi
 if ! [[ "$LATENCY_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
   echo "LATENCY_WARMUP_STEPS must be a non-negative integer."
+  exit 2
+fi
+if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
+  echo "SEED must be a non-negative integer."
   exit 2
 fi
 if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1" ]]; then
@@ -63,7 +70,9 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v11" || "$VARIANT" == "nbs_v12" || \
       "$VARIANT" == "nbs_v12_repeat" || "$VARIANT" == "nbs_v13" || \
       "$VARIANT" == "nbs_v14" || "$VARIANT" == "nbs_v15" || \
-      "$VARIANT" == "nbs_v16" || "$VARIANT" == "nbs_v17" ]]; then
+      "$VARIANT" == "nbs_v16" || "$VARIANT" == "nbs_v17" || \
+      "$VARIANT" == "nbs_v18" || "$VARIANT" == "nbs_v19" || \
+      "$VARIANT" == "nbs_v20" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   ADALORA_ALLOCATOR_MODE="nbs"
   DISPLAY_NAME="NBS-NetLLM"
@@ -273,6 +282,45 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
+  elif [[ "$VARIANT" == "nbs_v18" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v18"
+    DISPLAY_NAME="NBS-NetLLM v18 (min2-max32-budget640, mean-rank10, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=640
+    SEED=1
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v18
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v19" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v19"
+    DISPLAY_NAME="NBS-NetLLM v19 (min2-max32-budget512, mean-rank8, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=512
+    SEED=1
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v19
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v20" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v20"
+    DISPLAY_NAME="NBS-NetLLM v20 (v12 conditions: min4-max32-budget736, seed2)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min4_max32.json"
+    RANK_BUDGET=736
+    SEED=2
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v20
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
   fi
   NBS_DIAGNOSTICS="$RUN_DIR/nbs_rank_diagnostics.csv"
   EXTRA_ARGS=(
@@ -334,8 +382,8 @@ else
   EXTRA_ARGS=()
 fi
 
-TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
-TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_1_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
 MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
@@ -399,8 +447,8 @@ resolve_checkpoint() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nseed=1\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
-  "$VARIANT" "$RUN_ID" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
+printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+  "$VARIANT" "$RUN_ID" "$SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
   "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_ALLOCATOR_MODE" "$MULTIMODAL_MODE" \
   "${PATCH_SELECTION_WEIGHTS:-}" "${PATCH_TOP_K:-}" "${SELECTOR_RECENT_K_VALUE:-}" \
@@ -428,7 +476,7 @@ TRAIN_CMD=(
   --grad-accum-steps 32
   --steps-per-valid "$VALIDATION_INTERVAL"
   --lr "$LEARNING_RATE"
-  --seed 1
+  --seed "$SEED"
   "${MODE_ARGS[@]}"
   "${EXTRA_ARGS[@]}"
 )
@@ -577,7 +625,7 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       --measure-inference-latency
       --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
       --latency-output-path "$LATENCY_FILE"
-      --seed 1
+      --seed "$SEED"
       "${MODE_ARGS[@]}"
       "${INFERENCE_ARGS[@]}"
       "${EXTRA_ARGS[@]}"

@@ -1441,6 +1441,7 @@ if __name__ == '__main__':
                                  'nbs_v10', 'nbs_v11', 'nbs_v12',
                                  'nbs_v12_repeat', 'nbs_v13',
                                  'nbs_v14', 'nbs_v15', 'nbs_v16', 'nbs_v17',
+                                 'nbs_v18', 'nbs_v19', 'nbs_v20',
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
