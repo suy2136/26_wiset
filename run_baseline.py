@@ -1,4 +1,5 @@
 import re
+import time
 
 import numpy as np
 import torch
@@ -14,6 +15,8 @@ from dataset.load_dataset import create_dataset
 from utils.models_utils import create_model
 from utils.normalize import normalize_data, denormalize_data
 from utils.result_notebook import ResultNotebook
+from utils.dataset_checks import validate_viewport_dataset
+from utils.latency_utils import write_latency_artifacts
 
 
 def track_train(args, model, dataloader_train, dataloader_valid, models_dir):
@@ -90,6 +93,16 @@ def test(args, model, dataloader_test, models_dir, results_dir):
     best_model_path = os.path.join(models_dir, 'best_model_' + file_prefix + '.pth') if args.model_path is None else args.model_path
     result_path = os.path.join(results_dir, 'result_' + file_prefix + '.csv')
     notebook = ResultNotebook()
+    measure_latency = bool(args.measure_inference_latency)
+    warmup_steps = int(args.latency_warmup_steps)
+    if warmup_steps < 0:
+        raise ValueError('--latency-warmup-steps must be non-negative')
+    deadline_s = float(args.latency_deadline_ms) / 1000.0
+    if deadline_s <= 0:
+        raise ValueError('--latency-deadline-ms must be positive')
+    latency_path = args.latency_output_path or result_path.replace('.csv', '_latency.json')
+    latency_elapsed_s = []
+    latency_records = []
 
     if args.model not in ['regression', 'velocity']:  # linear regression/velocity doesn't need loading model weights
         model.load_state_dict(torch.load(best_model_path, map_location=args.device))
@@ -97,16 +110,52 @@ def test(args, model, dataloader_test, models_dir, results_dir):
 
     print(f'Testing {args.model} on {args.test_dataset} - seed: {args.seed}')
     with torch.no_grad():
-        for raw_history, raw_future, info in tqdm(dataloader_test):
+        for test_step, (raw_history, raw_future, info) in enumerate(tqdm(dataloader_test), start=1):
             raw_history, raw_future = raw_history.to(args.device), raw_future.to(args.device)
             history, future = normalize_data(raw_history, args.test_dataset), \
                 normalize_data(raw_future, args.test_dataset)
+            timed_call = measure_latency and test_step > warmup_steps
+            started_at = time.perf_counter() if timed_call else None
             pred, gt = model.inference(history, future)
+            if timed_call:
+                elapsed_s = time.perf_counter() - started_at
+                latency_elapsed_s.append(elapsed_s)
+                latency_records.append({
+                    'test_step': int(test_step),
+                    'video': int(info[0][0]),
+                    'user': int(info[1][0]),
+                    'timestep': int(info[2][0]),
+                    'batch_size': int(history.shape[0]),
+                    'latency_ms': elapsed_s * 1000.0,
+                })
             pred, gt = denormalize_data(pred, args.test_dataset), \
                 denormalize_data(gt, args.test_dataset)
             videos, users, timesteps = info[0], info[1], info[2]
             notebook.record(pred, gt, videos, users, timesteps)
         notebook.write(result_path)
+    if measure_latency:
+        summary, detail_path = write_latency_artifacts(
+            latency_path,
+            latency_elapsed_s,
+            latency_records,
+            deadline_s=deadline_s,
+            warmup_calls=min(len(dataloader_test), warmup_steps),
+            total_calls=len(dataloader_test),
+            measurement_scope={
+                'operation': f'{args.model}.inference',
+                'includes_data_loading': False,
+                'includes_normalization': False,
+                'includes_metric_computation': False,
+                'device': str(args.device),
+            },
+        )
+        print('Latency summary saved at', latency_path)
+        print('Per-sample latency saved at', detail_path)
+        print(
+            f"Latency mean={summary['mean_s'] * 1000.0:.3f} ms, "
+            f"median={summary['median_s'] * 1000.0:.3f} ms, "
+            f"p95={summary['p95_s'] * 1000.0:.3f} ms"
+        )
 
 
 def track_test(args, model, dataloader_test,models_dir, results_dir): 
@@ -173,6 +222,13 @@ def run(args):
         track_train(args, model, dataloader_train, dataloader_valid, models_dir)
 
     if args.test:
+        validation_report = validate_viewport_dataset(
+            args.test_dataset, splits=('test',), frequency=args.dataset_frequency
+        )
+        print(
+            'Dataset preflight OK:', validation_report['dataset'],
+            f"({validation_report['required_csv_files']} files at {validation_report['root']})"
+        )
         if args.model == 'track':
             dataset_test = create_dataset(args.test_dataset, his_window=args.his_window, fut_window=args.fut_window, step=args.sample_step,
                                       frequency=args.dataset_frequency, trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'], for_track=True)[0]
@@ -226,6 +282,14 @@ if __name__ == '__main__':
     parser.add_argument('--model-path', action="store", dest='model_path', help='(Optional) Model checkpoint path.', type=str)
     parser.add_argument('--seed', action="store", dest='seed', type=int, default=1,
                         help='(Optional) Random seed (default to 1).')
+    parser.add_argument('--measure-inference-latency', action='store_true',
+                        help='Measure model.inference only; excludes data loading, normalization and metrics.')
+    parser.add_argument('--latency-warmup-steps', type=int, default=5,
+                        help='Initial inference calls excluded from latency statistics.')
+    parser.add_argument('--latency-deadline-ms', type=float, default=1000.0,
+                        help='Reference real-time deadline in milliseconds.')
+    parser.add_argument('--latency-output-path', type=str, default=None,
+                        help='Optional latency summary JSON path; per-sample CSV is written beside it.')
     args = parser.parse_args()
 
     # for debug --- start
@@ -259,6 +323,10 @@ if __name__ == '__main__':
         args.compile = False
         args.device = 'cpu'
         print(f'Detect model: {args.model}. Automatically disenable train and compile mode and set device to cpu.')
+
+    if args.model == 'velocity' and args.bs != 1:
+        print(f'Velocity baseline uses the original batch-1 implementation; overriding bs={args.bs} to bs=1.')
+        args.bs = 1
 
     if args.train_dataset is None:
         args.train_dataset = args.test_dataset

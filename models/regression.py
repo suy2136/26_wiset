@@ -4,7 +4,6 @@ Currently only implement linear regression.
 """
 import numpy as np
 import torch
-import sklearn
 from torch import nn
 from sklearn.linear_model import LinearRegression as LR
 
@@ -25,7 +24,10 @@ class LinearRegression(nn.Module):
         self.future_window = fut_window
         self.seed = seed
         self.device = device
-        sklearn.random.seed(self.seed)
+        # sklearn does not expose ``sklearn.random.seed``.  The estimator used
+        # here is deterministic, but keep the original seed intent without
+        # raising AttributeError during model construction.
+        np.random.seed(self.seed)
 
     def forward(self, history, future, tearch_forcing=False):
         """
