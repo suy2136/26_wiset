@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -44,6 +44,36 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="viewport_prediction/data/experiment_runs/unseen_wu2017/$RUN_ID"
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" > viewport_prediction/data/experiment_runs/unseen_wu2017_latest.txt
+ACTIVE_CASE=""
+ACTIVE_OUTPUT=""
+
+write_status() {
+  local path="$1"
+  local payload="$2"
+  printf '%s\n' "$payload" > "$path.tmp"
+  mv "$path.tmp" "$path"
+}
+
+on_error() {
+  local code=$?
+  set +e
+  if [[ -n "$ACTIVE_OUTPUT" ]]; then
+    write_status "$ACTIVE_OUTPUT/status.json" \
+      "{\"case\":\"$ACTIVE_CASE\",\"dataset\":\"Wu2017\",\"status\":\"failed\",\"exit_code\":$code}"
+  fi
+  write_status "$RUN_DIR/status.json" \
+    "{\"run_id\":\"$RUN_ID\",\"dataset\":\"Wu2017\",\"status\":\"failed\",\"failed_case\":\"$ACTIVE_CASE\",\"exit_code\":$code,\"run_dir\":\"$RUN_DIR\"}"
+  echo "Wu2017 evaluation failed in $ACTIVE_CASE; completed artifacts remain in $RUN_DIR"
+  exit "$code"
+}
+trap on_error ERR
+
+LIMIT_ARGS=()
+if [[ -n "${LIMIT_TEST_SAMPLES:-}" ]]; then
+  LIMIT_ARGS=(--limit-test-samples "$LIMIT_TEST_SAMPLES")
+fi
+write_status "$RUN_DIR/status.json" \
+  "{\"run_id\":\"$RUN_ID\",\"dataset\":\"Wu2017\",\"status\":\"running\",\"run_dir\":\"$RUN_DIR\"}"
 
 COMMON_ARGS=(
   --test
@@ -123,6 +153,10 @@ run_case() {
   esac
 
   mkdir -p "$output_dir"
+  ACTIVE_CASE="$case_name"
+  ACTIVE_OUTPUT="$output_dir"
+  write_status "$output_dir/status.json" \
+    "{\"case\":\"$case_name\",\"dataset\":\"Wu2017\",\"status\":\"running\"}"
   echo "[$number/8] Starting $case_name on unseen Wu2017"
   python run_plm.py \
     "${COMMON_ARGS[@]}" \
@@ -132,6 +166,7 @@ run_case() {
     --inference-trace-output-path "$output_dir/inference_trace.json" \
     "${config_args[@]}" \
     "${inference_args[@]}" \
+    "${LIMIT_ARGS[@]}" \
     2>&1 | tee "$output_dir/evaluation.log"
 
   local result_csv
@@ -144,8 +179,10 @@ run_case() {
   cp "$result_csv" "$output_dir/results.csv"
   local per_sample="${result_csv/_results.csv/_per_sample_results.csv}"
   [[ -f "$per_sample" ]] && cp "$per_sample" "$output_dir/per_sample_results.csv"
-  printf '{"case":"%s","dataset":"Wu2017","status":"complete"}\n' \
-    "$case_name" > "$output_dir/status.json"
+  write_status "$output_dir/status.json" \
+    "{\"case\":\"$case_name\",\"dataset\":\"Wu2017\",\"status\":\"complete\"}"
+  ACTIVE_CASE=""
+  ACTIVE_OUTPUT=""
 }
 
 run_case 1 nbs_v12_repeat_direct "$NBS_CHECKPOINT" direct nbs
@@ -157,6 +194,6 @@ run_case 6 adalora_direct "$ADALORA_CHECKPOINT" direct adalora
 run_case 7 uniform_b736_full_stack "$UNIFORM_CHECKPOINT" full_stack uniform
 run_case 8 adalora_full_stack "$ADALORA_CHECKPOINT" full_stack adalora
 
-printf '{"run_id":"%s","dataset":"Wu2017","status":"complete","run_dir":"%s"}\n' \
-  "$RUN_ID" "$RUN_DIR" > "$RUN_DIR/status.json"
+write_status "$RUN_DIR/status.json" \
+  "{\"run_id\":\"$RUN_ID\",\"dataset\":\"Wu2017\",\"status\":\"complete\",\"run_dir\":\"$RUN_DIR\"}"
 echo "Eight-model unseen Wu2017 evaluation complete: $RUN_DIR"

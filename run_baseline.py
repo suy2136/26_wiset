@@ -241,6 +241,12 @@ def run(args):
         else:
             dataset_test = create_dataset(args.test_dataset, his_window=args.his_window, fut_window=args.fut_window, step=args.sample_step,
                                         frequency=args.dataset_frequency, trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'])[0]
+            if args.limit_test_samples is not None:
+                if args.limit_test_samples <= 0:
+                    raise ValueError('--limit-test-samples must be positive')
+                n = min(args.limit_test_samples, len(dataset_test))
+                dataset_test = torch.utils.data.Subset(dataset_test, range(n))
+                print(f'Debug: truncated test set to {n} samples (--limit-test-samples).')
             dataloader_test = DataLoader(dataset_test, batch_size=args.bs, shuffle=False, pin_memory=True)
             test(args, model, dataloader_test, models_dir, results_dir)
 
@@ -296,6 +302,8 @@ if __name__ == '__main__':
                         help='Optional latency summary JSON path; per-sample CSV is written beside it.')
     parser.add_argument('--results-output-dir', type=str, default=None,
                         help='Optional explicit directory for result and latency artifacts.')
+    parser.add_argument('--limit-test-samples', type=int, default=None,
+                        help='Optional smoke-test limit using the first N test samples.')
     args = parser.parse_args()
 
     # for debug --- start

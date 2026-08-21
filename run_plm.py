@@ -1280,6 +1280,13 @@ def run(args):
                                           his_window=args.his_window, fut_window=args.fut_window,
                                           trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'], frequency=args.dataset_frequency, step=args.sample_step)[0]
 
+        if args.limit_test_samples is not None:
+            if args.limit_test_samples <= 0:
+                raise ValueError('--limit-test-samples must be positive')
+            n = min(args.limit_test_samples, len(raw_dataset_test))
+            raw_dataset_test = torch.utils.data.Subset(raw_dataset_test, range(n))
+            print(f'\033[33mDebug:\033[0m truncated test set to {n} samples (--limit-test-samples).')
+
         dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
         test(args, pipeline, dataloader_test, models_dir, results_dir)
 
@@ -1451,6 +1458,8 @@ if __name__ == '__main__':
                         help='(Optional, debug) Truncate the training set to this many samples (first N, no shuffle applied to the truncation itself).')
     parser.add_argument('--limit-valid-samples', action='store', dest='limit_valid_samples', type=int,
                         help='(Optional, debug) Truncate the validation set to this many samples.')
+    parser.add_argument('--limit-test-samples', action='store', dest='limit_test_samples', type=int,
+                        help='(Optional, smoke test) Truncate the test set to the first N samples.')
     args = parser.parse_args()
 
     # resolve the 3-way multimodal mode; --multimodal (legacy) maps to 'baseline' when
