@@ -28,6 +28,14 @@ from models.speculative_pipeline import LlamaSpeculativeBlockVerifyPipeline
 from models.low_rank import peft_model, print_trainable_parameters
 from models.eva_initializer import validate_eva_state
 from models.rank_allocator import RankAllocationConstraintError
+from models.nbs_compaction import (
+    compact_nbs_model_for_inference,
+    extract_nbs_compaction_specs,
+    load_nbs_compact_checkpoint,
+    save_nbs_compact_checkpoint,
+    validate_nbs_compaction_factors,
+    write_nbs_compaction_validation,
+)
 from utils.latency_utils import write_latency_artifacts
 
 
@@ -317,6 +325,32 @@ def load_model(args, model, model_dir):
         # low rank matrices are disabled, load whole model
         model.load_state_dict(torch.load(os.path.join(model_dir, 'model.bin')))
     return model
+
+
+def load_compact_nbs_model(model, model_dir):
+    """Load an inference-only compact NBS derivative into a fresh pipeline."""
+    model_dir = _resolve_checkpoint_alias(model_dir)
+    report = load_nbs_compact_checkpoint(model.plm, model_dir)
+    modules_path = os.path.join(model_dir, 'modules_except_plm.bin')
+    if not os.path.isfile(modules_path):
+        raise FileNotFoundError(
+            f'compact NBS checkpoint is missing modules_except_plm.bin: {model_dir}'
+        )
+    model.modules_except_plm.load_state_dict(
+        torch.load(modules_path, map_location='cpu')
+    )
+    equivalence_path = os.path.join(model_dir, 'equivalence_report.json')
+    if not os.path.isfile(equivalence_path):
+        raise FileNotFoundError(
+            f'compact NBS checkpoint has no equivalence report: {model_dir}'
+        )
+    with open(equivalence_path, 'r', encoding='utf-8') as handle:
+        equivalence = json.load(handle)
+    if not equivalence.get('passed'):
+        raise RuntimeError(
+            f'compact NBS checkpoint did not pass equivalence validation: {model_dir}'
+        )
+    return model, report
 
 
 def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_accum_steps):
@@ -870,6 +904,8 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     )
     if args.inference_tag is not None:
         evaluation_suffix += f'_inference_{args.inference_tag}'
+    if args.nbs_inference_mode == 'compact':
+        evaluation_suffix += '_nbs_compact'
     result_path = os.path.join(
         results_dir, file_prefix + evaluation_suffix + '_results.csv'
     )
@@ -901,11 +937,47 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     )
 
     model_path = args.model_path if args.model_path is not None else best_model_path
+    compact_loaded_directly = False
+    compact_output_dir = args.nbs_compact_output_dir
     if os.path.exists(model_path):
-        pipeline = load_model(args, pipeline, model_path)
-        print('Load weights from:', model_path)
+        compact_state_path = os.path.join(
+            _resolve_checkpoint_alias(model_path), 'compact_adapter.pt'
+        )
+        if args.nbs_inference_mode == 'compact' and os.path.isfile(compact_state_path):
+            pipeline, compact_report = load_compact_nbs_model(pipeline, model_path)
+            compact_loaded_directly = True
+            print('Load compact NBS weights from:', model_path)
+            print(
+                'Compact NBS ranks: physical total {} -> compact total {}'.format(
+                    compact_report['physical_rank_total_before'],
+                    compact_report['compact_rank_total'],
+                )
+            )
+        else:
+            pipeline = load_model(args, pipeline, model_path)
+            print('Load weights from:', model_path)
     else:
         print('\033[33mWarning:\033[0m', model_path, 'not found, skip loading weights.')
+
+    if args.nbs_inference_mode == 'compact':
+        if args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0:
+            raise ValueError('NBS compaction tolerances must be non-negative')
+        if not args.use_adalora or args.adalora_allocator != 'nbs':
+            raise ValueError(
+                '--nbs-inference-mode compact requires NBS AdaLoRA '
+                '(--use-adalora --adalora-allocator nbs)'
+            )
+        if args.adapt:
+            raise ValueError(
+                '--nbs-inference-mode compact is evaluation-only; run training '
+                'and compact evaluation as separate commands'
+            )
+        if not compact_loaded_directly and not os.path.exists(model_path):
+            raise FileNotFoundError(
+                'compact inference requires an existing source NBS checkpoint'
+            )
+        if compact_output_dir is None and not compact_loaded_directly:
+            compact_output_dir = _resolve_checkpoint_alias(model_path) + '_compact'
 
     print(f'Testing on {args.test_dataset} - seed: {args.seed}')
     # Real accuracy bug, found 2026-08-14: this was missing entirely, so a `--adapt --test`
@@ -916,6 +988,84 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     # (those came from a separate script that already called pipeline.eval() correctly),
     # but a real correctness issue for anyone using --adapt --test together.
     pipeline.eval()
+    if args.nbs_inference_mode == 'compact' and not compact_loaded_directly:
+        # Validate on one real viewport example before any inference wrapper is
+        # installed.  These two calls are setup work and are intentionally not
+        # included in the reported latency samples.
+        try:
+            validation_batch = next(iter(dataloader_test))
+        except StopIteration:
+            raise ValueError('cannot validate NBS compaction on an empty test set')
+        validation_history, validation_future, validation_info = validation_batch
+        validation_history = validation_history.to(args.device)
+        validation_future = validation_future.to(args.device)
+        validation_history = normalize_data(validation_history, args.train_dataset)
+        specs, _ = extract_nbs_compaction_specs(pipeline.plm)
+        factor_validation = validate_nbs_compaction_factors(
+            pipeline.plm,
+            specs,
+            rtol=args.nbs_compaction_rtol,
+            atol=args.nbs_compaction_atol,
+        )
+        save_nbs_compact_checkpoint(
+            pipeline.plm,
+            compact_output_dir,
+            modules_except_plm_state=pipeline.modules_except_plm.state_dict(),
+            source_checkpoint=_resolve_checkpoint_alias(model_path),
+            factor_validation=factor_validation,
+        )
+        with torch.no_grad():
+            original_prediction, _ = pipeline.inference(
+                validation_history, validation_future, validation_info
+            )
+        compact_report = compact_nbs_model_for_inference(pipeline.plm)
+        pipeline.eval()
+        with torch.no_grad():
+            compact_prediction, _ = pipeline.inference(
+                validation_history, validation_future, validation_info
+            )
+        difference = (compact_prediction.float() - original_prediction.float()).abs()
+        denominator = original_prediction.float().abs().clamp_min(
+            args.nbs_compaction_atol
+        )
+        full_output_validation = {
+            'passed': False,
+            'rtol': float(args.nbs_compaction_rtol),
+            'atol': float(args.nbs_compaction_atol),
+            'max_abs_error': float(difference.max().item()),
+            'max_rel_error': float((difference / denominator).max().item()),
+            'output_shape': list(original_prediction.shape),
+            'dataset': args.test_dataset,
+        }
+        try:
+            torch.testing.assert_close(
+                compact_prediction.float(), original_prediction.float(),
+                rtol=args.nbs_compaction_rtol,
+                atol=args.nbs_compaction_atol,
+            )
+        except AssertionError:
+            write_nbs_compaction_validation(
+                compact_output_dir, factor_validation, full_output_validation
+            )
+            raise
+        full_output_validation['passed'] = True
+        equivalence = write_nbs_compaction_validation(
+            compact_output_dir, factor_validation, full_output_validation
+        )
+        print('Compact NBS checkpoint saved at:', compact_output_dir)
+        print(
+            'Compact NBS ranks: physical total {} -> compact total {}'.format(
+                compact_report['physical_rank_total_before'],
+                compact_report['compact_rank_total'],
+            )
+        )
+        print(
+            'NBS compaction equivalence passed: max abs error={:.3e}, '
+            'max relative error={:.3e}'.format(
+                equivalence['full_output_validation']['max_abs_error'],
+                equivalence['full_output_validation']['max_rel_error'],
+            )
+        )
     if args.speculative_gamma is not None:
         selector = (
             RecentKSelector(k=args.selector_recent_k)
@@ -1432,6 +1582,29 @@ if __name__ == '__main__':
                         help='Optional real-time deadline used to report latency margin (milliseconds).')
     parser.add_argument('--latency-output-path', type=str, default=None,
                         help='Optional JSON output path for latency summary; a per-sample CSV is written beside it.')
+    parser.add_argument(
+        '--nbs-inference-mode', choices=['original', 'compact'], default='original',
+        help=(
+            'NBS evaluation representation. original preserves masked PEFT '
+            'AdaLoRA; compact opt-in converts/loads an equivalent inference-only '
+            'fixed LoRA with physical inactive slots removed.'
+        ),
+    )
+    parser.add_argument(
+        '--nbs-compact-output-dir', type=str, default=None,
+        help=(
+            'Separate output directory for a newly derived compact NBS '
+            'checkpoint. Defaults to <resolved source checkpoint>_compact.'
+        ),
+    )
+    parser.add_argument(
+        '--nbs-compaction-rtol', type=float, default=1e-4,
+        help='Relative tolerance for compact factor and full-output equivalence.',
+    )
+    parser.add_argument(
+        '--nbs-compaction-atol', type=float, default=1e-5,
+        help='Absolute tolerance for compact factor and full-output equivalence.',
+    )
     parser.add_argument('--selector-recent-k', type=int, default=None,
                         help='Keep the most recent K trajectory tokens before decoding.')
     parser.add_argument('--speculative-gamma', type=int, default=None,
