@@ -14,11 +14,12 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v16" && "$VARIANT" != "nbs_v17" && \
       "$VARIANT" != "nbs_v18" && "$VARIANT" != "nbs_v19" && \
       "$VARIANT" != "nbs_v20" && \
+      "$VARIANT" != "nbs_v21" && "$VARIANT" != "nbs_v22" && \
       "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
       "$VARIANT" != "adalora_peft_r12" && \
       "$VARIANT" != "eva" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|nbs_v21|nbs_v22|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
   exit 2
 fi
 
@@ -95,7 +96,8 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v14" || "$VARIANT" == "nbs_v15" || \
       "$VARIANT" == "nbs_v16" || "$VARIANT" == "nbs_v17" || \
       "$VARIANT" == "nbs_v18" || "$VARIANT" == "nbs_v19" || \
-      "$VARIANT" == "nbs_v20" ]]; then
+      "$VARIANT" == "nbs_v20" || "$VARIANT" == "nbs_v21" || \
+      "$VARIANT" == "nbs_v22" ]]; then
   MODEL_TAG="llama_base_low_rank_adalora"
   ADALORA_ALLOCATOR_MODE="nbs"
   DISPLAY_NAME="NBS-NetLLM"
@@ -341,6 +343,32 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
       --experiment-tag nbs_v20
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v21" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v21"
+    DISPLAY_NAME="NBS-NetLLM v21 (min2-max32-budget448, mean-rank7, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=448
+    SEED=1
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v21
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v22" ]]; then
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v22"
+    DISPLAY_NAME="NBS-NetLLM v22 (min2-max32-budget384, mean-rank6, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=384
+    SEED=1
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v22
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
