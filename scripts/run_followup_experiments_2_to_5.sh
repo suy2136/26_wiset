@@ -14,7 +14,7 @@ export SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 export LEARNING_RATE="${LEARNING_RATE:-0.0002}"
 export ADALORA_EMA_BETA="${ADALORA_EMA_BETA:-0.9}"
 
-echo "[2] Unseen Wu2017: NBS v19 vs EVA"
+echo "[2] Unseen Wu2017: compact NBS v19 vs EVA"
 bash scripts/run_wu2017_v19_eva.sh
 
 echo "[3a] NBS v22: min2/max32/budget384 (mean rank6), seed1"

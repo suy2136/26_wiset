@@ -6,7 +6,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 ARTIFACT_ROOT="viewport_prediction/data/experiment_runs/netllm_vs_nbs"
-NBS_RUN_DIR="${NBS_RUN_DIR:-$(tr -d '\r\n' < "$ARTIFACT_ROOT/nbs_v19_latest.txt")}"
+NBS_COMPACT_RUN_DIR="${NBS_COMPACT_RUN_DIR:-$(tr -d '\r\n' < "$ARTIFACT_ROOT/nbs_v19_compaction_latest.txt")}"
 EVA_RUN_DIR="${EVA_RUN_DIR:-$(tr -d '\r\n' < "$ARTIFACT_ROOT/eva_latest.txt")}"
 
 metadata_value() {
@@ -14,7 +14,7 @@ metadata_value() {
   local key="$2"
   sed -n "s/^${key}=//p" "$file" | tail -n 1
 }
-NBS_CHECKPOINT="${NBS_CHECKPOINT:-$(metadata_value "$NBS_RUN_DIR/metadata.env" best_ar_model)}"
+NBS_CHECKPOINT="${NBS_CHECKPOINT:-$NBS_COMPACT_RUN_DIR/compact_checkpoint}"
 EVA_CHECKPOINT="${EVA_CHECKPOINT:-$(metadata_value "$EVA_RUN_DIR/metadata.env" best_ar_model)}"
 if [[ -z "$EVA_CHECKPOINT" ]]; then
   EVA_CHECKPOINT="$(metadata_value "$EVA_RUN_DIR/metadata.env" best_model)"
@@ -23,11 +23,17 @@ EVA_STATE="${EVA_STATE:-$(metadata_value "$EVA_RUN_DIR/metadata.env" eva_state)}
 for path in "$NBS_CHECKPOINT" "$EVA_CHECKPOINT" "$EVA_STATE"; do
   [[ -e "$path" ]] || { echo "Required Wu2017 evaluation input missing: $path"; exit 2; }
 done
+if [[ ! -f "$NBS_CHECKPOINT/equivalence_report.json" ]] || \
+   ! python -c "import json,sys; assert json.load(open(sys.argv[1]))['passed']" \
+       "$NBS_CHECKPOINT/equivalence_report.json"; then
+  echo "NBS v19 compact checkpoint has not passed equivalence validation: $NBS_CHECKPOINT"
+  exit 2
+fi
 
 python analysis/verify_viewport_datasets.py --datasets Wu2017 --splits test --frequency 5
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="viewport_prediction/data/experiment_runs/unseen_wu2017_v19_eva/$RUN_ID"
-mkdir -p "$RUN_DIR/nbs_v19" "$RUN_DIR/eva" "$RUN_DIR/comparison"
+mkdir -p "$RUN_DIR/nbs_v19_compact" "$RUN_DIR/eva" "$RUN_DIR/comparison"
 printf '%s\n' "$RUN_DIR" > viewport_prediction/data/experiment_runs/unseen_wu2017_v19_eva_latest.txt
 
 LIMIT_ARGS=()
@@ -63,16 +69,17 @@ run_case() {
   [[ ! -f "$detail" ]] || cp "$detail" "$output/per_sample_results.csv"
 }
 
-run_case "NBS v19" "$NBS_CHECKPOINT" "$RUN_DIR/nbs_v19" \
+run_case "NBS v19 compact" "$NBS_CHECKPOINT" "$RUN_DIR/nbs_v19_compact" \
   --rank 32 --use-adalora --adalora-allocator nbs \
   --adalora-rank-config configs/adalora_rank_config_llama7b_min2_max32.json \
-  --adalora-rank-budget 512 --experiment-tag nbs_v19
+  --adalora-rank-budget 512 --experiment-tag nbs_v19 \
+  --nbs-inference-mode compact
 
 run_case "EVA" "$EVA_CHECKPOINT" "$RUN_DIR/eva" \
   --rank 12 --use-eva --eva-state-path "$EVA_STATE" --experiment-tag eva
 
 python analysis/compare_wu2017_nbs_eva.py \
-  --nbs-dir "$RUN_DIR/nbs_v19" --eva-dir "$RUN_DIR/eva" \
+  --nbs-dir "$RUN_DIR/nbs_v19_compact" --eva-dir "$RUN_DIR/eva" \
   --output-dir "$RUN_DIR/comparison"
 printf '{"status":"complete","run_id":"%s","run_dir":"%s"}\n' \
   "$RUN_ID" "$RUN_DIR" > "$RUN_DIR/status.json"

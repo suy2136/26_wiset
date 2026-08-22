@@ -39,7 +39,7 @@ def load_case(directory):
 def main():
     args = parse_args()
     rows = [load_case(args.nbs_dir), load_case(args.eva_dir)]
-    labels = ["NBS v19", "EVA"]
+    labels = ["NBS v19 compact", "EVA"]
     colors = ["#4c78a8", "#f58518"]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     payload = {label: row for label, row in zip(labels, rows)}
