@@ -177,13 +177,28 @@ class _EvaPCAHook:
         self.pca = pca_factory(self.n_components)
         self.converged = torch.zeros(self.n_components, dtype=torch.bool)
         self.update_count = 0
+        self._bootstrap_states = []
 
     def __call__(self, module, inputs, output):
         states = inputs[0] if isinstance(inputs, tuple) else inputs
         states = states.detach().reshape(-1, states.shape[-1]).to(torch.float32)
-        if states.shape[0] < self.n_components:
-            return
         previous = getattr(self.pca, "components_", None)
+        if previous is None:
+            # torch-incremental-pca's low-rank backend defaults to q=2*k.
+            # NetLLM supplies only his_window+fut_window (=30) states per
+            # calibration sample, so k=24 would otherwise request q=48 from a
+            # 30-row matrix and fail inside torch.svd_lowrank. Buffer only the
+            # bootstrap call; subsequent partial_fit calls augment the new
+            # states with the already fitted PCA basis internally.
+            bootstrap_rows = min(states.shape[-1], 2 * self.n_components)
+            self._bootstrap_states.append(states)
+            buffered_rows = sum(batch.shape[0] for batch in self._bootstrap_states)
+            if buffered_rows < bootstrap_rows:
+                return
+            states = torch.cat(self._bootstrap_states, dim=0)
+            self._bootstrap_states = []
+        elif states.shape[0] < self.n_components:
+            return
         if previous is not None:
             previous = previous.detach().clone()
         self.pca.partial_fit(states)

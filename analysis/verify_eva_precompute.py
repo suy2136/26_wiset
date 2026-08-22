@@ -135,6 +135,32 @@ def main():
             assert os.path.isfile(os.path.join(output_dir, filename))
     print("[PASS] activation PCA hooks, shared q/v inputs, and EVA state schema")
 
+    # NetLLM presents 30 trajectory states per sample. A 24-component
+    # low-rank PCA internally requests q=48, so the first fit must combine two
+    # batches. This reproduces the real Llama smoke-test failure condition.
+    bootstrap_model = TinyLlama(layers=1, hidden=64)
+    bootstrap_collector = EvaActivationCollector(
+        bootstrap_model,
+        target_modules=("q_proj", "v_proj"),
+        max_components=24,
+        similarity_threshold=0.0,
+        expected_llama_layers=1,
+        pca_factory=lambda n: FakeIncrementalPCA(n),
+    )
+    bootstrap_batch = torch.randn(1, 30, 64)
+    bootstrap_state = bootstrap_collector.collect(
+        [bootstrap_batch, bootstrap_batch.clone(), bootstrap_batch.clone()],
+        forward_batch=bootstrap_model,
+        rank_budget=2,
+        min_rank=0,
+        max_rank=24,
+        min_batches=2,
+        max_batches=3,
+    )
+    assert bootstrap_state["processed_batches"] == 3
+    assert all(hook.update_count == 2 for hook in bootstrap_collector.hooks.values())
+    print("[PASS] low-rank PCA q=2k bootstrap buffers short NetLLM batches")
+
     rows = diagnostic_rows(state)
     diagnostics = summarize(state, rows)
     assert len(rows) == 4
