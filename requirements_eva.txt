@@ -1,0 +1,3 @@
+# Optional dependencies for EVA activation PCA precomputation only.
+# Existing LoRA, AdaLoRA, and NBS runs do not require this file.
+torch-incremental-pca==0.0.13

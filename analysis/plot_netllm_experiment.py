@@ -35,13 +35,14 @@ def parse_args() -> argparse.Namespace:
                  "nbs_v11", "nbs_v12", "nbs_v12_repeat", "nbs_v13",
                  "nbs_v14", "nbs_v15", "nbs_v16", "nbs_v17",
                  "nbs_v18", "nbs_v19", "nbs_v20",
-                 "uniform_r12", "uniform_b736", "adalora_peft_r12", "plain"),
+                 "uniform_r12", "uniform_b736", "adalora_peft_r12", "eva", "plain"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
     parser.add_argument("--result-csv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allocator-state", type=Path)
+    parser.add_argument("--eva-state", type=Path)
     parser.add_argument("--allocator-diagnostics", type=Path)
     parser.add_argument("--latency-json", type=Path)
     parser.add_argument("--display-name", type=str,
@@ -210,7 +211,7 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train_curve, valid_curve, teacher_forcing_valid_curve = parse_train_log(args.train_log)
     aggregate, per_pair = read_results(args.result_csv)
-    allocator = read_allocator_state(args.allocator_state)
+    allocator = read_allocator_state(args.allocator_state or args.eva_state)
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
     latency = read_latency(args.latency_json)
     train_finite = finite_losses(train_curve)
@@ -241,6 +242,7 @@ def main() -> None:
         "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
         "uniform_b736": "Fixed near-uniform NetLLM (ranks11/12, budget736, seed1)",
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
+        "eva": "EVA-NetLLM (activation-PCA rank allocation)",
         "plain": "NetLLM",
     }
     display_name = args.display_name or display_names[args.variant]
@@ -280,6 +282,7 @@ def main() -> None:
             "allocator_diagnostics": (
                 str(args.allocator_diagnostics) if args.allocator_diagnostics else None
             ),
+            "eva_state": str(args.eva_state) if args.eva_state else None,
             "latency_json": str(args.latency_json) if args.latency_json else None,
         },
     }
@@ -362,7 +365,12 @@ def main() -> None:
     if allocator and allocator.get("histogram"):
         rank_items = sorted((int(rank), count) for rank, count in allocator["histogram"].items())
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
-        axes[1, 2].set(title="NBS allocated ranks", xlabel="Rank", ylabel="Layers")
+        allocation_name = "EVA" if args.variant == "eva" else "NBS"
+        axes[1, 2].set(
+            title=f"{allocation_name} allocated ranks",
+            xlabel="Rank",
+            ylabel="Layers",
+        )
     else:
         if args.variant == "uniform_b736":
             rank_text = "Fixed ranks: 32 x 11 + 32 x 12\nTotal budget = 736"

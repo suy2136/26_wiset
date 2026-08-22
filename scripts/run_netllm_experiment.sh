@@ -16,8 +16,9 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v20" && \
       "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
       "$VARIANT" != "adalora_peft_r12" && \
+      "$VARIANT" != "eva" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|uniform_r12|uniform_b736|adalora_peft_r12|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
   exit 2
 fi
 
@@ -27,6 +28,7 @@ VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-500}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-32}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
 ADALORA_EMA_BETA="${ADALORA_EMA_BETA:-0.9}"
 ADALORA_SHADOW_UPDATE_POLICY="${ADALORA_SHADOW_UPDATE_POLICY:-legacy}"
@@ -38,6 +40,10 @@ if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ &&
 fi
 if ! [[ "$LATENCY_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
   echo "LATENCY_WARMUP_STEPS must be a non-negative integer."
+  exit 2
+fi
+if ! [[ "$GRAD_ACCUM_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "GRAD_ACCUM_STEPS must be a positive integer."
   exit 2
 fi
 if [[ "$ADALORA_SHADOW_UPDATE_POLICY" != "legacy" && \
@@ -68,6 +74,17 @@ INFERENCE_ARGS=()
 INFERENCE_SUFFIX=""
 BEST_MODEL_NAME="best_model"
 ADALORA_ALLOCATOR_MODE="none"
+TRAIN_LIMIT_ARGS=()
+TEST_LIMIT_ARGS=()
+if [[ -n "${LIMIT_TRAIN_SAMPLES:-}" ]]; then
+  TRAIN_LIMIT_ARGS+=(--limit-train-samples "$LIMIT_TRAIN_SAMPLES")
+fi
+if [[ -n "${LIMIT_VALID_SAMPLES:-}" ]]; then
+  TRAIN_LIMIT_ARGS+=(--limit-valid-samples "$LIMIT_VALID_SAMPLES")
+fi
+if [[ -n "${LIMIT_TEST_SAMPLES:-}" ]]; then
+  TEST_LIMIT_ARGS+=(--limit-test-samples "$LIMIT_TEST_SAMPLES")
+fi
 if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v3" || "$VARIANT" == "nbs_v4" || \
       "$VARIANT" == "nbs_v5" || "$VARIANT" == "nbs_v6" || \
@@ -340,6 +357,25 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     --adalora-diagnostics-path "$NBS_DIAGNOSTICS"
     "${EXPERIMENT_ARGS[@]}"
   )
+elif [[ "$VARIANT" == "eva" ]]; then
+  MODEL_TAG="llama_base_low_rank_eva"
+  DISPLAY_NAME="EVA-NetLLM (activation-PCA, budget736, seed1)"
+  RANK="${EVA_RANK:-12}"
+  RANK_BUDGET="${EVA_RANK_BUDGET:-736}"
+  EVA_MIN_RANK="${EVA_MIN_RANK:-0}"
+  EVA_MAX_RANK="${EVA_MAX_RANK:-24}"
+  EVA_RHO="${EVA_RHO:-2.0}"
+  EVA_STATE_DIR="$RUN_DIR/eva"
+  EVA_STATE_ARTIFACT="$EVA_STATE_DIR/eva_state.pt"
+  EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-2}"
+  EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.0001}"
+  EXTRA_ARGS=(
+    --use-eva
+    --eva-state-path "$EVA_STATE_ARTIFACT"
+    --experiment-tag eva
+    --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+    --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+  )
 elif [[ "$VARIANT" == "uniform_r12" ]]; then
   MODEL_TAG="llama_base_low_rank_uniform_r12"
   DISPLAY_NAME="Uniform-rank NetLLM (rank12, total active rank768)"
@@ -389,8 +425,8 @@ else
   EXTRA_ARGS=()
 fi
 
-TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
-TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_32_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
 MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
@@ -429,6 +465,63 @@ run_logged() {
   return "$exit_code"
 }
 
+prepare_eva_state() {
+  mkdir -p "$EVA_STATE_DIR"
+  if [[ -n "${EVA_STATE_PATH:-}" ]]; then
+    local source_path="$EVA_STATE_PATH"
+    if [[ -d "$source_path" ]]; then
+      source_path="$source_path/eva_state.pt"
+    fi
+    if [[ ! -f "$source_path" ]]; then
+      echo "Configured EVA_STATE_PATH does not contain eva_state.pt: $source_path"
+      return 2
+    fi
+    cp "$source_path" "$EVA_STATE_ARTIFACT"
+    local source_dir
+    source_dir="$(dirname "$source_path")"
+    for artifact in rank_pattern.json explained_variance.csv metadata.json; do
+      [[ -f "$source_dir/$artifact" ]] && cp "$source_dir/$artifact" "$EVA_STATE_DIR/$artifact"
+    done
+    echo "EVA state copied from $source_path"
+    return 0
+  fi
+
+  local convergence_args=()
+  if [[ "${EVA_ALLOW_UNCONVERGED:-0}" == "1" ]]; then
+    convergence_args+=(--allow-unconverged)
+  fi
+  local calibration_limit_args=()
+  if [[ -n "${EVA_LIMIT_TRAIN_SAMPLES:-${LIMIT_TRAIN_SAMPLES:-}}" ]]; then
+    calibration_limit_args+=(
+      --limit-train-samples "${EVA_LIMIT_TRAIN_SAMPLES:-${LIMIT_TRAIN_SAMPLES}}"
+    )
+  fi
+  local command=(
+    python analysis/precompute_eva.py
+    --train-dataset Jin2022
+    --plm-type llama
+    --plm-size base
+    --device cuda
+    --device-out cuda
+    --fp16
+    --rank "$RANK"
+    --rho "$EVA_RHO"
+    --rank-budget "$RANK_BUDGET"
+    --min-rank "$EVA_MIN_RANK"
+    --max-rank "$EVA_MAX_RANK"
+    --metric "${EVA_METRIC:-ratio}"
+    --similarity-threshold "${EVA_SIMILARITY_THRESHOLD:-0.99}"
+    --min-batches "${EVA_MIN_BATCHES:-2}"
+    --max-batches "${EVA_MAX_BATCHES:-128}"
+    --seed "$SEED"
+    --output-dir "$EVA_STATE_DIR"
+    "${calibration_limit_args[@]}"
+    "${convergence_args[@]}"
+  )
+  run_logged "$RUN_DIR/eva_precompute.log" \
+    env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "${command[@]}"
+}
+
 checkpoint_complete() {
   local checkpoint_path="$1"
   local canonical_path
@@ -453,6 +546,19 @@ resolve_checkpoint() {
 }
 
 set -e
+if [[ "$VARIANT" == "eva" ]]; then
+  write_status "eva_precompute" "running" 0
+  if prepare_eva_state; then
+    python analysis/plot_eva_diagnostics.py \
+      --state "$EVA_STATE_ARTIFACT" \
+      --output-dir "$RUN_DIR/figures"
+  else
+    code=$?
+    write_status "eva_precompute" "failed" "$code"
+    echo "EVA precomputation failed. Existing artifacts were preserved in $RUN_DIR"
+    exit "$code"
+  fi
+fi
 write_status "training" "running" 0
 printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
@@ -465,6 +571,11 @@ printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheck
   "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" "${LORA_RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
   "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
+if [[ "$VARIANT" == "eva" ]]; then
+  printf 'eva_state=%s\neva_rank_budget=%s\neva_min_rank=%s\neva_max_rank=%s\neva_rho=%s\neva_metric=%s\n' \
+    "$EVA_STATE_ARTIFACT" "$RANK_BUDGET" "$EVA_MIN_RANK" "$EVA_MAX_RANK" \
+    "$EVA_RHO" "${EVA_METRIC:-ratio}" >> "$RUN_DIR/metadata.env"
+fi
 
 TRAIN_CMD=(
   python run_plm.py
@@ -481,10 +592,11 @@ TRAIN_CMD=(
   --experiment-run-id "$RUN_ID"
   --epochs "$EPOCHS"
   --bs 1
-  --grad-accum-steps 32
+  --grad-accum-steps "$GRAD_ACCUM_STEPS"
   --steps-per-valid "$VALIDATION_INTERVAL"
   --lr "$LEARNING_RATE"
   --seed "$SEED"
+  "${TRAIN_LIMIT_ARGS[@]}"
   "${MODE_ARGS[@]}"
   "${EXTRA_ARGS[@]}"
 )
@@ -627,13 +739,14 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       "${EVALUATION_TAG_ARGS[@]}"
       --epochs "$EPOCHS"
       --bs 1
-      --grad-accum-steps 32
+      --grad-accum-steps "$GRAD_ACCUM_STEPS"
       --lr "$LEARNING_RATE"
       --save-test-progress-per-steps "$EVAL_PROGRESS_INTERVAL"
       --measure-inference-latency
       --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
       --latency-output-path "$LATENCY_FILE"
       --seed "$SEED"
+      "${TEST_LIMIT_ARGS[@]}"
       "${MODE_ARGS[@]}"
       "${INFERENCE_ARGS[@]}"
       "${EXTRA_ARGS[@]}"
@@ -700,6 +813,9 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
   if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
     PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
     PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
+  fi
+  if [[ "$VARIANT" == "eva" ]]; then
+    PLOT_CMD+=(--eva-state "$EVA_STATE_ARTIFACT")
   fi
 
   write_status "visualization_${ROLE}" "running" 0

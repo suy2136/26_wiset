@@ -5,6 +5,7 @@ import torch.nn as nn
 from types import MethodType
 
 from models.rank_allocator import NashRankAllocator
+from models.eva_initializer import eva_lora_spec, initialize_eva_lora_weights
 
 
 TARGET_MODULES = {
@@ -136,7 +137,7 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero",
                 lora_rank_pattern=None, adalora_allocator="nbs",
-                adalora_shadow_update_policy="legacy"):
+                adalora_shadow_update_policy="legacy", eva_state=None):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -166,6 +167,8 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
             return super().forward(x).to(torch.float32)
 
     if use_adalora:
+        if eva_state is not None:
+            raise ValueError("EVA initialization cannot be combined with AdaLoRA")
         if total_step is None:
             raise ValueError("use_adalora=True requires total_step (total optimizer update steps)")
         # Training-time schedule derived from optimizer updates.  The NBS
@@ -195,7 +198,16 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         )
     else:
         rank_pattern = {}
-        if lora_rank_pattern is not None:
+        target_modules = TARGET_MODULES[plm_type]
+        if eva_state is not None:
+            if lora_rank_pattern is not None:
+                raise ValueError(
+                    "EVA initialization cannot be combined with lora_rank_pattern"
+                )
+            eva_spec = eva_lora_spec(eva_state)
+            rank_pattern = eva_spec["rank_pattern"]
+            target_modules = eva_spec["target_modules"]
+        elif lora_rank_pattern is not None:
             if not isinstance(lora_rank_pattern, dict):
                 raise TypeError("lora_rank_pattern must be a dictionary")
             rank_pattern = {str(name): int(value) for name, value in lora_rank_pattern.items()}
@@ -204,7 +216,7 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         config = LoraConfig(
             r=rank,
             lora_alpha=32,
-            target_modules=TARGET_MODULES[plm_type],
+            target_modules=target_modules,
             lora_dropout=0.05,
             bias="none",
             task_type=task_type,
@@ -267,6 +279,19 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                     adalora_allocation_interval, total_step,
                 )
             )
+    elif eva_state is not None:
+        summary = initialize_eva_lora_weights(model, eva_state)
+        _verify_fixed_lora_rank_pattern(model, rank_pattern)
+        model.eva_initialization_summary = summary
+        # Keep the small CPU EVA state with the adapter so a moved checkpoint
+        # can reconstruct its exact rank pattern without the original run dir.
+        model.eva_state = eva_state
+        print(
+            "EVA LoRA initialization: modules={}, total active rank={}, "
+            "lora_A=PCA components, lora_B=0".format(
+                summary["initialized_modules"], summary["total_rank_budget"]
+            )
+        )
     elif rank_pattern:
         _verify_fixed_lora_rank_pattern(model, rank_pattern)
     model.from_pretrained

@@ -26,6 +26,7 @@ from models.selectable_pipeline import LlamaSelectablePipeline
 from models.selectors import RecentKSelector
 from models.speculative_pipeline import LlamaSpeculativeBlockVerifyPipeline
 from models.low_rank import peft_model, print_trainable_parameters
+from models.eva_initializer import validate_eva_state
 from models.rank_allocator import RankAllocationConstraintError
 from utils.latency_utils import write_latency_artifacts
 
@@ -181,6 +182,7 @@ CHECKPOINT_PAYLOAD_FILES = (
     'adapter_config.json',
     'modules_except_plm.bin',
     'nash_rank_allocator.pt',
+    'eva_state.pt',
     'model.bin',
     'README.md',
     'checkpoint_alias.json',
@@ -255,6 +257,9 @@ def save_model(args, model, save_dir, metadata=None):
         allocator = getattr(model.plm, 'nash_rank_allocator', None)
         if allocator is not None:
             torch.save(allocator.state_dict(), os.path.join(save_dir, 'nash_rank_allocator.pt'))
+        eva_state = getattr(model.plm, 'eva_state', None)
+        if eva_state is not None:
+            torch.save(eva_state, os.path.join(save_dir, 'eva_state.pt'))
     else:
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
@@ -1168,6 +1173,30 @@ def run(args):
         with open(args.adalora_rank_config, 'r', encoding='utf-8') as handle:
             adalora_rank_config = json.load(handle)
 
+    eva_state = None
+    if args.use_eva:
+        if args.rank == -1:
+            raise ValueError('--use-eva requires --rank to enable LoRA')
+        if args.use_adalora:
+            raise ValueError('--use-eva and --use-adalora are mutually exclusive')
+        if args.lora_rank_config is not None:
+            raise ValueError('--use-eva cannot be combined with --lora-rank-config')
+        if not args.eva_state_path:
+            raise ValueError('--use-eva requires --eva-state-path')
+        eva_state_path = args.eva_state_path
+        if os.path.isdir(eva_state_path):
+            eva_state_path = os.path.join(eva_state_path, 'eva_state.pt')
+        if not os.path.isfile(eva_state_path):
+            raise FileNotFoundError(f'EVA state not found: {eva_state_path}')
+        eva_state = torch.load(eva_state_path, map_location='cpu')
+        validate_eva_state(eva_state)
+        print(
+            f'[EVA] loaded {eva_state_path}: '
+            f'modules={len(eva_state["rank_pattern"])}, '
+            f'positive modules={sum(int(rank) > 0 for rank in eva_state["rank_pattern"].values())}, '
+            f'total active rank={eva_state["total_rank_budget"]}'
+        )
+
     lora_rank_pattern = None
     if args.lora_rank_config is not None:
         if args.use_adalora:
@@ -1205,6 +1234,7 @@ def run(args):
             lora_rank_pattern=lora_rank_pattern,
             adalora_allocator=args.adalora_allocator,
             adalora_shadow_update_policy=args.adalora_shadow_update_policy,
+            eva_state=eva_state,
         )
 
     # set up networking head
@@ -1415,6 +1445,11 @@ if __name__ == '__main__':
                          help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
                               'Only has an effect when --rank != -1. Uses gradient/spectral '
                               'Nash rank allocation over physical slots sized to the largest configured max_rank.')
+    parser.add_argument('--use-eva', action='store_true',
+                        help='Initialize fixed LoRA ranks and lora_A directions from a precomputed EVA state. '
+                             'Mutually exclusive with AdaLoRA and fixed --lora-rank-config.')
+    parser.add_argument('--eva-state-path', type=str, default=None,
+                        help='Path to EVA eva_state.pt, or to its containing directory.')
     parser.add_argument('--adalora-min-rank', type=int, default=None,
                         help='Minimum rank per LoRA layer for Nash allocation (default: rank//2).')
     parser.add_argument('--adalora-ema-beta', type=float, default=0.9,
@@ -1452,7 +1487,8 @@ if __name__ == '__main__':
                                  'nbs_v12_repeat', 'nbs_v13',
                                  'nbs_v14', 'nbs_v15', 'nbs_v16', 'nbs_v17',
                                  'nbs_v18', 'nbs_v19', 'nbs_v20',
-                                 'uniform_r12', 'uniform_b736', 'adalora_peft_r12'],
+                                 'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
+                                 'eva'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
