@@ -1204,6 +1204,7 @@ def run(args):
             adalora_missing_grad_policy=args.adalora_missing_grad_policy,
             lora_rank_pattern=lora_rank_pattern,
             adalora_allocator=args.adalora_allocator,
+            adalora_shadow_update_policy=args.adalora_shadow_update_policy,
         )
 
     # set up networking head
@@ -1432,6 +1433,15 @@ if __name__ == '__main__':
                         help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
     parser.add_argument('--adalora-allocator', choices=['nbs', 'peft'], default='nbs',
                         help='Use the proposed NBS allocator or stock PEFT AdaLoRA allocator.')
+    parser.add_argument(
+        '--adalora-shadow-update-policy',
+        choices=['legacy', 'active-only'],
+        default='legacy',
+        help=(
+            'How NBS refreshes lora_E spectral_shadow: legacy updates every '
+            'nonzero slot; active-only updates only currently active mask slots.'
+        ),
+    )
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')

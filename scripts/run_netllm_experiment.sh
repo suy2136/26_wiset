@@ -29,6 +29,7 @@ SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
 ADALORA_EMA_BETA="${ADALORA_EMA_BETA:-0.9}"
+ADALORA_SHADOW_UPDATE_POLICY="${ADALORA_SHADOW_UPDATE_POLICY:-legacy}"
 SEED="${SEED:-1}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
         "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
@@ -37,6 +38,11 @@ if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ &&
 fi
 if ! [[ "$LATENCY_WARMUP_STEPS" =~ ^[0-9]+$ ]]; then
   echo "LATENCY_WARMUP_STEPS must be a non-negative integer."
+  exit 2
+fi
+if [[ "$ADALORA_SHADOW_UPDATE_POLICY" != "legacy" && \
+      "$ADALORA_SHADOW_UPDATE_POLICY" != "active-only" ]]; then
+  echo "ADALORA_SHADOW_UPDATE_POLICY must be legacy or active-only."
   exit 2
 fi
 if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
@@ -329,6 +335,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     --adalora-rank-config "$RANK_CONFIG"
     --adalora-rank-budget "$RANK_BUDGET"
     --adalora-ema-beta "$ADALORA_EMA_BETA"
+    --adalora-shadow-update-policy "$ADALORA_SHADOW_UPDATE_POLICY"
     --adalora-allocation-interval 10
     --adalora-diagnostics-path "$NBS_DIAGNOSTICS"
     "${EXPERIMENT_ARGS[@]}"
@@ -447,10 +454,11 @@ resolve_checkpoint() {
 
 set -e
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
-  "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_ALLOCATOR_MODE" "$MULTIMODAL_MODE" \
+  "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_SHADOW_UPDATE_POLICY" \
+  "$ADALORA_ALLOCATOR_MODE" "$MULTIMODAL_MODE" \
   "${PATCH_SELECTION_WEIGHTS:-}" "${PATCH_TOP_K:-}" "${SELECTOR_RECENT_K_VALUE:-}" \
   "${SPECULATIVE_GAMMA_VALUE:-}" "${SPECULATIVE_THRESHOLD_VALUE:-}" \
   "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \

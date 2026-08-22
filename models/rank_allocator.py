@@ -39,7 +39,8 @@ class NashRankAllocator:
                  rank_budget=None, ema_beta=0.9, eps=1e-8,
                  adapter_name="default", rank_config=None,
                  missing_grad_policy="zero", warmup_steps=0,
-                 cooldown_start_step=None, allocation_interval=1):
+                 cooldown_start_step=None, allocation_interval=1,
+                 shadow_update_policy="legacy"):
         self.model = model
         self.adapter_name = adapter_name
         self.target_rank = int(target_rank)
@@ -52,6 +53,11 @@ class NashRankAllocator:
         if missing_grad_policy not in ("zero", "hold"):
             raise ValueError("missing_grad_policy must be 'zero' or 'hold'")
         self.missing_grad_policy = missing_grad_policy
+        if shadow_update_policy not in ("legacy", "active-only"):
+            raise ValueError(
+                "shadow_update_policy must be 'legacy' or 'active-only'"
+            )
+        self.shadow_update_policy = shadow_update_policy
         self.warmup_steps = int(warmup_steps)
         self.cooldown_start_step = (
             None if cooldown_start_step is None else int(cooldown_start_step)
@@ -420,13 +426,24 @@ class NashRankAllocator:
         return list(self.last_diagnostics)
 
     def _refresh_spectral_shadow(self):
-        """Capture current nonzero E values before enforcing the previous mask."""
+        """Refresh candidate spectra according to the configured mask policy.
+
+        ``legacy`` preserves the historical behavior: any nonzero physical
+        ``lora_E`` slot is considered observed.  ``active-only`` updates only
+        slots selected by the current rank mask, preventing optimizer momentum
+        or numerical leakage in inactive slots from replacing their preserved
+        candidate spectrum.
+        """
         for name, module in self.layers.items():
             current = module.lora_E[self.adapter_name].detach().float().reshape(-1)
             shadow = self.spectral_shadow[name].to(device=current.device)
             if shadow.numel() != current.numel():
                 shadow = torch.zeros_like(current)
             observed = current.abs() > self.eps
+            if self.shadow_update_policy == "active-only":
+                mask = self.masks.get(name)
+                if mask is not None:
+                    observed = observed & mask.to(device=current.device).bool()
             shadow = torch.where(observed, current, shadow)
             self.spectral_shadow[name] = shadow.detach().clone()
 
@@ -532,12 +549,13 @@ class NashRankAllocator:
     def state_dict(self):
         """Return allocator state separately from the PEFT adapter state."""
         return {
-            "version": 3,
+            "version": 4,
             "target_rank": self.target_rank,
             "rank_budget": self.rank_budget,
             "ema_beta": self.ema_beta,
             "eps": self.eps,
             "missing_grad_policy": self.missing_grad_policy,
+            "shadow_update_policy": self.shadow_update_policy,
             "warmup_steps": self.warmup_steps,
             "cooldown_start_step": self.cooldown_start_step,
             "allocation_interval": self.allocation_interval,
@@ -583,6 +601,15 @@ class NashRankAllocator:
             if name not in state.get("spectral_shadow", {}):
                 raise ValueError(f"allocator checkpoint is missing layer {name}")
         self.sensitivity.update(state.get("sensitivity", {}))
+        # Version <=3 checkpoints predate the selectable policy and therefore
+        # restore the exact historical behavior.
+        shadow_update_policy = state.get("shadow_update_policy", "legacy")
+        if shadow_update_policy not in ("legacy", "active-only"):
+            raise ValueError(
+                "allocator checkpoint has invalid shadow_update_policy: "
+                f"{shadow_update_policy!r}"
+            )
+        self.shadow_update_policy = shadow_update_policy
         self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
         cooldown_start = state.get("cooldown_start_step", self.cooldown_start_step)
         self.cooldown_start_step = (

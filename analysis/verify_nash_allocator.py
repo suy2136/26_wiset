@@ -272,9 +272,43 @@ def check_shadow_reallocation_and_restore():
     assert restored.warmup_steps == allocator.warmup_steps
     assert restored.cooldown_start_step == allocator.cooldown_start_step
     assert restored.allocation_interval == allocator.allocation_interval
+    assert restored.shadow_update_policy == "legacy"
+
+    active_only_model = FakeAdaModel(n_layers=1, rank=6)
+    active_only = NashRankAllocator(
+        active_only_model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=6,
+        shadow_update_policy="active-only",
+    )
+    active_name, active_layer = next(iter(active_only.layers.items()))
+    active_only.allocate(step=1)
+    inactive = active_only.masks[active_name] == 0
+    preserved_inactive = active_only.spectral_shadow[active_name][inactive].clone()
+    with torch.no_grad():
+        active_layer.lora_E["default"][inactive] = 3.25
+    active_only.enforce_masks()
+    assert_close(
+        active_only.spectral_shadow[active_name][inactive],
+        preserved_inactive,
+        "active-only policy allowed inactive slots to overwrite shadow",
+    )
+    assert torch.all(active_layer.lora_E["default"].reshape(-1)[inactive] == 0)
+
+    active_state = active_only.state_dict()
+    assert active_state["shadow_update_policy"] == "active-only"
+    active_restored = NashRankAllocator(
+        FakeAdaModel(n_layers=1, rank=6),
+        target_rank=2,
+        min_rank=1,
+        max_rank=6,
+    )
+    active_restored.load_state_dict(active_state)
+    assert active_restored.shadow_update_policy == "active-only"
     print(
-        "[PASS] immutable pre-mask spectrum, shadow-based reallocation, "
-        "and checkpoint restoration"
+        "[PASS] legacy/active-only shadow refresh, immutable pre-mask spectrum, "
+        "shadow-based reallocation, and checkpoint restoration"
     )
 
 

@@ -135,7 +135,8 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_ema_beta=0.9, adalora_eps=1e-8,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero",
-                lora_rank_pattern=None, adalora_allocator="nbs"):
+                lora_rank_pattern=None, adalora_allocator="nbs",
+                adalora_shadow_update_policy="legacy"):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -233,12 +234,18 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 warmup_steps=tinit,
                 cooldown_start_step=cooldown_start,
                 allocation_interval=adalora_allocation_interval,
+                shadow_update_policy=adalora_shadow_update_policy,
             )
             model.nash_rank_allocation_interval = int(adalora_allocation_interval)
             model.nash_physical_rank = int(physical_rank)
             print(
                 "NBS physical AdaLoRA rank: init_r={} (largest configured max_rank)".format(
                     physical_rank
+                )
+            )
+            print(
+                "NBS spectral-shadow update policy: {}".format(
+                    adalora_shadow_update_policy
                 )
             )
             print(
