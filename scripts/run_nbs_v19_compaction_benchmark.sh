@@ -6,17 +6,22 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 ARTIFACT_ROOT="viewport_prediction/data/experiment_runs/netllm_vs_nbs"
+NBS_VARIANT="${NBS_VARIANT:-nbs_v19}"
+case "$NBS_VARIANT" in
+  nbs_v19|nbs_v24|nbs_v25) ;;
+  *) echo "NBS_VARIANT must be nbs_v19, nbs_v24, or nbs_v25"; exit 2 ;;
+esac
 V19_RUN_DIR="${V19_RUN_DIR:-}"
 if [[ -z "$V19_RUN_DIR" ]]; then
-  LATEST_POINTER="$ARTIFACT_ROOT/nbs_v19_latest.txt"
+  LATEST_POINTER="$ARTIFACT_ROOT/${NBS_VARIANT}_latest.txt"
   if [[ ! -f "$LATEST_POINTER" ]]; then
-    echo "Set V19_RUN_DIR to the completed v19 artifact directory."
+    echo "Set V19_RUN_DIR to the completed $NBS_VARIANT artifact directory."
     exit 2
   fi
   V19_RUN_DIR="$(<"$LATEST_POINTER")"
 fi
 if [[ ! -f "$V19_RUN_DIR/metadata.env" ]]; then
-  echo "v19 metadata.env not found: $V19_RUN_DIR"
+  echo "$NBS_VARIANT metadata.env not found: $V19_RUN_DIR"
   exit 2
 fi
 
@@ -36,13 +41,13 @@ if [[ ! -d "$SOURCE_CHECKPOINT" ]]; then
 fi
 
 BENCHMARK_ID="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="$ARTIFACT_ROOT/nbs_v19_compaction/$BENCHMARK_ID"
+RUN_DIR="$ARTIFACT_ROOT/${NBS_VARIANT}_compaction/$BENCHMARK_ID"
 ORIGINAL_DIR="$RUN_DIR/original"
 COMPACT_DIR="$RUN_DIR/compact"
 COMPACT_CHECKPOINT="$RUN_DIR/compact_checkpoint"
 COMPARISON_DIR="$RUN_DIR/comparison"
 mkdir -p "$ORIGINAL_DIR" "$COMPACT_DIR" "$COMPARISON_DIR"
-printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/nbs_v19_compaction_latest.txt"
+printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/${NBS_VARIANT}_compaction_latest.txt"
 
 LIMIT_ARGS=()
 if [[ -n "${LIMIT_TEST_SAMPLES:-}" ]]; then
@@ -64,17 +69,17 @@ COMMON_ARGS=(
   --use-adalora
   --adalora-allocator nbs
   --adalora-rank-config configs/adalora_rank_config_llama7b_min2_max32.json
-  --adalora-rank-budget 512
-  --adalora-ema-beta 0.9
+  --adalora-rank-budget "$rank_budget"
+  --adalora-ema-beta "$adalora_ema_beta"
   --adalora-allocation-interval 10
-  --experiment-tag nbs_v19
+  --experiment-tag "$NBS_VARIANT"
   --model-path "$SOURCE_CHECKPOINT"
   --evaluation-tag "$CHECKPOINT_ROLE"
   --epochs 4
   --bs 1
   --grad-accum-steps 32
-  --lr 0.0002
-  --seed 1
+  --lr "$learning_rate"
+  --seed "$seed"
   --save-test-progress-per-steps "$EVAL_PROGRESS_INTERVAL"
   --measure-inference-latency
   --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
@@ -124,9 +129,9 @@ python analysis/compare_nbs_compaction.py \
   --compact-dir "$COMPACT_DIR" \
   --compact-checkpoint "$COMPACT_CHECKPOINT" \
   --output-dir "$COMPARISON_DIR" \
-  --label "NBS v19 ($CHECKPOINT_ROLE)"
+  --label "$NBS_VARIANT ($CHECKPOINT_ROLE)"
 
 printf '{\n  "status": "complete",\n  "benchmark_id": "%s",\n  "source_checkpoint": "%s",\n  "compact_checkpoint": "%s"\n}\n' \
   "$BENCHMARK_ID" "$SOURCE_CHECKPOINT" "$COMPACT_CHECKPOINT" \
   > "$RUN_DIR/status.json"
-echo "NBS v19 original/compact benchmark complete: $RUN_DIR"
+echo "$NBS_VARIANT original/compact benchmark complete: $RUN_DIR"
