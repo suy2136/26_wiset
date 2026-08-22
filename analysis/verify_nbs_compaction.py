@@ -112,7 +112,7 @@ def main():
     assert report["physical_rank_total_before"] == 6
     assert report["compact_rank_total"] == 3
     print("[PASS] exact non-prefix active-slot extraction")
-    print("[PASS] lora_E and AdaLoRA scaling absorption")
+    print("[PASS] lora_E absorption with AdaLoRA scaling-order preservation")
     print("[PASS] separate compact checkpoint save/load")
     print("[PASS] compact fixed-LoRA forward equivalence")
 

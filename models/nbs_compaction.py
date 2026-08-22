@@ -33,17 +33,18 @@ class NBSLayerCompactionSpec:
     compact_rank: int
     lora_a: torch.Tensor
     lora_b: torch.Tensor
+    adapter_scale: float
 
 
 class CompactLoRALinear(nn.Module):
     """Frozen base projection plus an inference-only variable-rank LoRA.
 
-    ``lora_b`` already contains AdaLoRA's ``lora_E`` values and its effective
-    ``scaling / ranknum`` factor.  The forward path therefore needs only two
-    dense compact matrix multiplications and has no physical-rank mask.
+    ``lora_a`` already contains AdaLoRA's active ``lora_E`` values.  Keep the
+    final ``scaling / ranknum`` multiply after the two compact matmuls, matching
+    the original AdaLoRA operation order as closely as possible.
     """
 
-    def __init__(self, source, lora_a, lora_b, dropout):
+    def __init__(self, source, lora_a, lora_b, adapter_scale, dropout):
         super().__init__()
         if lora_a.ndim != 2 or lora_b.ndim != 2:
             raise ValueError("compact LoRA factors must be matrices")
@@ -67,13 +68,20 @@ class CompactLoRALinear(nn.Module):
         # following model.to(device/dtype) and participating in state_dict().
         self.register_buffer("lora_a", lora_a.detach().clone())
         self.register_buffer("lora_b", lora_b.detach().clone())
+        self.register_buffer(
+            "adapter_scale",
+            torch.as_tensor(adapter_scale, device=lora_b.device, dtype=lora_b.dtype),
+        )
         self.lora_dropout = copy.deepcopy(dropout)
 
     def forward(self, x):
         base_weight = self.weight.T if self.fan_in_fan_out else self.weight
         result = F.linear(x.to(base_weight.dtype), base_weight, self.bias)
         adapter_input = self.lora_dropout(x.to(self.lora_a.dtype))
-        delta = F.linear(F.linear(adapter_input, self.lora_a), self.lora_b)
+        delta = (
+            F.linear(F.linear(adapter_input, self.lora_a), self.lora_b)
+            * self.adapter_scale
+        )
         return result + delta.to(result.dtype)
 
 
@@ -121,8 +129,9 @@ def extract_nbs_compaction_specs(model, adapter_name="default", allocator_state=
 
         B[:, S] @ diag(E[S]) @ A[S, :] * scaling / ranknum
 
-    We preserve it as ``B_compact @ A_compact`` by folding ``E`` and the
-    complete scalar factor into ``B_compact``.  Masks are mandatory because
+    We preserve it by folding ``E`` into ``A_compact`` and retaining the final
+    scalar multiply after ``B_compact``, which minimizes FP16 reassociation.
+    Masks are mandatory because
     an active component can legitimately have a zero-valued ``lora_E``; using
     nonzero values alone would then infer the wrong topology.
     """
@@ -157,12 +166,13 @@ def extract_nbs_compaction_specs(model, adapter_name="default", allocator_state=
             module.scaling[adapter_name], device=lora_b.device, dtype=lora_b.dtype
         ) / (ranknum.to(device=lora_b.device, dtype=lora_b.dtype) + 1e-5)
         selected_e = lora_e.index_select(0, active).to(lora_b.dtype)
-        compact_a = lora_a.index_select(0, active).clone()
-        compact_b = (
-            lora_b.index_select(1, active)
-            * selected_e.reshape(1, -1)
-            * effective_scale
+        # Preserve AdaLoRA's original operation order: E multiplies A before
+        # the first matmul, while scaling/ranknum remains after the B matmul.
+        compact_a = (
+            lora_a.index_select(0, active)
+            * selected_e.to(lora_a.dtype).reshape(-1, 1)
         ).clone()
+        compact_b = lora_b.index_select(1, active).clone()
         specs[name] = NBSLayerCompactionSpec(
             name=name,
             active_indices=tuple(int(index) for index in active.cpu().tolist()),
@@ -170,6 +180,7 @@ def extract_nbs_compaction_specs(model, adapter_name="default", allocator_state=
             compact_rank=int(active.numel()),
             lora_a=compact_a,
             lora_b=compact_b,
+            adapter_scale=float(effective_scale.item()),
         )
 
     return specs, source
@@ -210,7 +221,9 @@ def validate_nbs_compaction_factors(model, specs, adapter_name="default",
                      * source_e.reshape(-1).index_select(0, active).reshape(-1, 1)).T
                 @ source_b.index_select(1, active).T
             ) * scale
-            actual = x @ spec.lora_a.float().T @ spec.lora_b.float().T
+            actual = (
+                x @ spec.lora_a.float().T @ spec.lora_b.float().T
+            ) * float(spec.adapter_scale)
             difference = (actual - expected).abs()
             max_abs_error = max(max_abs_error, float(difference.max().item()))
             denominator = expected.abs().clamp_min(float(atol))
@@ -270,7 +283,7 @@ def save_nbs_compact_checkpoint(model, output_dir, modules_except_plm_state=None
         )
     os.makedirs(output_dir, exist_ok=True)
     compact_state = {
-        "format_version": 1,
+        "format_version": 2,
         "adapter_name": adapter_name,
         "layers": {
             name: {
@@ -279,6 +292,7 @@ def save_nbs_compact_checkpoint(model, output_dir, modules_except_plm_state=None
                 "compact_rank": spec.compact_rank,
                 "lora_a": spec.lora_a.detach().cpu(),
                 "lora_b": spec.lora_b.detach().cpu(),
+                "adapter_scale": spec.adapter_scale,
             }
             for name, spec in specs.items()
         },
@@ -298,7 +312,7 @@ def save_nbs_compact_checkpoint(model, output_dir, modules_except_plm_state=None
         name: spec.compact_rank for name, spec in specs.items()
     }
     metadata = {
-        "format_version": 1,
+        "format_version": 2,
         "checkpoint_type": "nbs_compact_inference",
         "source_checkpoint": (
             None if source_checkpoint is None else os.path.abspath(source_checkpoint)
@@ -355,6 +369,7 @@ def _specs_from_compact_state(model, state, adapter_name):
             compact_rank=compact_rank,
             lora_a=compact_a,
             lora_b=compact_b,
+            adapter_scale=float(row.get("adapter_scale", 1.0)),
         )
     return specs
 
@@ -369,6 +384,7 @@ def _apply_compaction_specs(model, specs, adapter_name, mask_source):
             source=source,
             lora_a=spec.lora_a,
             lora_b=spec.lora_b,
+            adapter_scale=spec.adapter_scale,
             dropout=dropout,
         )
         replacement.train(source.training)
@@ -401,7 +417,7 @@ def load_nbs_compact_checkpoint(model, checkpoint_dir, adapter_name="default"):
     if not os.path.isfile(state_path):
         raise FileNotFoundError(f"compact adapter not found: {state_path}")
     state = torch.load(state_path, map_location="cpu")
-    if int(state.get("format_version", 0)) != 1:
+    if int(state.get("format_version", 0)) not in (1, 2):
         raise ValueError("unsupported NBS compact checkpoint format")
     if state.get("adapter_name", adapter_name) != adapter_name:
         raise ValueError("compact checkpoint adapter name mismatch")

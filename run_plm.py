@@ -960,7 +960,9 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
         print('\033[33mWarning:\033[0m', model_path, 'not found, skip loading weights.')
 
     if args.nbs_inference_mode == 'compact':
-        if args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0:
+        if (args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0 or
+                args.nbs_compaction_output_rtol < 0 or
+                args.nbs_compaction_output_atol < 0):
             raise ValueError('NBS compaction tolerances must be non-negative')
         if not args.use_adalora or args.adalora_allocator != 'nbs':
             raise ValueError(
@@ -1026,13 +1028,15 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             )
         difference = (compact_prediction.float() - original_prediction.float()).abs()
         denominator = original_prediction.float().abs().clamp_min(
-            args.nbs_compaction_atol
+            args.nbs_compaction_output_atol
         )
         full_output_validation = {
             'passed': False,
-            'rtol': float(args.nbs_compaction_rtol),
-            'atol': float(args.nbs_compaction_atol),
+            'rtol': float(args.nbs_compaction_output_rtol),
+            'atol': float(args.nbs_compaction_output_atol),
             'max_abs_error': float(difference.max().item()),
+            'mean_abs_error': float(difference.mean().item()),
+            'rmse': float(difference.square().mean().sqrt().item()),
             'max_rel_error': float((difference / denominator).max().item()),
             'output_shape': list(original_prediction.shape),
             'dataset': args.test_dataset,
@@ -1040,8 +1044,8 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
         try:
             torch.testing.assert_close(
                 compact_prediction.float(), original_prediction.float(),
-                rtol=args.nbs_compaction_rtol,
-                atol=args.nbs_compaction_atol,
+                rtol=args.nbs_compaction_output_rtol,
+                atol=args.nbs_compaction_output_atol,
             )
         except AssertionError:
             write_nbs_compaction_validation(
@@ -1599,11 +1603,22 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--nbs-compaction-rtol', type=float, default=1e-4,
-        help='Relative tolerance for compact factor and full-output equivalence.',
+        help='Strict relative tolerance for layer-level compact-factor equivalence.',
     )
     parser.add_argument(
         '--nbs-compaction-atol', type=float, default=1e-5,
-        help='Absolute tolerance for compact factor and full-output equivalence.',
+        help='Strict absolute tolerance for layer-level compact-factor equivalence.',
+    )
+    parser.add_argument(
+        '--nbs-compaction-output-rtol', type=float, default=1e-3,
+        help='Relative tolerance for end-to-end autoregressive output equivalence.',
+    )
+    parser.add_argument(
+        '--nbs-compaction-output-atol', type=float, default=2e-3,
+        help=(
+            'Absolute tolerance for end-to-end autoregressive output equivalence; '
+            'separate from strict factor checks to allow accumulated FP16 rounding.'
+        ),
     )
     parser.add_argument('--selector-recent-k', type=int, default=None,
                         help='Keep the most recent K trajectory tokens before decoding.')

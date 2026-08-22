@@ -40,8 +40,15 @@ if [[ ! -d "$SOURCE_CHECKPOINT" ]]; then
   exit 3
 fi
 
-BENCHMARK_ID="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="$ARTIFACT_ROOT/${NBS_VARIANT}_compaction/$BENCHMARK_ID"
+if [[ -n "${BENCHMARK_RUN_DIR:-}" ]]; then
+  RUN_DIR="$BENCHMARK_RUN_DIR"
+  BENCHMARK_ID="$(basename "$RUN_DIR")"
+  SKIP_ORIGINAL="${SKIP_ORIGINAL:-1}"
+else
+  BENCHMARK_ID="$(date +%Y%m%d_%H%M%S)"
+  RUN_DIR="$ARTIFACT_ROOT/${NBS_VARIANT}_compaction/$BENCHMARK_ID"
+  SKIP_ORIGINAL="${SKIP_ORIGINAL:-0}"
+fi
 ORIGINAL_DIR="$RUN_DIR/original"
 COMPACT_DIR="$RUN_DIR/compact"
 COMPACT_CHECKPOINT="$RUN_DIR/compact_checkpoint"
@@ -90,14 +97,22 @@ printf 'benchmark_id=%s\nsource_run=%s\nsource_checkpoint=%s\ncheckpoint_role=%s
   "$BENCHMARK_ID" "$V19_RUN_DIR" "$SOURCE_CHECKPOINT" "$CHECKPOINT_ROLE" \
   > "$RUN_DIR/metadata.env"
 
-echo "[1/3] Original masked NBS AdaLoRA evaluation"
-env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-  python run_plm.py \
-  "${COMMON_ARGS[@]}" \
-  --nbs-inference-mode original \
-  --results-output-dir "$ORIGINAL_DIR" \
-  --latency-output-path "$ORIGINAL_DIR/latency.json" \
-  2>&1 | tee "$ORIGINAL_DIR/test.log"
+if [[ "$SKIP_ORIGINAL" == "1" ]]; then
+  if [[ ! -f "$ORIGINAL_DIR/latency.json" ]]; then
+    echo "Cannot resume: original latency artifact is missing in $ORIGINAL_DIR"
+    exit 4
+  fi
+  echo "[1/3] Reusing completed original masked NBS evaluation from $ORIGINAL_DIR"
+else
+  echo "[1/3] Original masked NBS AdaLoRA evaluation"
+  env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    python run_plm.py \
+    "${COMMON_ARGS[@]}" \
+    --nbs-inference-mode original \
+    --results-output-dir "$ORIGINAL_DIR" \
+    --latency-output-path "$ORIGINAL_DIR/latency.json" \
+    2>&1 | tee "$ORIGINAL_DIR/test.log"
+fi
 
 echo "[2/3] Compact fixed-LoRA conversion, equivalence check, and evaluation"
 env PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
