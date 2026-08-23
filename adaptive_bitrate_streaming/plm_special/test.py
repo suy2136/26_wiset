@@ -81,14 +81,25 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             if str(args.device).startswith('cuda') and torch.cuda.is_available():
                 torch.cuda.synchronize(args.device)
             inference_start = time.perf_counter()
-            bit_rate = model.sample(state, target_return, timestep)
+            if getattr(args, 'speculative_draft_steps', 0) > 0:
+                bit_rate = model.sample_speculative(
+                    state=state,
+                    target_return=target_return,
+                    timestep=timestep,
+                    last_bitrate=last_bit_rate,
+                    buffer_size=buffer_size,
+                    video_chunk_remain=video_chunk_remain,
+                    reward_transform=process_reward_fn,
+                )
+            else:
+                bit_rate = model.sample(state, target_return, timestep)
             if str(args.device).startswith('cuda') and torch.cuda.is_available():
                 torch.cuda.synchronize(args.device)
             inference_latencies_ms.append(
                 (time.perf_counter() - inference_start) * 1000.0
             )
             selection_trace = getattr(model, 'last_selection_trace', {})
-            if selection_trace:
+            if selection_trace and selection_trace.get('target_model_called', True):
                 original_token_counts.append(selection_trace['original_length'])
                 selected_token_counts.append(selection_trace['selected_length'])
             timestep += 1
@@ -99,6 +110,7 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
                 torch.zero_(state)
                 timestep = 0
                 target_return = copy.deepcopy(target_return_clone)
+                model.clear_dq()
 
                 ep_count += 1
                 if ep_count >= max_ep_num:
@@ -142,6 +154,23 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             0.0 if total_original_tokens == 0
             else 1.0 - total_selected_tokens / total_original_tokens
         ),
+    })
+    speculative_metrics = model.get_speculative_metrics()
+    target_plm_calls = speculative_metrics['target_plm_calls']
+    test_log.update({
+        'speculative_draft_steps': getattr(args, 'speculative_draft_steps', 0),
+        'speculative_verification_mode': getattr(
+            args, 'speculative_verification_mode', 'sample'
+        ),
+        'speculative_buffer_tolerance': getattr(
+            args, 'speculative_buffer_tolerance', None
+        ),
+        'target_plm_calls': target_plm_calls,
+        'llm_call_reduction_ratio': (
+            0.0 if not inference_latencies_ms
+            else 1.0 - target_plm_calls / len(inference_latencies_ms)
+        ),
+        **speculative_metrics,
     })
     with open(os.path.join(results_dir, 'selector_metrics.json'), 'w') as f:
         json.dump(test_log, f, indent=2, sort_keys=True)

@@ -10,6 +10,12 @@ SCRIPT_PATH = ABR_ROOT / 'analysis' / 'run_selector_sweep.py'
 spec = importlib.util.spec_from_file_location('run_selector_sweep', SCRIPT_PATH)
 sweep = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sweep)
+SPECULATIVE_SCRIPT_PATH = ABR_ROOT / 'analysis' / 'run_speculative_sweep.py'
+speculative_spec = importlib.util.spec_from_file_location(
+    'run_speculative_sweep', SPECULATIVE_SCRIPT_PATH
+)
+speculative_sweep = importlib.util.module_from_spec(speculative_spec)
+speculative_spec.loader.exec_module(speculative_sweep)
 
 
 class SelectorSweepTest(unittest.TestCase):
@@ -32,6 +38,23 @@ class SelectorSweepTest(unittest.TestCase):
         self.assertEqual(command[1:3], ['run_plm.py', '--test'])
         self.assertIn('--selector-history-steps', command)
         self.assertEqual(command[-1], '10')
+
+
+class SpeculativeSweepTest(unittest.TestCase):
+    def test_default_matrix_has_baseline_and_four_draft_lengths(self):
+        self.assertEqual(
+            list(speculative_sweep.configurations([1, 2, 3, 4])),
+            [0, 1, 2, 3, 4],
+        )
+
+    def test_speculative_flags_are_added(self):
+        command = speculative_sweep.command_for(
+            3, 'sample', 1.0, ['--device', 'cuda:0']
+        )
+        self.assertEqual(command[1:3], ['run_plm.py', '--test'])
+        self.assertIn('--speculative-draft-steps', command)
+        self.assertIn('--speculative-buffer-tolerance', command)
+        self.assertEqual(command[-1], '1.0')
 
 
 if __name__ == '__main__':

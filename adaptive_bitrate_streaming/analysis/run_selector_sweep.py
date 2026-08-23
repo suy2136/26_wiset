@@ -33,7 +33,10 @@ def command_for(selector, steps, forwarded):
 
 def newest_metrics(selector, steps):
     tag = 'selector_none' if selector == 'none' else f'selector_recent_timestep_h{steps}'
-    candidates = list(RESULTS_ROOT.rglob(f'{tag}/selector_metrics.json'))
+    candidates = [
+        path for path in RESULTS_ROOT.rglob('selector_metrics.json')
+        if tag in path.parts
+    ]
     if not candidates:
         raise FileNotFoundError(f'no metrics produced for {tag}')
     return max(candidates, key=lambda path: path.stat().st_mtime)

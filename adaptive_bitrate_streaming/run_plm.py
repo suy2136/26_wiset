@@ -22,6 +22,7 @@ from plm_special.models.rl_policy import OfflineRLPolicy
 from plm_special.models.selectors import RecentTimestepSelector
 from plm_special.models.state_encoder import EncoderNetwork
 from plm_special.models.low_rank import peft_model
+from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
@@ -136,6 +137,10 @@ def run(args):
     assert args.video in cfg.video_size_dirs.keys()
     if args.selector_history_steps <= 0:
         raise ValueError('--selector-history-steps must be positive')
+    if not 0 <= args.speculative_draft_steps <= 5:
+        raise ValueError('--speculative-draft-steps must be between 0 and 5')
+    if args.speculative_buffer_tolerance < 0:
+        raise ValueError('--speculative-buffer-tolerance must be non-negative')
 
     # 1. set seed
     set_random_seed(args.seed)
@@ -195,9 +200,17 @@ def run(args):
     token_selector = None
     if args.token_selector == 'recent-timestep':
         token_selector = RecentTimestepSelector(args.selector_history_steps)
+    draft_generator = None
+    if args.speculative_draft_steps > 0:
+        draft_generator = RobustMPCDraftGenerator.from_video_size_dir(
+            video_size_dir, max_horizon=args.speculative_draft_steps
+        )
     rl_policy = OfflineRLPolicy(state_feature_dim=args.state_feature_dim, bitrate_levels=BITRATE_LEVELS, state_encoder=state_encoder, plm=plm, plm_embed_size=plm_embed_size,
                                            max_length=args.w, max_ep_len=max_ep_len, device=args.device, device_out=args.device_out, which_layer=args.which_layer,
-                                           token_selector=token_selector)
+                                           token_selector=token_selector, draft_generator=draft_generator,
+                                           speculative_draft_steps=args.speculative_draft_steps,
+                                           speculative_verification_mode=args.speculative_verification_mode,
+                                           speculative_buffer_tolerance=args.speculative_buffer_tolerance)
 
     # 5. handling directory and path
 
@@ -210,8 +223,12 @@ def run(args):
         'selector_none' if args.token_selector == 'none'
         else f'selector_recent_timestep_h{args.selector_history_steps}'
     )
+    speculative_tag = (
+        'speculative_none' if args.speculative_draft_steps == 0
+        else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}'
+    )
     results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
-                               f'early_stop_{args.which_layer}_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag)
+                               f'early_stop_{args.which_layer}_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag, speculative_tag)
     checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
     best_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_best_model')
 
@@ -273,6 +290,12 @@ if __name__ == '__main__':
                         help='inference-time token selection policy')
     parser.add_argument('--selector-history-steps', type=int, default=20,
                         help='number of complete real-history timesteps retained by recent-timestep')
+    parser.add_argument('--speculative-draft-steps', type=int, default=0,
+                        help='MPC draft horizon; 0 disables speculative draft generation')
+    parser.add_argument('--speculative-verification-mode', choices=('greedy', 'sample'), default='sample',
+                        help='how target logits choose actions during draft verification')
+    parser.add_argument('--speculative-buffer-tolerance', type=float, default=1.0,
+                        help='maximum predicted/observed buffer error in seconds before fallback')
     # other settings
     parser.add_argument('--adapt', action="store_true", help='adapt model')
     parser.add_argument('--test', action="store_true", help='test model')

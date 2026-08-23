@@ -112,6 +112,30 @@ We offer the model checkpoint of the finetuned Llama2-7b here: https://drive.goo
 python run_plm.py --test --plm-type llama --plm-size base --rank 128 --device cuda:0 --model-dir  data/ft_plms/try_llama2_7b
 ```
 
+**Token selection and MPC speculative inference**
+
+Inference can retain only recent complete ABR history blocks and verify a
+short robust-MPC draft in one target-model call:
+
+```sh
+python run_plm.py --test --model-dir YOUR_MODEL --device cuda:0 \
+  --token-selector recent-timestep --selector-history-steps 10 \
+  --speculative-draft-steps 3 --speculative-verification-mode sample \
+  --speculative-buffer-tolerance 1.0
+```
+
+The speculative path accepts the matching MPC/NetLLM prefix, uses the NetLLM
+action at the first mismatch, and falls back to ordinary one-step inference
+when observed buffer error exceeds the configured tolerance. Only observed
+states and executed actions are committed to policy history. To compare
+`K=0,1,2,3,4` and write a CSV summary, run:
+
+```sh
+python analysis/run_speculative_sweep.py -- \
+  --model-dir YOUR_MODEL --device cuda:0 \
+  --token-selector recent-timestep --selector-history-steps 10
+```
+
 ## Run baselines
 
 To run baselines, please run:
