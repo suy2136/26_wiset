@@ -1,5 +1,7 @@
 import os
 import sys
+import json
+import math
 import numpy as np
 import torch
 import pickle
@@ -47,12 +49,35 @@ PLM_LAYER_SIZES = {
 }
 
 
-def save_model(args, model, save_dir):
+def save_model(args, model, save_dir, role='checkpoint'):
     if args.rank > 0:
         # save lora weights
         model.plm.save_pretrained(save_dir)
         # save other modules except plm
         torch.save(model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
+        allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        if allocator is not None:
+            torch.save(
+                allocator.state_dict(),
+                os.path.join(save_dir, 'nash_rank_allocator.pt'),
+            )
+            metadata = {
+                'variant': 'nbs_v19',
+                'role': role,
+                'seed': args.seed,
+                'rank_budget': allocator.rank_budget,
+                'effective_rank_budget': sum(allocator.ranks.values()),
+                'ema_beta': allocator.ema_beta,
+                'allocation_interval': allocator.allocation_interval,
+                'warmup_steps': allocator.warmup_steps,
+                'cooldown_start_step': allocator.cooldown_start_step,
+                'active_ranks': allocator.active_rank_summary(),
+            }
+            with open(
+                os.path.join(save_dir, 'checkpoint_metadata.json'),
+                'w', encoding='utf-8'
+            ) as stream:
+                json.dump(metadata, stream, indent=2, sort_keys=True)
     else:
         # lora is disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
@@ -68,6 +93,16 @@ def load_model(args, model, model_dir):
             map_location=args.device or 'cpu',
         )
         model.modules_except_plm.load_state_dict(modules_state)
+        allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        allocator_path = os.path.join(model_dir, 'nash_rank_allocator.pt')
+        if allocator is not None:
+            if not os.path.isfile(allocator_path):
+                raise FileNotFoundError(
+                    'NBS v19 checkpoint is missing nash_rank_allocator.pt: '
+                    f'{model_dir}'
+                )
+            allocator_state = torch.load(allocator_path, map_location='cpu')
+            allocator.load_state_dict(allocator_state)
     else:
         # lora is disabled, load whole model
         model_state = torch.load(
@@ -78,7 +113,9 @@ def load_model(args, model, model_dir):
     return model
 
 
-def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpoint_dir, best_model_dir, eval_process_reward_fn):
+def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
+          checkpoint_dir, best_model_dir, final_model_dir,
+          eval_process_reward_fn):
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -89,11 +126,18 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
         lambda steps: min((steps + 1) / args.warmup_steps, 1)
     )
     loss_fn = CrossEntropyLoss()
-    trainer = Trainer(args, model=model, optimizer=optimizer, exp_dataset=exp_dataset, loss_fn=loss_fn, device=args.device, lr_scheduler=lr_scheduler, 
-                      grad_accum_steps=args.grad_accum_steps)
+    trainer = Trainer(
+        args, model=model, optimizer=optimizer, exp_dataset=exp_dataset,
+        loss_fn=loss_fn, device=args.device, lr_scheduler=lr_scheduler,
+        grad_accum_steps=args.grad_accum_steps,
+        nbs_diagnostics_path=(
+            os.path.join(checkpoint_dir, 'nbs_rank_diagnostics.csv')
+            if args.nbs_v19 else None
+        ),
+    )
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
-    best_eval_return = 0.
+    best_eval_return = float('-inf')
 
     total_train_losses = []
     for epoch in range(args.num_epochs):
@@ -107,7 +151,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
             checkpoint_dir_epoch = os.path.join(checkpoint_dir, str(epoch))
             if not os.path.exists(checkpoint_dir_epoch):
                 os.makedirs(checkpoint_dir_epoch)
-            save_model(args, model, checkpoint_dir_epoch)
+            save_model(args, model, checkpoint_dir_epoch, role=f'epoch_{epoch}')
             print('Checkpoint saved at:', checkpoint_dir_epoch)
 
         if epoch % args.eval_per_epoch == 0:
@@ -116,7 +160,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
             episodes_return = eval_logs['episodes_return']
             if best_eval_return < episodes_return:
                 best_eval_return = episodes_return
-                save_model(args, model, best_model_dir)
+                save_model(args, model, best_model_dir, role='best')
                 print('Best model saved at:', best_model_dir)
 
             eval_logs['best_return'] = best_eval_return
@@ -125,6 +169,9 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings, checkpo
     # save training losses
     train_losses_path = os.path.join(checkpoint_dir, 'train_losses.txt')
     np.savetxt(train_losses_path, total_train_losses, fmt='%.6f', delimiter='\n')
+    trainer.snapshot_nbs(event='training_end')
+    save_model(args, model, final_model_dir, role='final')
+    print('Final model saved at:', final_model_dir)
 
 
 def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, test_process_reward_fn):
@@ -153,6 +200,22 @@ def run(args):
         raise ValueError('--speculative-state-tolerance must be non-negative')
     if args.speculative_return_tolerance < 0:
         raise ValueError('--speculative-return-tolerance must be non-negative')
+    if args.nbs_v19:
+        if args.plm_type != 'llama':
+            raise ValueError('NBS v19 currently supports --plm-type llama only')
+        if args.rank != 32:
+            raise ValueError('NBS v19 requires --rank 32')
+        if args.nbs_rank_budget != 512:
+            raise ValueError('NBS v19 uses the fixed rank budget 512')
+        if args.nbs_allocation_interval <= 0:
+            raise ValueError('--nbs-allocation-interval must be positive')
+        if args.adapt and (
+            args.token_selector != 'none' or args.speculative_draft_steps != 0
+        ):
+            raise ValueError(
+                'Train NBS v19 once with selector/speculative disabled; '
+                'enable them only in --test runs.'
+            )
 
     # 1. set seed
     set_random_seed(args.seed)
@@ -205,7 +268,28 @@ def run(args):
         plm = plm.to(args.device)
     
     if args.rank != -1:
-        plm = peft_model(plm, args.plm_type, rank=args.rank)
+        total_optimizer_steps = max(
+            1,
+            math.ceil(len(exp_dataset) / args.grad_accum_steps) * args.num_epochs,
+        )
+        rank_config = None
+        if args.nbs_v19:
+            rank_config_path = args.nbs_rank_config
+            if not os.path.isfile(rank_config_path):
+                rank_config_path = os.path.join(
+                    os.path.dirname(__file__), args.nbs_rank_config
+                )
+            with open(rank_config_path, encoding='utf-8') as stream:
+                rank_config = json.load(stream)
+        plm = peft_model(
+            plm, args.plm_type, rank=args.rank,
+            nbs_v19=args.nbs_v19,
+            total_step=total_optimizer_steps,
+            nbs_rank_budget=args.nbs_rank_budget,
+            nbs_ema_beta=args.nbs_ema_beta,
+            nbs_allocation_interval=args.nbs_allocation_interval,
+            nbs_rank_config=rank_config,
+        )
 
     # 4.2 create state encoder
     assert args.state_feature_dim is not None, 'please specify state feature dim to create state encoder'
@@ -237,7 +321,8 @@ def run(args):
     # extract training experience pool information
     train_exp_pool_info = args.exp_pool_path.split('/')[-4:-1]
     train_exp_pool_info = '_'.join(train_exp_pool_info)
-    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
+    nbs_tag = '_nbs_v19_budget512' if args.nbs_v19 else ''
+    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
     selector_tag = (
         'selector_none' if args.token_selector == 'none'
@@ -248,9 +333,10 @@ def run(args):
         else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
     )
     results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
-                               f'early_stop_{args.which_layer}_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag, speculative_tag)
+                               f'early_stop_{args.which_layer}_rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag, speculative_tag)
     checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
     best_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_best_model')
+    final_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_final_model')
 
 
     # 6. start training/testing
@@ -270,7 +356,10 @@ def run(args):
             os.makedirs(best_model_dir)
         console_log = open(os.path.join(models_dir, f'early_stop_{args.which_layer}_console.log'), 'w')
         sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
-        adapt(args, rl_policy, exp_dataset, exp_dataset_info, env_settings, checkpoint_dir, best_model_dir, process_reward)
+        adapt(
+            args, rl_policy, exp_dataset, exp_dataset_info, env_settings,
+            checkpoint_dir, best_model_dir, final_model_dir, process_reward,
+        )
     if args.test:
         if not os.path.exists(results_dir):
             os.makedirs(results_dir)
@@ -297,6 +386,19 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true',
                         help='load base PLM weights directly in FP16')
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
+    parser.add_argument('--nbs-v19', action='store_true',
+                        help='enable the fixed-budget NBS allocation v19 recipe')
+    parser.add_argument('--nbs-rank-budget', type=int, default=512,
+                        help='global active-rank budget for NBS v19')
+    parser.add_argument('--nbs-ema-beta', type=float, default=0.9,
+                        help='gradient sensitivity EMA coefficient for NBS v19')
+    parser.add_argument('--nbs-allocation-interval', type=int, default=10,
+                        help='optimizer-step interval between NBS reallocations')
+    parser.add_argument(
+        '--nbs-rank-config',
+        default='configs/nbs_v19_rank_config.json',
+        help='JSON file containing NBS per-layer min/max ranks',
+    )
     # state encoder settings
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)
     # rl policy related settings

@@ -139,6 +139,35 @@ python analysis/run_speculative_sweep.py -- \
   --token-selector recent-timestep --selector-history-steps 10
 ```
 
+**NBS allocation v19 experiment**
+
+NBS v19 uses seed 1, FP16 Llama2-7B, physical rank 32, per-layer ranks
+2--32, and a fixed total active-rank budget of 512. Train the allocator once
+with both inference-only features disabled:
+
+```sh
+BASE_MODEL_DIR=/workspace/26_wiset/downloaded_plms/llama/base \
+  bash scripts/run_nbs_v19_training.sh
+```
+
+The best and final checkpoints include `nash_rank_allocator.pt` and
+`checkpoint_metadata.json` in addition to the LoRA and ABR module weights.
+Use one of those checkpoint directories for the fixed seed-1 inference matrix:
+
+```sh
+python analysis/run_nbs_v19_inference_matrix.py \
+  --checkpoint-dir YOUR_NBS_V19_BEST_MODEL \
+  --base-model-dir /workspace/26_wiset/downloaded_plms/llama/base
+```
+
+The matrix runs NBS only, selector `H=5/10/15`, speculative `K=2/3/4`, and
+combined `H5+K2`/`H10+K3`. It writes CSV and JSON rows containing QoE,
+end-to-end test time, inference latency, token reduction, draft acceptance,
+fallback, target-LLM-call reduction, and comparisons against NBS only. Each
+completed configuration is saved immediately. If execution is interrupted,
+rerun the same command with `--resume`; the manifest rejects incompatible
+checkpoint, trace, or tolerance settings.
+
 ## Run baselines
 
 To run baselines, please run:
