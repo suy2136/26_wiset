@@ -168,6 +168,24 @@ completed configuration is saved immediately. If execution is interrupted,
 rerun the same command with `--resume`; the manifest rejects incompatible
 checkpoint, trace, or tolerance settings.
 
+To run training and all nine inference configurations sequentially with one
+command, use the full experiment runner:
+
+```sh
+python analysis/run_nbs_v19_full_experiment.py \
+  --base-model-dir /workspace/26_wiset/downloaded_plms/llama/base
+```
+
+It selects the best seed-1 NBS v19 checkpoint created by that training run and
+then starts the inference matrix. If training has completed but inference was
+interrupted, do not retrain; resume from the recorded checkpoint with:
+
+```sh
+python analysis/run_nbs_v19_full_experiment.py \
+  --base-model-dir /workspace/26_wiset/downloaded_plms/llama/base \
+  --resume-inference
+```
+
 ## Run baselines
 
 To run baselines, please run:
