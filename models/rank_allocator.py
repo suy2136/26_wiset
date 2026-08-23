@@ -30,9 +30,11 @@ class NashRankAllocator:
     ``max_rank`` is the maximum number of active slots allowed in each adapter;
     it may be smaller than the physical AdaLoRA rank.  Candidate components are
     selected by energy from all physical slots, never by their storage index.
-    ``rank_budget`` is the desired sum of active slots across all layers.
-    Rank allocation is recomputed from the current gradients and ``lora_E``
-    values whenever :meth:`step` is called.
+    In fixed mode, ``rank_budget`` is the desired sum of active slots across
+    all layers.  In adaptive mode it is the default upper bound; allocation
+    stops earlier when the best remaining marginal Nash gain falls below a
+    relative threshold.  Rank allocation is recomputed from the current
+    gradients and shadow ``lora_E`` spectrum whenever :meth:`step` is called.
     """
 
     def __init__(self, model, target_rank, min_rank=None, max_rank=None,
@@ -40,7 +42,9 @@ class NashRankAllocator:
                  adapter_name="default", rank_config=None,
                  missing_grad_policy="zero", warmup_steps=0,
                  cooldown_start_step=None, allocation_interval=1,
-                 shadow_update_policy="legacy"):
+                 shadow_update_policy="legacy", budget_mode="fixed",
+                 relative_lambda=0.15, adaptive_min_budget=None,
+                 adaptive_max_budget=None):
         self.model = model
         self.adapter_name = adapter_name
         self.target_rank = int(target_rank)
@@ -58,6 +62,19 @@ class NashRankAllocator:
                 "shadow_update_policy must be 'legacy' or 'active-only'"
             )
         self.shadow_update_policy = shadow_update_policy
+        if budget_mode not in ("fixed", "adaptive"):
+            raise ValueError("budget_mode must be 'fixed' or 'adaptive'")
+        self.budget_mode = budget_mode
+        self.relative_lambda = float(relative_lambda)
+        if not 0.0 <= self.relative_lambda <= 1.0:
+            raise ValueError("relative_lambda must be in [0, 1]")
+        if self.budget_mode == "adaptive" and self.shadow_update_policy != "active-only":
+            raise ValueError(
+                "adaptive budget mode requires shadow_update_policy='active-only' "
+                "so inactive spectral candidates remain available"
+            )
+        self.adaptive_min_budget_override = adaptive_min_budget
+        self.adaptive_max_budget_override = adaptive_max_budget
         self.warmup_steps = int(warmup_steps)
         self.cooldown_start_step = (
             None if cooldown_start_step is None else int(cooldown_start_step)
@@ -83,6 +100,11 @@ class NashRankAllocator:
         self.last_diagnostics = []
         self.last_step = None
         self.ema_step = 0
+        self.reference_gain = None
+        self.stopping_threshold = None
+        self.last_allocated_gain = None
+        self.next_rejected_gain = None
+        self.stopping_reason = "initialization"
 
         self.layers = self._find_layers()
         if not self.layers:
@@ -103,10 +125,42 @@ class NashRankAllocator:
             if self.max_ranks[name] > physical_ranks[name]:
                 raise ValueError(f"max rank exceeds physical rank for {name}")
         self.rank_budget = self._resolve_budget()
-        if self.rank_budget < sum(self.min_ranks.values()):
+        minimum_budget = sum(self.min_ranks.values())
+        maximum_budget = sum(self.max_ranks.values())
+        self.adaptive_min_budget = (
+            minimum_budget
+            if self.adaptive_min_budget_override is None
+            else int(self.adaptive_min_budget_override)
+        )
+        self.adaptive_max_budget = (
+            self.rank_budget
+            if self.adaptive_max_budget_override is None
+            else int(self.adaptive_max_budget_override)
+        )
+        if self.budget_mode == "adaptive":
+            self.rank_budget = self.adaptive_max_budget
+        else:
+            # Keep one source of truth in fixed mode.  Adaptive-only bounds do
+            # not alter the historical exact-budget behavior.
+            self.adaptive_min_budget = self.rank_budget
+            self.adaptive_max_budget = self.rank_budget
+        if self.rank_budget < minimum_budget:
             raise ValueError("rank_budget is smaller than the minimum-rank budget")
-        if self.rank_budget > sum(self.max_ranks.values()):
+        if self.rank_budget > maximum_budget:
             raise ValueError("rank_budget exceeds the available AdaLoRA slots")
+        if self.budget_mode == "adaptive":
+            if self.adaptive_min_budget < minimum_budget:
+                raise ValueError(
+                    "adaptive_min_budget is smaller than the minimum-rank budget"
+                )
+            if self.adaptive_min_budget > self.adaptive_max_budget:
+                raise ValueError(
+                    "adaptive_min_budget exceeds adaptive_max_budget"
+                )
+            if self.adaptive_max_budget > maximum_budget:
+                raise ValueError(
+                    "adaptive_max_budget exceeds the available AdaLoRA slots"
+                )
 
         initial_ranks = self._initial_budget_ranks()
         for name, module in self.layers.items():
@@ -128,6 +182,7 @@ class NashRankAllocator:
             (name, values.detach().clone())
             for name, values in self.spectral_shadow.items()
         )
+        self.stopping_reason = "warmup_initial_budget"
         self._apply_allocation(self.ranks)
         self.snapshot_diagnostics(step=0, event="initialization")
 
@@ -323,37 +378,93 @@ class NashRankAllocator:
             return float("-inf")
         return float(torch.log(utility[rank + 1] / utility[rank]).item())
 
-    def _choose_ranks(self):
+    def _rank_choice_inputs(self):
         weights = self._weights()
         utilities = {name: self._utility(name) for name in self.layers}
         ranks = {name: self.min_ranks[name] for name in self.layers}
-        remaining = self.rank_budget - sum(ranks.values())
-
-        # Each layer has a diminishing marginal-gain sequence.  The heap
-        # stores only the next available gain for each layer; after selecting
-        # a layer, only that layer's next gain is recomputed.
         heap = []
         tie_breaker = {name: index for index, name in enumerate(self.layers)}
         for name in self.layers:
             if ranks[name] < self.max_ranks[name]:
                 gain = self._marginal_gain(utilities[name], ranks[name], weights[name])
                 heapq.heappush(heap, (-gain, tie_breaker[name], name))
+        return ranks, utilities, weights, heap, tie_breaker
+
+    def _push_next_gain(self, heap, tie_breaker, selected, ranks,
+                        utilities, weights):
+        if ranks[selected] >= self.max_ranks[selected]:
+            return
+        next_gain = self._marginal_gain(
+            utilities[selected], ranks[selected], weights[selected]
+        )
+        heapq.heappush(
+            heap, (-next_gain, tie_breaker[selected], selected)
+        )
+
+    def _choose_ranks_fixed(self):
+        ranks, utilities, weights, heap, tie_breaker = self._rank_choice_inputs()
+        remaining = self.rank_budget - sum(ranks.values())
 
         self.last_gains = OrderedDict()
+        self.reference_gain = -heap[0][0] if heap else None
+        self.stopping_threshold = None
+        self.last_allocated_gain = None
+        self.next_rejected_gain = None
         for _ in range(remaining):
             if not heap:
                 break
             neg_gain, _, selected = heapq.heappop(heap)
-            self.last_gains[selected] = -neg_gain
+            selected_gain = -neg_gain
+            self.last_gains[selected] = selected_gain
+            self.last_allocated_gain = selected_gain
             ranks[selected] += 1
-            if ranks[selected] < self.max_ranks[selected]:
-                next_gain = self._marginal_gain(
-                    utilities[selected], ranks[selected], weights[selected]
-                )
-                heapq.heappush(
-                    heap, (-next_gain, tie_breaker[selected], selected)
-                )
+            self._push_next_gain(
+                heap, tie_breaker, selected, ranks, utilities, weights
+            )
+        self.next_rejected_gain = -heap[0][0] if heap else None
+        self.stopping_reason = "fixed_budget_reached"
         return ranks, utilities, weights
+
+    def _choose_ranks_adaptive(self):
+        ranks, utilities, weights, heap, tie_breaker = self._rank_choice_inputs()
+        self.last_gains = OrderedDict()
+        self.reference_gain = -heap[0][0] if heap else 0.0
+        self.stopping_threshold = self.relative_lambda * self.reference_gain
+        self.last_allocated_gain = None
+        self.next_rejected_gain = None
+        self.stopping_reason = "no_available_candidate"
+
+        while heap and sum(ranks.values()) < self.adaptive_max_budget:
+            best_gain = -heap[0][0]
+            current_total = sum(ranks.values())
+            if (
+                current_total >= self.adaptive_min_budget
+                and best_gain <= self.stopping_threshold
+            ):
+                self.next_rejected_gain = best_gain
+                self.stopping_reason = "relative_threshold_reached"
+                break
+            neg_gain, _, selected = heapq.heappop(heap)
+            selected_gain = -neg_gain
+            self.last_gains[selected] = selected_gain
+            self.last_allocated_gain = selected_gain
+            ranks[selected] += 1
+            self._push_next_gain(
+                heap, tie_breaker, selected, ranks, utilities, weights
+            )
+        else:
+            if sum(ranks.values()) >= self.adaptive_max_budget:
+                self.stopping_reason = "adaptive_max_budget_reached"
+                self.next_rejected_gain = -heap[0][0] if heap else None
+
+        return ranks, utilities, weights
+
+    def _choose_ranks(self):
+        # Keep the original exact-budget path separate so fixed mode remains
+        # a stable baseline for every existing experiment and checkpoint.
+        if self.budget_mode == "adaptive":
+            return self._choose_ranks_adaptive()
+        return self._choose_ranks_fixed()
 
     @staticmethod
     def _module_coordinates(name):
@@ -408,6 +519,18 @@ class NashRankAllocator:
                 "rank_delta": rank - int(previous_ranks.get(name, rank)),
                 "total_rank": total_rank,
                 "rank_budget": int(self.rank_budget),
+                "budget_mode": self.budget_mode,
+                "relative_lambda": (
+                    self.relative_lambda if self.budget_mode == "adaptive" else None
+                ),
+                "reference_gain": self.reference_gain,
+                "stopping_threshold": self.stopping_threshold,
+                "last_allocated_gain": self.last_allocated_gain,
+                "next_rejected_gain": self.next_rejected_gain,
+                "effective_rank_budget": total_rank,
+                "rank_budget_cap": int(self.adaptive_max_budget),
+                "adaptive_min_budget": int(self.adaptive_min_budget),
+                "stopping_reason": self.stopping_reason,
             })
         return rows
 
@@ -518,7 +641,7 @@ class NashRankAllocator:
 
         if len(validated_ranks) == len(self.layers):
             requested_total = sum(validated_ranks.values())
-            if requested_total != self.rank_budget:
+            if self.budget_mode == "fixed" and requested_total != self.rank_budget:
                 violations.append({
                     "layer_name": None,
                     "requested_rank": requested_total,
@@ -528,6 +651,23 @@ class NashRankAllocator:
                     "message": (
                         f"allocation total rank {requested_total} does not match "
                         f"global budget {self.rank_budget}"
+                    ),
+                })
+            elif self.budget_mode == "adaptive" and not (
+                self.adaptive_min_budget
+                <= requested_total
+                <= self.adaptive_max_budget
+            ):
+                violations.append({
+                    "layer_name": None,
+                    "requested_rank": requested_total,
+                    "min_rank": self.adaptive_min_budget,
+                    "max_rank": self.adaptive_max_budget,
+                    "reason": "adaptive_budget_out_of_bounds",
+                    "message": (
+                        f"adaptive allocation total rank {requested_total} is "
+                        f"outside [{self.adaptive_min_budget}, "
+                        f"{self.adaptive_max_budget}]"
                     ),
                 })
 
@@ -549,9 +689,19 @@ class NashRankAllocator:
     def state_dict(self):
         """Return allocator state separately from the PEFT adapter state."""
         return {
-            "version": 4,
+            "version": 5,
             "target_rank": self.target_rank,
             "rank_budget": self.rank_budget,
+            "budget_mode": self.budget_mode,
+            "relative_lambda": self.relative_lambda,
+            "adaptive_min_budget": self.adaptive_min_budget,
+            "adaptive_max_budget": self.adaptive_max_budget,
+            "effective_rank_budget": sum(self.ranks.values()),
+            "reference_gain": self.reference_gain,
+            "stopping_threshold": self.stopping_threshold,
+            "last_allocated_gain": self.last_allocated_gain,
+            "next_rejected_gain": self.next_rejected_gain,
+            "stopping_reason": self.stopping_reason,
             "ema_beta": self.ema_beta,
             "eps": self.eps,
             "missing_grad_policy": self.missing_grad_policy,
@@ -609,7 +759,32 @@ class NashRankAllocator:
                 "allocator checkpoint has invalid shadow_update_policy: "
                 f"{shadow_update_policy!r}"
             )
+        budget_mode = state.get("budget_mode", "fixed")
+        if budget_mode not in ("fixed", "adaptive"):
+            raise ValueError(
+                f"allocator checkpoint has invalid budget_mode: {budget_mode!r}"
+            )
+        if budget_mode == "adaptive" and shadow_update_policy != "active-only":
+            raise ValueError(
+                "adaptive allocator checkpoint requires active-only spectral shadow"
+            )
         self.shadow_update_policy = shadow_update_policy
+        self.budget_mode = budget_mode
+        self.relative_lambda = float(state.get("relative_lambda", 0.15))
+        if not 0.0 <= self.relative_lambda <= 1.0:
+            raise ValueError("allocator checkpoint relative_lambda must be in [0, 1]")
+        self.rank_budget = int(state.get("rank_budget", self.rank_budget))
+        self.adaptive_min_budget = int(
+            state.get("adaptive_min_budget", self.rank_budget)
+        )
+        self.adaptive_max_budget = int(
+            state.get("adaptive_max_budget", self.rank_budget)
+        )
+        self.reference_gain = state.get("reference_gain")
+        self.stopping_threshold = state.get("stopping_threshold")
+        self.last_allocated_gain = state.get("last_allocated_gain")
+        self.next_rejected_gain = state.get("next_rejected_gain")
+        self.stopping_reason = state.get("stopping_reason", "checkpoint_restore")
         self.warmup_steps = int(state.get("warmup_steps", self.warmup_steps))
         cooldown_start = state.get("cooldown_start_step", self.cooldown_start_step)
         self.cooldown_start_step = (

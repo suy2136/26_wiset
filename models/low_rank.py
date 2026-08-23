@@ -137,7 +137,11 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero",
                 lora_rank_pattern=None, adalora_allocator="nbs",
-                adalora_shadow_update_policy="legacy", eva_state=None):
+                adalora_shadow_update_policy="legacy",
+                adalora_budget_mode="fixed",
+                adalora_relative_lambda=0.15,
+                adalora_adaptive_min_budget=None,
+                adalora_adaptive_max_budget=None, eva_state=None):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -151,6 +155,10 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
     """
     if adalora_allocator not in ("nbs", "peft"):
         raise ValueError("adalora_allocator must be 'nbs' or 'peft'")
+    if adalora_budget_mode not in ("fixed", "adaptive"):
+        raise ValueError("adalora_budget_mode must be 'fixed' or 'adaptive'")
+    if adalora_allocator != "nbs" and adalora_budget_mode != "fixed":
+        raise ValueError("adaptive budget mode is only available with the NBS allocator")
 
     for param in plm.parameters():
         param.requires_grad = False
@@ -247,6 +255,10 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 cooldown_start_step=cooldown_start,
                 allocation_interval=adalora_allocation_interval,
                 shadow_update_policy=adalora_shadow_update_policy,
+                budget_mode=adalora_budget_mode,
+                relative_lambda=adalora_relative_lambda,
+                adaptive_min_budget=adalora_adaptive_min_budget,
+                adaptive_max_budget=adalora_adaptive_max_budget,
             )
             model.nash_rank_allocation_interval = int(adalora_allocation_interval)
             model.nash_physical_rank = int(physical_rank)
@@ -260,6 +272,20 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                     adalora_shadow_update_policy
                 )
             )
+            allocator = model.nash_rank_allocator
+            if allocator.budget_mode == "adaptive":
+                print(
+                    "NBS budget mode: adaptive (warm-up/cap={}, floor={}, "
+                    "relative lambda={})".format(
+                        allocator.adaptive_max_budget,
+                        allocator.adaptive_min_budget,
+                        allocator.relative_lambda,
+                    )
+                )
+            else:
+                print("NBS budget mode: fixed (rank budget={})".format(
+                    allocator.rank_budget
+                ))
             print(
                 "NBS rank schedule: warm-up steps 1-{}, allocation window {}-{}, "
                 "cooldown steps {}-{} (interval={})".format(

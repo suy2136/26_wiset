@@ -45,7 +45,11 @@ NASH_DIAGNOSTIC_FIELDS = [
     'alpha', 'spectral_energy_total', 'utility', 'next_utility_increment',
     'next_marginal_utility_gain', 'next_marginal_gain',
     'min_rank', 'max_rank', 'at_min_rank', 'at_max_rank', 'rank_delta',
-    'total_rank', 'rank_budget', 'validation_event', 'validation_loss',
+    'total_rank', 'rank_budget', 'budget_mode', 'relative_lambda',
+    'reference_gain', 'stopping_threshold', 'last_allocated_gain',
+    'next_rejected_gain', 'effective_rank_budget', 'rank_budget_cap',
+    'adaptive_min_budget', 'stopping_reason',
+    'validation_event', 'validation_loss',
     'teacher_forcing_validation_loss',
     'allocation_error', 'allocation_error_message', 'requested_rank',
     'allocation_error_action',
@@ -1388,6 +1392,10 @@ def run(args):
             lora_rank_pattern=lora_rank_pattern,
             adalora_allocator=args.adalora_allocator,
             adalora_shadow_update_policy=args.adalora_shadow_update_policy,
+            adalora_budget_mode=args.adalora_budget_mode,
+            adalora_relative_lambda=args.adalora_relative_lambda,
+            adalora_adaptive_min_budget=args.adalora_adaptive_min_budget,
+            adalora_adaptive_max_budget=args.adalora_adaptive_max_budget,
             eva_state=eva_state,
         )
 
@@ -1647,7 +1655,36 @@ if __name__ == '__main__':
     parser.add_argument('--adalora-allocation-interval', type=int, default=10,
                         help='Optimizer-step interval between custom rank allocations.')
     parser.add_argument('--adalora-rank-budget', type=int, default=None,
-                        help='Global active rank budget R (default: target rank multiplied by layer count).')
+                        help=('Global active rank budget R in fixed mode; default adaptive '
+                              'warm-up/cap budget in adaptive mode.'))
+    parser.add_argument(
+        '--adalora-budget-mode', choices=['fixed', 'adaptive'], default='fixed',
+        help=(
+            'Use the historical exact global rank budget or stop allocation '
+            'when relative marginal Nash gain falls below a threshold.'
+        ),
+    )
+    parser.add_argument(
+        '--adalora-relative-lambda', type=float, default=0.15,
+        help=(
+            'Adaptive stopping ratio tau in lambda_t=tau*max_l Delta_l(r_l_min). '
+            'Ignored in fixed mode.'
+        ),
+    )
+    parser.add_argument(
+        '--adalora-adaptive-min-budget', type=int, default=None,
+        help=(
+            'Optional adaptive total-rank floor; defaults to the sum of all '
+            'layer minimum ranks.'
+        ),
+    )
+    parser.add_argument(
+        '--adalora-adaptive-max-budget', type=int, default=None,
+        help=(
+            'Optional adaptive total-rank cap and warm-up budget; defaults to '
+            '--adalora-rank-budget (or target rank times layer count).'
+        ),
+    )
     parser.add_argument('--adalora-rank-config', type=str, default=None,
                         help='JSON file mapping LoRA module names to min_rank/max_rank overrides.')
     parser.add_argument('--lora-rank-config', type=str, default=None,
@@ -1676,6 +1713,7 @@ if __name__ == '__main__':
                                  'nbs_v14', 'nbs_v15', 'nbs_v16', 'nbs_v17',
                                  'nbs_v18', 'nbs_v19', 'nbs_v20', 'nbs_v21',
                                  'nbs_v22', 'nbs_v23', 'nbs_v24', 'nbs_v25',
+                                 'nbs_adaptive_tau015',
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
                                  'eva'],
                         default=None,
@@ -1697,6 +1735,17 @@ if __name__ == '__main__':
     parser.add_argument('--limit-test-samples', action='store', dest='limit_test_samples', type=int,
                         help='(Optional, smoke test) Truncate the test set to the first N samples.')
     args = parser.parse_args()
+    if args.adalora_budget_mode == 'adaptive':
+        if not args.use_adalora or args.adalora_allocator != 'nbs':
+            parser.error(
+                '--adalora-budget-mode adaptive requires --use-adalora '
+                'and --adalora-allocator nbs'
+            )
+        if args.adalora_shadow_update_policy != 'active-only':
+            parser.error(
+                '--adalora-budget-mode adaptive requires '
+                '--adalora-shadow-update-policy active-only'
+            )
 
     # resolve the 3-way multimodal mode; --multimodal (legacy) maps to 'baseline' when
     # --multimodal-mode isn't explicitly given

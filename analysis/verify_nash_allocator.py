@@ -112,6 +112,85 @@ def check_initial_budget_and_schedule():
     print("[PASS] full-budget uniform warm-up and fixed cooldown schedule")
 
 
+def check_adaptive_relative_budget():
+    common = dict(
+        target_rank=2,
+        min_rank=1,
+        max_rank=6,
+        rank_budget=15,
+        budget_mode="adaptive",
+        adaptive_min_budget=3,
+        shadow_update_policy="active-only",
+    )
+    allocator = NashRankAllocator(
+        FakeAdaModel(n_layers=3, rank=6),
+        relative_lambda=0.5,
+        **common,
+    )
+    # Warm-up uses the configured cap; the first adaptive allocation restarts
+    # from all minima and stops after each identical layer receives one unit.
+    assert sum(allocator.active_rank_summary().values()) == 15
+    ranks = allocator.allocate(step=1)
+    assert sum(ranks.values()) == 6, ranks
+    assert set(ranks.values()) == {2}, ranks
+    assert allocator.stopping_reason == "relative_threshold_reached"
+    assert allocator.reference_gain > 0
+    assert allocator.stopping_threshold == allocator.relative_lambda * allocator.reference_gain
+    assert allocator.next_rejected_gain <= allocator.stopping_threshold
+    row = allocator.last_diagnostics[0]
+    assert row["budget_mode"] == "adaptive"
+    assert row["effective_rank_budget"] == 6
+    assert row["rank_budget_cap"] == 15
+    assert row["adaptive_min_budget"] == 3
+
+    strict = NashRankAllocator(
+        FakeAdaModel(n_layers=3, rank=6),
+        relative_lambda=1.0,
+        **common,
+    )
+    assert sum(strict.allocate(step=1).values()) == 3
+
+    permissive = NashRankAllocator(
+        FakeAdaModel(n_layers=3, rank=6),
+        relative_lambda=0.0,
+        **common,
+    )
+    assert sum(permissive.allocate(step=1).values()) == 15
+    assert permissive.stopping_reason == "adaptive_max_budget_reached"
+
+    try:
+        NashRankAllocator(
+            FakeAdaModel(n_layers=3, rank=6),
+            relative_lambda=0.5,
+            shadow_update_policy="legacy",
+            budget_mode="adaptive",
+            target_rank=2,
+            min_rank=1,
+            max_rank=6,
+            rank_budget=15,
+        )
+    except ValueError as exc:
+        assert "active-only" in str(exc)
+    else:
+        raise AssertionError("adaptive mode accepted a legacy spectral shadow")
+
+    state = allocator.state_dict()
+    restored = NashRankAllocator(
+        FakeAdaModel(n_layers=3, rank=6),
+        target_rank=2,
+        min_rank=1,
+        max_rank=6,
+        rank_budget=15,
+    )
+    restored.load_state_dict(state)
+    assert restored.budget_mode == "adaptive"
+    assert restored.relative_lambda == 0.5
+    assert restored.adaptive_min_budget == 3
+    assert restored.adaptive_max_budget == 15
+    assert sum(restored.active_rank_summary().values()) == 6
+    print("[PASS] optional relative-threshold adaptive rank budget")
+
+
 def check_sensitivity_weights():
     model = FakeAdaModel(n_layers=2, rank=4)
     allocator = NashRankAllocator(model, target_rank=2, min_rank=1, ema_beta=0.5)
@@ -396,6 +475,36 @@ def check_optional_real_adalora():
         assert os.path.exists(os.path.join(checkpoint_dir, "adapter_model.bin"))
     print("[PASS] real PEFT AdaLoRA forward/backward and custom allocator smoke test")
 
+    adaptive = peft_model(
+        TinyModel(), "llama", rank=2,
+        task_type=TaskType.FEATURE_EXTRACTION, use_adalora=True,
+        total_step=4, adalora_min_rank=1, adalora_rank_budget=8,
+        adalora_allocation_interval=1,
+        adalora_rank_config={
+            "*.layers.*.q_proj": {"min_rank": 1, "max_rank": 2},
+            "*.layers.*.v_proj": {"min_rank": 1, "max_rank": 2},
+        },
+        adalora_shadow_update_policy="active-only",
+        adalora_budget_mode="adaptive",
+        adalora_relative_lambda=0.5,
+        adalora_adaptive_min_budget=4,
+        adalora_adaptive_max_budget=8,
+    )
+    adaptive_output = adaptive(input_ids=torch.randn(4, 8))
+    adaptive_output.pow(2).mean().backward()
+    adaptive_allocator = adaptive.nash_rank_allocator
+    adaptive_allocator.update_sensitivity()
+    adaptive_ranks = adaptive_allocator.allocate(step=2)
+    assert 4 <= sum(adaptive_ranks.values()) <= 8
+    assert adaptive_allocator.budget_mode == "adaptive"
+    assert adaptive_allocator.shadow_update_policy == "active-only"
+    assert adaptive_allocator.stopping_threshold is not None
+    assert all(
+        row["effective_rank_budget"] == sum(adaptive_ranks.values())
+        for row in adaptive_allocator.last_diagnostics
+    )
+    print("[PASS] real PEFT AdaLoRA adaptive-budget forward/backward/allocation")
+
     # PEFT 0.6.2 keeps AdaLoRA A/B/E in fp32 even when the frozen base model
     # is fp16.  Its stock SVDLinear forward cannot multiply those mixed
     # dtypes, so exercise the compatibility forward installed by peft_model().
@@ -482,6 +591,7 @@ def main():
     torch.manual_seed(0)
     check_rank_bounds_and_budget()
     check_initial_budget_and_schedule()
+    check_adaptive_relative_budget()
     check_sensitivity_weights()
     check_utility_concavity_and_gain_monotonicity()
     check_max_rank_uses_all_physical_slots()
