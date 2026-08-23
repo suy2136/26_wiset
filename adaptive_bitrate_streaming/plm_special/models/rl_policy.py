@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from collections import deque
 
 from plm_special.models.selectors import BaseSelector
+from plm_special.models.selection_layout import aligned_context_window
 from plm_special.speculative.acceptance import (
     buffer_deviation_seconds,
     build_acceptance_plan,
@@ -27,6 +28,7 @@ class OfflineRLPolicy(nn.Module):
             state_encoder,
             plm,
             plm_embed_size,
+            plm_context_length=None,
             max_length=None,
             max_ep_len=100,
             device='cuda' if torch.cuda.is_available() else 'cpu',
@@ -51,6 +53,9 @@ class OfflineRLPolicy(nn.Module):
 
         self.plm = plm
         self.plm_embed_size = plm_embed_size
+        self.plm_context_length = self._resolve_plm_context_length(
+            plm, plm_context_length
+        )
 
         # =========== multimodal encoder (start) ===========
         self.state_encoder = state_encoder
@@ -114,6 +119,46 @@ class OfflineRLPolicy(nn.Module):
             self.embed_state6, self.action_head
         ])
 
+    @staticmethod
+    def _resolve_plm_context_length(plm, explicit_limit):
+        if explicit_limit is not None:
+            if (
+                isinstance(explicit_limit, bool)
+                or not isinstance(explicit_limit, int)
+                or explicit_limit <= 0
+            ):
+                raise ValueError("plm_context_length must be a positive integer")
+            return explicit_limit
+        configs = [getattr(plm, "config", None)]
+        base_model = getattr(plm, "base_model", None)
+        configs.append(getattr(base_model, "config", None))
+        get_base_model = getattr(plm, "get_base_model", None)
+        if callable(get_base_model):
+            configs.append(getattr(get_base_model(), "config", None))
+        for config in configs:
+            for name in ("max_position_embeddings", "n_positions", "n_ctx"):
+                value = getattr(config, name, None) if config is not None else None
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and value > 0
+                ):
+                    return value
+        return None
+
+    def _truncate_inference_context(self, embeddings, protected_suffix_tokens):
+        """Drop only complete oldest history blocks to fit the PLM context."""
+        original_length = int(embeddings.shape[1])
+        if self.plm_context_length is None:
+            return embeddings, 0, original_length
+        start = aligned_context_window(
+            original_length=original_length,
+            context_limit=self.plm_context_length,
+            tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
+            protected_suffix_tokens=protected_suffix_tokens,
+        )
+        return embeddings[:, start:, :], start, original_length
+
     def forward(self, states, actions, returns, timesteps, attention_mask=None):
         """
         Forward function, used for training.
@@ -156,7 +201,14 @@ class OfflineRLPolicy(nn.Module):
             stacked_inputs.append(stacked_input)
             action_embed_positions[i] = (i + 1) * (2 + 6)
         stacked_inputs = torch.cat(stacked_inputs, dim=0).unsqueeze(0)
-        stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]  # truncate sequence length (should not exceed plm embed size)
+        if (
+            self.plm_context_length is not None
+            and stacked_inputs.shape[1] > self.plm_context_length
+        ):
+            raise ValueError(
+                "training ABR sequence exceeds the PLM context limit; "
+                "reduce --w so labels and complete 8-token blocks remain aligned"
+            )
         stacked_inputs_ln = self.embed_ln(stacked_inputs)  # layer normalization
         
         # Step 4: feed stacked embeddings into the plm
@@ -261,7 +313,11 @@ class OfflineRLPolicy(nn.Module):
         previous_context = self._stack_previous_context()
         protected_suffix = torch.cat((current_block, draft_blocks), dim=1)
         stacked_inputs = torch.cat((previous_context, protected_suffix), dim=1)
-        stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]
+        stacked_inputs, context_start, pre_truncation_length = (
+            self._truncate_inference_context(
+                stacked_inputs, int(protected_suffix.shape[1])
+            )
+        )
         stacked_inputs_ln = self.embed_ln(stacked_inputs)
         attention_mask = torch.ones(
             stacked_inputs_ln.shape[:2], dtype=torch.long, device=self.device
@@ -294,6 +350,9 @@ class OfflineRLPolicy(nn.Module):
 
         self.last_selection_trace = {
             "target_model_called": True,
+            "pre_truncation_length": pre_truncation_length,
+            "context_truncated_tokens": context_start,
+            "plm_context_length": self.plm_context_length,
             "selector_enabled": self.token_selector is not None,
             "selector_class": (
                 None if self.token_selector is None
@@ -354,9 +413,9 @@ class OfflineRLPolicy(nn.Module):
             raise ValueError("draft_blocks must contain one or more complete ABR blocks")
         previous_context = self._stack_previous_context()
         stacked_inputs = torch.cat((previous_context, draft_blocks), dim=1)
-        if draft_tokens > self.plm_embed_size:
-            raise ValueError("protected MPC draft exceeds the PLM context limit")
-        stacked_inputs = stacked_inputs[:, -self.plm_embed_size:, :]
+        stacked_inputs, context_start, pre_truncation_length = (
+            self._truncate_inference_context(stacked_inputs, draft_tokens)
+        )
         stacked_inputs_ln = self.embed_ln(stacked_inputs)
         attention_mask = torch.ones(
             stacked_inputs_ln.shape[:2], dtype=torch.long, device=self.device
@@ -382,6 +441,9 @@ class OfflineRLPolicy(nn.Module):
 
         self.last_selection_trace = {
             "target_model_called": True,
+            "pre_truncation_length": pre_truncation_length,
+            "context_truncated_tokens": context_start,
+            "plm_context_length": self.plm_context_length,
             "selector_enabled": self.token_selector is not None,
             "selector_class": (
                 None if self.token_selector is None
