@@ -1,3 +1,4 @@
+import json
 import importlib.util
 from pathlib import Path
 import tempfile
@@ -12,6 +13,27 @@ spec.loader.exec_module(smoke)
 
 
 class InferenceFeatureSmokeTest(unittest.TestCase):
+    def test_discovers_base_model_recorded_by_vp_adapter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            base = root / 'vp_base'
+            checkpoint = root / 'vp_checkpoint'
+            base.mkdir()
+            checkpoint.mkdir()
+            (base / 'config.json').touch()
+            with (checkpoint / 'adapter_config.json').open('w', encoding='utf-8') as stream:
+                json.dump({'base_model_name_or_path': str(base)}, stream)
+            self.assertEqual(
+                smoke.discover_base_model(None, (checkpoint,)).resolve(),
+                base.resolve(),
+            )
+
+    def test_explicit_base_model_path_overrides_discovery(self):
+        explicit = Path('my/base/model')
+        self.assertEqual(
+            smoke.discover_base_model(explicit, ()), explicit
+        )
+
     def test_checkpoint_inspection_accepts_bin_adapter(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

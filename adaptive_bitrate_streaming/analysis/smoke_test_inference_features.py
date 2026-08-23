@@ -8,7 +8,7 @@ Examples:
   python analysis/smoke_test_inference_features.py --mode auto
   python analysis/smoke_test_inference_features.py --mode real \
       --checkpoint-dir data/ft_plms/try_llama2_7b \
-      --base-model-dir ../downloaded_plms/llama2/base --device cuda:0
+      --device cuda:0
 """
 
 import argparse
@@ -23,6 +23,62 @@ ABR_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_ROOT = ABR_ROOT / 'artifacts' / 'results'
 DEFAULT_CHECKPOINT = ABR_ROOT / 'data' / 'ft_plms' / 'try_llama2_7b'
 DEFAULT_BASE_MODEL = ABR_ROOT.parent / 'downloaded_plms' / 'llama2' / 'base'
+VP_CHECKPOINT_CANDIDATES = (
+    ABR_ROOT.parents[1] / 'data' / 'ft_plms' / 'try_llama2_7b',
+    ABR_ROOT.parent / 'data' / 'ft_plms' / 'try_llama2_7b',
+    ABR_ROOT.parent / 'viewport_prediction' / 'data' / 'ft_plms' / 'try_llama2_7b',
+)
+
+
+def _valid_base_model(path):
+    return path.is_dir() and (path / 'config.json').is_file()
+
+
+def base_model_candidates(vp_checkpoint_candidates=VP_CHECKPOINT_CANDIDATES):
+    """Return likely locations, including the base recorded by the VP adapter."""
+    candidates = []
+    for checkpoint_dir in vp_checkpoint_candidates:
+        adapter_config = checkpoint_dir / 'adapter_config.json'
+        if not adapter_config.is_file():
+            continue
+        try:
+            with adapter_config.open(encoding='utf-8') as stream:
+                recorded_path = json.load(stream).get('base_model_name_or_path')
+        except (OSError, ValueError):
+            continue
+        if recorded_path:
+            recorded_path = Path(recorded_path).expanduser()
+            if recorded_path.is_absolute():
+                candidates.append(recorded_path)
+
+    workspace_root = ABR_ROOT.parents[1]
+    project_root = ABR_ROOT.parent
+    for root in (project_root, workspace_root):
+        candidates.extend((
+            root / 'downloaded_plms' / 'llama' / 'base',
+            root / 'downloaded_plms' / 'llama2' / 'base',
+        ))
+
+    hf_cache = Path.home() / '.cache' / 'huggingface' / 'hub'
+    candidates.extend(sorted(
+        hf_cache.glob('models--meta-llama--Llama-2-7b-hf/snapshots/*')
+    ))
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate.resolve(strict=False))
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def discover_base_model(explicit_path=None, vp_checkpoint_candidates=VP_CHECKPOINT_CANDIDATES):
+    if explicit_path is not None:
+        return Path(explicit_path).expanduser()
+    candidates = base_model_candidates(vp_checkpoint_candidates)
+    return next((path for path in candidates if _valid_base_model(path)), DEFAULT_BASE_MODEL)
 
 
 def checkpoint_problems(checkpoint_dir, base_model_dir):
@@ -148,7 +204,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', choices=('auto', 'check', 'mock', 'real'), default='auto')
     parser.add_argument('--checkpoint-dir', type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument('--base-model-dir', type=Path, default=DEFAULT_BASE_MODEL)
+    parser.add_argument(
+        '--base-model-dir', type=Path,
+        help='base Llama directory; omitted means auto-detect the model used by VP',
+    )
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--selector-history-steps', type=int, default=5)
     parser.add_argument('--speculative-draft-steps', type=int, default=2)
@@ -162,6 +221,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    args.base_model_dir = discover_base_model(args.base_model_dir)
+    if _valid_base_model(args.base_model_dir):
+        print(f'Base model selected: {args.base_model_dir}')
     problems = checkpoint_problems(args.checkpoint_dir, args.base_model_dir)
     if problems:
         print('Real-model prerequisites: NOT READY')
