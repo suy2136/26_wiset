@@ -121,13 +121,16 @@ short robust-MPC draft in one target-model call:
 python run_plm.py --test --model-dir YOUR_MODEL --device cuda:0 \
   --token-selector recent-timestep --selector-history-steps 10 \
   --speculative-draft-steps 3 --speculative-verification-mode sample \
-  --speculative-buffer-tolerance 1.0
+  --speculative-buffer-tolerance 1.0 \
+  --speculative-state-tolerance 0.25 \
+  --speculative-return-tolerance 0.01
 ```
 
 The speculative path accepts the matching MPC/NetLLM prefix, uses the NetLLM
 action at the first mismatch, and falls back to ordinary one-step inference
-when observed buffer error exceeds the configured tolerance. Only observed
-states and executed actions are committed to policy history. To compare
+when observed buffer, state features, or target return diverge beyond their
+configured tolerances. Only observed states and executed actions are committed
+to policy history. To compare
 `K=0,1,2,3,4` and write a CSV summary, run:
 
 ```sh

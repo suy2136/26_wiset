@@ -12,6 +12,7 @@ if ABR_ROOT not in sys.path:
 from plm_special.speculative.acceptance import (
     buffer_deviation_seconds,
     build_acceptance_plan,
+    validate_speculative_observation,
 )
 
 
@@ -41,6 +42,26 @@ class AcceptancePlanTest(unittest.TestCase):
         self.assertAlmostEqual(
             buffer_deviation_seconds(observed, predicted), 2.0, places=5
         )
+
+    def test_rejects_throughput_difference_even_when_buffer_matches(self):
+        observed = np.zeros((6, 6), dtype=np.float32)
+        predicted = np.zeros((6, 6), dtype=np.float32)
+        observed[1, -1] = predicted[1, -1] = 1.0
+        observed[2, -1] = 5.0
+        predicted[2, -1] = 10.0
+        validation = validate_speculative_observation(
+            observed, predicted, 1.0, 1.0, 1.0, 0.25, 0.01
+        )
+        self.assertFalse(validation.valid)
+        self.assertEqual(validation.reason, 'state')
+
+    def test_rejects_target_return_difference(self):
+        state = np.ones((6, 6), dtype=np.float32)
+        validation = validate_speculative_observation(
+            state, state, 1.1, 1.0, 1.0, 0.25, 0.01
+        )
+        self.assertFalse(validation.valid)
+        self.assertEqual(validation.reason, 'return')
 
 
 if __name__ == '__main__':

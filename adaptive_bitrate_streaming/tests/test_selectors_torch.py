@@ -125,11 +125,12 @@ class MPCVerificationContractTest(unittest.TestCase):
         self.assertEqual(len(policy._speculative_queue), 2)
 
         predicted = policy._speculative_queue[0]['predicted_state']
+        predicted_return = policy._speculative_queue[0]['predicted_return']
         observed = torch.as_tensor(predicted).reshape(1, 1, 6, 6)
         with torch.no_grad():
             second = policy.sample_speculative(
                 state=observed,
-                target_return=4.0,
+                target_return=predicted_return,
                 timestep=1,
                 last_bitrate=1,
                 buffer_size=float(predicted[1, -1] * 10),
@@ -138,6 +139,9 @@ class MPCVerificationContractTest(unittest.TestCase):
         self.assertEqual(second, 2)
         self.assertEqual(plm.calls, 1)
         self.assertEqual(len(policy.states_dq), 3)
+        self.assertEqual(
+            policy.get_speculative_metrics()['throughput_predictor_updates'], 2
+        )
 
         bad_observation = torch.as_tensor(
             policy._speculative_queue[0]['predicted_state']
@@ -146,7 +150,7 @@ class MPCVerificationContractTest(unittest.TestCase):
         with torch.no_grad():
             policy.sample_speculative(
                 state=bad_observation,
-                target_return=3.0,
+                target_return=policy._speculative_queue[0]['predicted_return'],
                 timestep=2,
                 last_bitrate=2,
                 buffer_size=float(bad_observation[..., 1, -1] * 10),

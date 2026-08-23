@@ -9,8 +9,8 @@ from collections import deque
 from plm_special.models.selectors import BaseSelector
 from plm_special.models.selection_layout import aligned_context_window
 from plm_special.speculative.acceptance import (
-    buffer_deviation_seconds,
     build_acceptance_plan,
+    validate_speculative_observation,
 )
 
 
@@ -41,6 +41,8 @@ class OfflineRLPolicy(nn.Module):
             speculative_draft_steps=0,
             speculative_verification_mode='sample',
             speculative_buffer_tolerance=1.0,
+            speculative_state_tolerance=0.25,
+            speculative_return_tolerance=0.01,
             **kwargs
     ):
         super().__init__()
@@ -96,8 +98,14 @@ class OfflineRLPolicy(nn.Module):
             raise ValueError("speculative_verification_mode must be greedy or sample")
         if speculative_buffer_tolerance < 0:
             raise ValueError("speculative_buffer_tolerance must be non-negative")
+        if speculative_state_tolerance < 0:
+            raise ValueError("speculative_state_tolerance must be non-negative")
+        if speculative_return_tolerance < 0:
+            raise ValueError("speculative_return_tolerance must be non-negative")
         self.speculative_verification_mode = speculative_verification_mode
         self.speculative_buffer_tolerance = speculative_buffer_tolerance
+        self.speculative_state_tolerance = speculative_state_tolerance
+        self.speculative_return_tolerance = speculative_return_tolerance
         self._speculative_queue = deque()
         self.speculative_stats = {
             "target_plm_calls": 0,
@@ -109,7 +117,11 @@ class OfflineRLPolicy(nn.Module):
             "queued_actions_served": 0,
             "fallback_calls": 0,
             "state_mismatch_fallbacks": 0,
+            "buffer_mismatch_fallbacks": 0,
+            "feature_mismatch_fallbacks": 0,
+            "return_mismatch_fallbacks": 0,
             "draft_generation_failures": 0,
+            "throughput_predictor_updates": 0,
         }
         self.last_selection_output = None
         self.last_selection_trace = {}
@@ -505,6 +517,7 @@ class OfflineRLPolicy(nn.Module):
         timestep,
         reward_transform=None,
         horizon=None,
+        predicted_bandwidth=None,
     ):
         """Generate an MPC rollout and verify it in one target-model call."""
         if self.draft_generator is None:
@@ -522,6 +535,7 @@ class OfflineRLPolicy(nn.Module):
             timestep=timestep,
             horizon=horizon,
             reward_transform=reward_transform,
+            predicted_bandwidth=predicted_bandwidth,
         )
         return self.verify_mpc_draft(rollout)
 
@@ -569,10 +583,26 @@ class OfflineRLPolicy(nn.Module):
         if self.draft_generator is None or self.speculative_draft_steps <= 0:
             return self.sample(state, target_return, timestep)
 
+        try:
+            predicted_bandwidth = self.draft_generator.observe(state)
+            self.speculative_stats["throughput_predictor_updates"] += 1
+        except (ValueError, FloatingPointError, ZeroDivisionError):
+            self._speculative_queue.clear()
+            self.speculative_stats["draft_generation_failures"] += 1
+            return self._fallback_sample(state, target_return, timestep)
+
         if self._speculative_queue:
             queued = self._speculative_queue[0]
-            deviation = buffer_deviation_seconds(state, queued["predicted_state"])
-            if deviation <= self.speculative_buffer_tolerance:
+            validation = validate_speculative_observation(
+                observed_state=state,
+                predicted_state=queued["predicted_state"],
+                observed_return=target_return,
+                predicted_return=queued["predicted_return"],
+                buffer_tolerance_seconds=self.speculative_buffer_tolerance,
+                state_tolerance=self.speculative_state_tolerance,
+                return_tolerance=self.speculative_return_tolerance,
+            )
+            if validation.valid:
                 self._speculative_queue.popleft()
                 bitrate = queued["action"]
                 self._append_observed_action(state, target_return, timestep, bitrate)
@@ -587,6 +617,12 @@ class OfflineRLPolicy(nn.Module):
                 return bitrate
             self._speculative_queue.clear()
             self.speculative_stats["state_mismatch_fallbacks"] += 1
+            mismatch_counter = {
+                "buffer": "buffer_mismatch_fallbacks",
+                "state": "feature_mismatch_fallbacks",
+                "return": "return_mismatch_fallbacks",
+            }[validation.reason]
+            self.speculative_stats[mismatch_counter] += 1
             return self._fallback_sample(state, target_return, timestep)
 
         self.speculative_stats["draft_attempts"] += 1
@@ -599,6 +635,7 @@ class OfflineRLPolicy(nn.Module):
                 target_return=target_return,
                 timestep=timestep,
                 reward_transform=reward_transform,
+                predicted_bandwidth=predicted_bandwidth,
             )
         except (ValueError, FloatingPointError, ZeroDivisionError):
             self.speculative_stats["draft_generation_failures"] += 1
@@ -618,6 +655,7 @@ class OfflineRLPolicy(nn.Module):
             self._speculative_queue.append({
                 "action": int(action),
                 "predicted_state": rollout.states[index].copy(),
+                "predicted_return": float(rollout.returns[index]),
                 "source": (
                     "accepted" if index < plan.accepted_count else "correction"
                 ),

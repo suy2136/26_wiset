@@ -92,8 +92,8 @@ class RobustMPCDraftGenerator:
             raise ValueError(f'state must resolve to shape [6,6], got {state.shape}')
         return state
 
-    def predict_bandwidth(self, state):
-        """Use the baseline's harmonic mean and robust recent-error correction."""
+    def observe(self, state):
+        """Record one real throughput observation and return its robust forecast."""
         state = self._state_array(state)
         measured = float(state[2, -1])
         if self.past_bandwidth_estimates and measured > 0:
@@ -110,6 +110,10 @@ class RobustMPCDraftGenerator:
         max_error = max(self.past_errors[-5:])
         self.past_bandwidth_estimates.append(harmonic)
         return harmonic / (1.0 + max_error)
+
+    def predict_bandwidth(self, state):
+        """Backward-compatible alias for observing one real decision state."""
+        return self.observe(state)
 
     @staticmethod
     def _valid_sequences(last_bitrate, horizon):
@@ -178,6 +182,7 @@ class RobustMPCDraftGenerator:
         timestep,
         horizon=None,
         reward_transform=None,
+        predicted_bandwidth=None,
     ):
         """Return decision states and MPC actions for up to ``horizon`` chunks."""
         state = self._state_array(state)
@@ -195,7 +200,13 @@ class RobustMPCDraftGenerator:
         if rollout_length <= 0:
             raise ValueError('no video chunks remain for MPC drafting')
 
-        bandwidth = self.predict_bandwidth(state)
+        bandwidth = (
+            self.observe(state)
+            if predicted_bandwidth is None
+            else float(predicted_bandwidth)
+        )
+        if not np.isfinite(bandwidth) or bandwidth <= 0:
+            raise ValueError('predicted_bandwidth must be finite and positive')
         # Preserve the baseline's ``reward >= max_reward`` tie behavior.
         best_sequence = None
         best_score = -float('inf')

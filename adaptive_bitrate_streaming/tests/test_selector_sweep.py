@@ -49,12 +49,14 @@ class SpeculativeSweepTest(unittest.TestCase):
 
     def test_speculative_flags_are_added(self):
         command = speculative_sweep.command_for(
-            3, 'sample', 1.0, ['--device', 'cuda:0']
+            3, 'sample', 1.0, 0.25, 0.01, ['--device', 'cuda:0']
         )
         self.assertEqual(command[1:3], ['run_plm.py', '--test'])
         self.assertIn('--speculative-draft-steps', command)
         self.assertIn('--speculative-buffer-tolerance', command)
-        self.assertEqual(command[-1], '1.0')
+        self.assertIn('--speculative-state-tolerance', command)
+        self.assertIn('--speculative-return-tolerance', command)
+        self.assertEqual(command[-1], '0.01')
 
 
 if __name__ == '__main__':

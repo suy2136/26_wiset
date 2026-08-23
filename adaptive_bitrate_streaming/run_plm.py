@@ -141,6 +141,10 @@ def run(args):
         raise ValueError('--speculative-draft-steps must be between 0 and 5')
     if args.speculative_buffer_tolerance < 0:
         raise ValueError('--speculative-buffer-tolerance must be non-negative')
+    if args.speculative_state_tolerance < 0:
+        raise ValueError('--speculative-state-tolerance must be non-negative')
+    if args.speculative_return_tolerance < 0:
+        raise ValueError('--speculative-return-tolerance must be non-negative')
 
     # 1. set seed
     set_random_seed(args.seed)
@@ -210,7 +214,9 @@ def run(args):
                                            token_selector=token_selector, draft_generator=draft_generator,
                                            speculative_draft_steps=args.speculative_draft_steps,
                                            speculative_verification_mode=args.speculative_verification_mode,
-                                           speculative_buffer_tolerance=args.speculative_buffer_tolerance)
+                                           speculative_buffer_tolerance=args.speculative_buffer_tolerance,
+                                           speculative_state_tolerance=args.speculative_state_tolerance,
+                                           speculative_return_tolerance=args.speculative_return_tolerance)
 
     # 5. handling directory and path
 
@@ -225,7 +231,7 @@ def run(args):
     )
     speculative_tag = (
         'speculative_none' if args.speculative_draft_steps == 0
-        else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}'
+        else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
     )
     results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
                                f'early_stop_{args.which_layer}_rank_{args.rank}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag, speculative_tag)
@@ -296,6 +302,10 @@ if __name__ == '__main__':
                         help='how target logits choose actions during draft verification')
     parser.add_argument('--speculative-buffer-tolerance', type=float, default=1.0,
                         help='maximum predicted/observed buffer error in seconds before fallback')
+    parser.add_argument('--speculative-state-tolerance', type=float, default=0.25,
+                        help='maximum normalized state-feature error before fallback')
+    parser.add_argument('--speculative-return-tolerance', type=float, default=0.01,
+                        help='maximum target-return error before fallback')
     # other settings
     parser.add_argument('--adapt', action="store_true", help='adapt model')
     parser.add_argument('--test', action="store_true", help='test model')

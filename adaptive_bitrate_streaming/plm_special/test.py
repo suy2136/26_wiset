@@ -78,6 +78,24 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
                 episodes_return += reward
                 episodes_len += 1
 
+            # There is no next bitrate decision after the final video chunk.
+            # Skipping inference here avoids one unused PLM call per episode.
+            if end_of_video:
+                last_bit_rate = DEFAULT_QUALITY
+                bit_rate = DEFAULT_QUALITY
+                torch.zero_(state)
+                timestep = 0
+                target_return = copy.deepcopy(target_return_clone)
+                model.clear_dq()
+
+                ep_count += 1
+                if ep_count >= max_ep_num:
+                    break
+
+                trace_idx = env.trace_idx
+                results_log[trace_idx] = []
+                continue
+
             if str(args.device).startswith('cuda') and torch.cuda.is_available():
                 torch.cuda.synchronize(args.device)
             inference_start = time.perf_counter()
@@ -104,21 +122,7 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
                 selected_token_counts.append(selection_trace['selected_length'])
             timestep += 1
 
-            if end_of_video:
-                last_bit_rate = DEFAULT_QUALITY
-                bit_rate = DEFAULT_QUALITY
-                torch.zero_(state)
-                timestep = 0
-                target_return = copy.deepcopy(target_return_clone)
-                model.clear_dq()
 
-                ep_count += 1
-                if ep_count >= max_ep_num:
-                    break
-
-                trace_idx = env.trace_idx
-                results_log[trace_idx] = []
-    
     test_log.update({'time': time.time() - test_start})
 
     # write results to disk
@@ -164,6 +168,12 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         ),
         'speculative_buffer_tolerance': getattr(
             args, 'speculative_buffer_tolerance', None
+        ),
+        'speculative_state_tolerance': getattr(
+            args, 'speculative_state_tolerance', None
+        ),
+        'speculative_return_tolerance': getattr(
+            args, 'speculative_return_tolerance', None
         ),
         'target_plm_calls': target_plm_calls,
         'llm_call_reduction_ratio': (

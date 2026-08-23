@@ -89,6 +89,21 @@ class RobustMPCDraftGeneratorTest(unittest.TestCase):
         self.assertEqual(self.generator.past_bandwidth_estimates, [])
         self.assertEqual(self.generator.past_errors, [])
 
+    def test_preobserved_bandwidth_does_not_double_update_history(self):
+        state = sample_state()
+        forecast = self.generator.observe(state)
+        self.generator.generate(
+            state=state,
+            last_bitrate=0,
+            buffer_size=10.0,
+            video_chunk_remain=10,
+            target_return=5.0,
+            timestep=0,
+            horizon=2,
+            predicted_bandwidth=forecast,
+        )
+        self.assertEqual(len(self.generator.past_bandwidth_estimates), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
