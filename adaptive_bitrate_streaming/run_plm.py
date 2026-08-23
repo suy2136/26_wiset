@@ -184,7 +184,8 @@ def run(args):
     # For data/modules near the output side, we use args.device_out.
     # For data/modules lying in the middle, we use args.device_mid (it can be None). 
     # If args.device == args.device_out == args.device_mid (if not None), everything will be the same as using only one device.
-    plm, *_ = load_plm(args.plm_type, os.path.join(cfg.plm_dir, args.plm_type, args.plm_size), 
+    plm_path = args.plm_dir or os.path.join(cfg.plm_dir, args.plm_type, args.plm_size)
+    plm, *_ = load_plm(args.plm_type, plm_path,
                        device_input_side=args.device, device_output_side=args.device_out, device_middle_side=args.device_mid)
 
     if args.plm_type != 'llama':
@@ -278,6 +279,8 @@ if __name__ == '__main__':
     # plm settings
     parser.add_argument('--plm-type', type=str, default='gpt2')
     parser.add_argument('--plm-size', type=str, default='base')
+    parser.add_argument('--plm-dir', type=str,
+                        help='optional direct path to the base PLM directory')
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
     # state encoder settings
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)
