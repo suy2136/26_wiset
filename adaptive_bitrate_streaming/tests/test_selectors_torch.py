@@ -66,9 +66,15 @@ class MPCVerificationContractTest(unittest.TestCase):
             def __init__(self):
                 super().__init__()
                 self.calls = 0
+                self.input_dtypes = []
+                self.embed_tokens = nn.Embedding(2, 32).to(torch.float16)
+
+            def get_input_embeddings(self):
+                return self.embed_tokens
 
             def forward(self, inputs_embeds, **kwargs):
                 self.calls += 1
+                self.input_dtypes.append(inputs_embeds.dtype)
                 return {'last_hidden_state': inputs_embeds}
 
         plm = DummyPLM()
@@ -102,6 +108,8 @@ class MPCVerificationContractTest(unittest.TestCase):
         )
         self.assertEqual(plm.calls, 1)
         self.assertEqual(tuple(result['action_logits'].shape), (1, 3, 6))
+        self.assertEqual(result['action_logits'].dtype, torch.float32)
+        self.assertEqual(plm.input_dtypes, [torch.float16])
         self.assertEqual(tuple(result['draft_blocks'].shape), (1, 24, 32))
         self.assertEqual(result['selection_trace']['protected_suffix_tokens'], 24)
 
@@ -158,6 +166,8 @@ class MPCVerificationContractTest(unittest.TestCase):
             )
         self.assertEqual(plm.calls, 2)
         self.assertEqual(policy.get_speculative_metrics()['state_mismatch_fallbacks'], 1)
+        self.assertTrue(plm.input_dtypes)
+        self.assertEqual(set(plm.input_dtypes), {torch.float16})
 
 
 if __name__ == '__main__':

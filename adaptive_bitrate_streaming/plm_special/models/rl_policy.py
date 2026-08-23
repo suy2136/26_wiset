@@ -171,6 +171,32 @@ class OfflineRLPolicy(nn.Module):
         )
         return embeddings[:, start:, :], start, original_length
 
+    def _plm_compute_dtype(self):
+        """Return the dtype consumed by the frozen PLM input projection."""
+        embedding = self.plm.get_input_embeddings()
+        weight = getattr(embedding, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.is_floating_point():
+            return weight.dtype
+        raise RuntimeError("could not determine PLM input dtype")
+
+    def _run_plm(self, inputs_embeds, attention_mask):
+        """Bridge FP32 ABR embeddings to the PLM dtype for every call path."""
+        plm_inputs = inputs_embeds.to(self._plm_compute_dtype())
+        outputs = self.plm(
+            inputs_embeds=plm_inputs,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            stop_layer_idx=self.which_layer,
+        )
+        hidden = outputs['last_hidden_state']
+        if self.residual:
+            hidden = hidden + plm_inputs
+        return hidden
+
+    def _run_action_head(self, hidden):
+        """Bridge PLM outputs back to the FP32 ABR task head."""
+        return self.action_head(hidden.to(self.action_head.weight.dtype))
+
     def forward(self, states, actions, returns, timesteps, attention_mask=None):
         """
         Forward function, used for training.
@@ -230,21 +256,13 @@ class OfflineRLPolicy(nn.Module):
             attention_mask = torch.ones((stacked_inputs_ln.shape[0], stacked_inputs_ln.shape[1]), dtype=torch.long, device=self.device)
 
         # we feed in the input embeddings (not word indices as in NLP) to the model
-        transformer_outputs = self.plm(
-            inputs_embeds=stacked_inputs_ln,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            stop_layer_idx=self.which_layer,
-        )
-        logits = transformer_outputs['last_hidden_state']
-        if self.residual:
-            logits = logits + stacked_inputs_ln  # residual add
+        logits = self._run_plm(stacked_inputs_ln, attention_mask)
 
         # Step 5: predict actions
         # we need to locate the logits corresponding to the state embeddings
         # simply using `action_embed_positions[i] - 2` will do.
         logits_used = logits[:, action_embed_positions - 2]
-        action_pred = self.action_head(logits_used)
+        action_pred = self._run_action_head(logits_used)
 
         return action_pred
 
@@ -478,16 +496,8 @@ class OfflineRLPolicy(nn.Module):
         stacked_inputs_ln, attention_mask = (
             self._build_selected_mpc_verification_context(draft_blocks)
         )
-        transformer_outputs = self.plm(
-            inputs_embeds=stacked_inputs_ln,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            stop_layer_idx=self.which_layer,
-        )
+        hidden = self._run_plm(stacked_inputs_ln, attention_mask)
         self.speculative_stats["target_plm_calls"] += 1
-        hidden = transformer_outputs['last_hidden_state']
-        if self.residual:
-            hidden = hidden + stacked_inputs_ln
 
         selected_history_tokens = hidden.shape[1] - draft_blocks.shape[1]
         state_positions = (
@@ -496,7 +506,7 @@ class OfflineRLPolicy(nn.Module):
             * ABR_HISTORY_BLOCK_TOKENS
             + ABR_STATE_TOKEN_COUNT
         )
-        action_logits = self.action_head(hidden[:, state_positions, :])
+        action_logits = self._run_action_head(hidden[:, state_positions, :])
         return {
             "draft_actions": torch.as_tensor(
                 rollout.actions, dtype=torch.long, device=action_logits.device
@@ -685,20 +695,12 @@ class OfflineRLPolicy(nn.Module):
             current_block
         )
 
-        transformer_outputs = self.plm(
-            inputs_embeds=stacked_inputs_ln,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            stop_layer_idx=self.which_layer,
-        )
+        logits = self._run_plm(stacked_inputs_ln, attention_mask)
         self.speculative_stats["target_plm_calls"] += 1
-        logits = transformer_outputs['last_hidden_state']
-        if self.residual:
-            logits = logits + stacked_inputs_ln  # residual add
 
         # Step 6: predict the bitrate for next chunk
         logits_used = logits[:, -1:]
-        action_pred = self.action_head(logits_used)
+        action_pred = self._run_action_head(logits_used)
         action_pred = action_pred.reshape(-1)
         bitrate, _ = self._sample(action_pred)
 
