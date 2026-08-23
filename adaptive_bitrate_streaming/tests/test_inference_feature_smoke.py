@@ -60,6 +60,8 @@ class InferenceFeatureSmokeTest(unittest.TestCase):
         self.assertEqual(speculative[speculative.index('--token-selector') + 1], 'none')
         self.assertEqual(selector[selector.index('--trace-num') + 1], '1')
         self.assertEqual(speculative[speculative.index('--trace-num') + 1], '1')
+        self.assertIn('--fp16', selector)
+        self.assertIn('--fp16', speculative)
 
     def test_metrics_validation_requires_draft_activity(self):
         with self.assertRaisesRegex(RuntimeError, 'MPC draft path'):

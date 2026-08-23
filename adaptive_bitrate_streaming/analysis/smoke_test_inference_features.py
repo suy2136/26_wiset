@@ -112,6 +112,7 @@ def common_command(args):
     return [
         sys.executable, 'run_plm.py', '--test',
         '--plm-type', 'llama', '--plm-size', 'base', '--rank', '128',
+        '--fp16',
         '--plm-dir', str(Path(args.base_model_dir).resolve()),
         '--model-dir', str(Path(args.checkpoint_dir).resolve()),
         '--device', args.device, '--device-out', args.device,

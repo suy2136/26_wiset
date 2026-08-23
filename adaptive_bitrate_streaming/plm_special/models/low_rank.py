@@ -29,8 +29,9 @@ def print_trainable_parameters(model):
 def peft_model(plm, plm_type, rank, print_trainable=False, task_type=TaskType.FEATURE_EXTRACTION):
     for param in plm.parameters():
         param.requires_grad = False
-        if param.ndim == 1:
-            param.data = param.data.to(torch.float32)
+        # Keep frozen normalization weights in the dtype selected by
+        # from_pretrained(). Upcasting 1-D LlamaRMSNorm weights would promote
+        # FP16 hidden states to FP32 and break the next FP16 projection.
 
     plm.gradient_checkpointing_enable()
     plm.enable_input_require_grads()
