@@ -534,8 +534,18 @@ else
   EXTRA_ARGS=()
 fi
 
-TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
-TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_seed_${SEED}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+LORA_SEED="${LORA_SEED:-$SEED}"
+DATA_SEED="${DATA_SEED:-$SEED}"
+if ! [[ "$LORA_SEED" =~ ^[0-9]+$ && "$DATA_SEED" =~ ^[0-9]+$ ]]; then
+  echo "LORA_SEED and DATA_SEED must be non-negative integers."
+  exit 2
+fi
+SEED_PATH="seed_${SEED}"
+if [[ "$LORA_SEED" != "$SEED" || "$DATA_SEED" != "$SEED" ]]; then
+  SEED_PATH="${SEED_PATH}_lora_seed_${LORA_SEED}_data_seed_${DATA_SEED}"
+fi
+TRAIN_PREFIX="his_10_fut_20_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_${SEED_PATH}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
+TEST_PREFIX="his_10_fut_20_axes_ss_15_epochs_${EPOCHS}_bs_${GRAD_ACCUM_STEPS}_lr_${LEARNING_RATE}_${SEED_PATH}_rank_${RANK}_scheduled_sampling_${SCHEDULED_SAMPLING}"
 MODEL_ROOT="viewport_prediction/data/ft_plms/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/best_ar_model"
@@ -622,7 +632,7 @@ prepare_eva_state() {
     --similarity-threshold "${EVA_SIMILARITY_THRESHOLD:-0.99}"
     --min-batches "${EVA_MIN_BATCHES:-2}"
     --max-batches "${EVA_MAX_BATCHES:-128}"
-    --seed "$SEED"
+    --seed "$DATA_SEED"
     --output-dir "$EVA_STATE_DIR"
     "${calibration_limit_args[@]}"
     "${convergence_args[@]}"
@@ -669,8 +679,8 @@ if [[ "$VARIANT" == "eva" ]]; then
   fi
 fi
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nseed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
-  "$VARIANT" "$RUN_ID" "$SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
+printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+  "$VARIANT" "$RUN_ID" "$SEED" "$LORA_SEED" "$DATA_SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
   "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_SHADOW_UPDATE_POLICY" \
   "$ADALORA_BUDGET_MODE" "$ADALORA_RELATIVE_LAMBDA" \
@@ -707,6 +717,8 @@ TRAIN_CMD=(
   --steps-per-valid "$VALIDATION_INTERVAL"
   --lr "$LEARNING_RATE"
   --seed "$SEED"
+  --lora-seed "$LORA_SEED"
+  --data-seed "$DATA_SEED"
   "${TRAIN_LIMIT_ARGS[@]}"
   "${MODE_ARGS[@]}"
   "${EXTRA_ARGS[@]}"
@@ -857,6 +869,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       --latency-warmup-steps "$LATENCY_WARMUP_STEPS"
       --latency-output-path "$LATENCY_FILE"
       --seed "$SEED"
+      --lora-seed "$LORA_SEED"
+      --data-seed "$DATA_SEED"
       "${TEST_LIMIT_ARGS[@]}"
       "${MODE_ARGS[@]}"
       "${INFERENCE_ARGS[@]}"

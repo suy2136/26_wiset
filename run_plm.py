@@ -37,6 +37,12 @@ from models.nbs_compaction import (
     write_nbs_compaction_validation,
 )
 from utils.latency_utils import write_latency_artifacts
+from utils.seed_utils import (
+    isolated_seed,
+    make_data_generator,
+    resolve_experiment_seeds,
+    seed_data_worker,
+)
 
 
 NASH_DIAGNOSTIC_FIELDS = [
@@ -143,6 +149,42 @@ def _write_json_atomic(path, payload):
     finally:
         if os.path.exists(temporary_path):
             os.remove(temporary_path)
+
+
+def _seed_metadata(args):
+    return {
+        'seed': int(args.seed),
+        'lora_seed': int(args.lora_seed),
+        'data_seed': int(args.data_seed),
+    }
+
+
+def _seed_path_fragment(args):
+    """Keep historical paths unless component seeds are explicitly different."""
+    fragment = f'seed_{args.seed}'
+    if args.lora_seed != args.seed or args.data_seed != args.seed:
+        fragment += f'_lora_seed_{args.lora_seed}_data_seed_{args.data_seed}'
+    return fragment
+
+
+def _warn_checkpoint_seed_mismatch(args, model_dir):
+    """Warn about reproducibility metadata without rejecting legacy checkpoints."""
+    metadata_path = os.path.join(model_dir, 'checkpoint_metadata.json')
+    if not os.path.isfile(metadata_path):
+        return
+    with open(metadata_path, 'r', encoding='utf-8') as handle:
+        metadata = json.load(handle)
+    expected = _seed_metadata(args)
+    mismatches = []
+    for key, current in expected.items():
+        saved = metadata.get(key)
+        if saved is not None and int(saved) != current:
+            mismatches.append(f'{key}: checkpoint={saved}, current={current}')
+    if mismatches:
+        print(
+            '\033[33mWarning:\033[0m checkpoint seed metadata differs from the '
+            'current invocation (' + '; '.join(mismatches) + '). Loading continues.'
+        )
 
 
 def _write_inference_trace_artifacts(path, records, inference_tag):
@@ -275,10 +317,12 @@ def save_model(args, model, save_dir, metadata=None):
     else:
         # low rank matrices are disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
+    checkpoint_metadata = _seed_metadata(args)
     if metadata is not None:
-        _write_json_atomic(
-            os.path.join(save_dir, 'checkpoint_metadata.json'), metadata
-        )
+        checkpoint_metadata.update(metadata)
+    _write_json_atomic(
+        os.path.join(save_dir, 'checkpoint_metadata.json'), checkpoint_metadata
+    )
 
 
 def _resize_adalora_to_ckpt(plm, adapter_bin, adapter_name='default'):
@@ -314,6 +358,7 @@ def load_model(args, model, model_dir):
     :return: the pretrained model corresponding to using model_dir
     """
     model_dir = _resolve_checkpoint_alias(model_dir)
+    _warn_checkpoint_seed_mismatch(args, model_dir)
     if args.rank != -1:
         if args.use_adalora:
             _resize_adalora_to_ckpt(model.plm, os.path.join(model_dir, 'adapter_model.bin'))
@@ -358,8 +403,9 @@ def load_compact_nbs_model(model, model_dir):
 
 
 def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_accum_steps):
+    seed_path_fragment = _seed_path_fragment(args)
     file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
-                  f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
+                  f'lr_{args.lr}_{seed_path_fragment}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     checkpoint_path = os.path.join(models_dir, file_prefix, 'checkpoint')
     if ((args.save_checkpoint_per_step is not None or
          args.save_checkpoint_per_epoch is not None) and
@@ -407,6 +453,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     allocator,
                     diagnostics=[],
                     metadata={
+                        **_seed_metadata(args),
                         'snapshot_kind': 'pre_mask_initialization',
                         'optimizer_step': 0,
                         'validation_event': 0,
@@ -573,6 +620,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             else:
                 best_post_nbs_epoch = position
             post_metadata = {
+                **_seed_metadata(args),
                 'checkpoint_role': 'best_post_nbs',
                 'optimizer_step': int(opt_step),
                 'validation_event': int(validation_event_count),
@@ -668,7 +716,10 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 )
         return should_stop
         
-    print(f'Training on {args.train_dataset} - bs: {args.bs} - lr: {args.lr} - seed: {args.seed}')
+    print(
+        f'Training on {args.train_dataset} - bs: {args.bs} - lr: {args.lr} '
+        f'- seed: {args.seed} (LoRA={args.lora_seed}, data={args.data_seed})'
+    )
     for epoch in range(args.epochs):
         pipeline.train()
         for step, (history, future, video_user_info) in enumerate(dataloader_train): 
@@ -854,6 +905,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             allocator,
             diagnostics=final_rows,
             metadata={
+                **_seed_metadata(args),
                 'snapshot_kind': 'post_training',
                 'optimizer_step': int(opt_step),
                 'global_step': int(global_step),
@@ -868,6 +920,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             post_training_snapshot_path,
         )
         final_metadata = {
+            **_seed_metadata(args),
             'checkpoint_role': 'final_nbs',
             'optimizer_step': int(opt_step),
             'global_step': int(global_step),
@@ -899,8 +952,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
 
 
 def test(args, pipeline, dataloader_test, models_dir, results_dir):
+    seed_path_fragment = _seed_path_fragment(args)
     file_prefix = f'his_{args.his_window}_fut_{args.fut_window}_axes_ss_{args.sample_step}_epochs_{args.epochs}_bs_{args.bs * args.grad_accum_steps}_'\
-                  f'lr_{args.lr}_seed_{args.seed}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
+                  f'lr_{args.lr}_{seed_path_fragment}_rank_{args.rank}_scheduled_sampling_{args.scheduled_sampling}'
     default_model_name = 'best_ar_model' if args.use_adalora else 'best_model'
     best_model_path = os.path.join(models_dir, file_prefix, default_model_name)
     evaluation_suffix = (
@@ -985,7 +1039,10 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
         if compact_output_dir is None and not compact_loaded_directly:
             compact_output_dir = _resolve_checkpoint_alias(model_path) + '_compact'
 
-    print(f'Testing on {args.test_dataset} - seed: {args.seed}')
+    print(
+        f'Testing on {args.test_dataset} - seed: {args.seed} '
+        f'(LoRA={args.lora_seed}, data={args.data_seed})'
+    )
     # Real accuracy bug, found 2026-08-14: this was missing entirely, so a `--adapt --test`
     # invocation in one command evaluated with the pipeline still in train() mode from the
     # end of adapt() (dropout active everywhere -- patch_selection_module's 0.1, LoRA's
@@ -1228,18 +1285,29 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
 
 
 def run(args):
-    assert args.train_dataset in cfg.dataset_list 
+    args.seed, args.lora_seed, args.data_seed = resolve_experiment_seeds(
+        args.seed,
+        getattr(args, 'lora_seed', None),
+        getattr(args, 'data_seed', None),
+    )
+    assert args.train_dataset in cfg.dataset_list
     assert args.test_dataset in cfg.dataset_list
     assert args.plm_type in cfg.plm_types
     assert args.plm_size in cfg.plm_sizes
     assert args.trim_head >= args.his_window and args.trim_tail >= args.fut_window
 
-    # seed
+    # The master seed controls the rest of the model/training stochasticity.
+    # Dataset ordering and LoRA initialization use isolated component seeds below.
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
     random.seed(args.seed)
+    print(
+        f'Experiment seeds: master={args.seed}, LoRA={args.lora_seed}, '
+        f'data={args.data_seed}'
+    )
     # multimodal_mode is part of the checkpoint/result path so that baseline/all-patch/
     # patch-selection runs (otherwise identical hyperparameters) never collide on the same
     # directory -- without this, two modes trained with the same his/fut window, epochs,
@@ -1305,9 +1373,17 @@ def run(args):
     dataloader_train = dataloader_valid = None
     total_step = 1  # placeholder; only used by AdaLoRA, and only meaningful when args.adapt
     if args.adapt:
-        raw_dataset_train, raw_dataset_valid = create_dataset(args.train_dataset, his_window=args.his_window,
-                                                              fut_window=args.fut_window, trim_head=args.trim_head, trim_tail=args.trim_tail,
-                                                              include=['train', 'valid'], frequency=args.dataset_frequency, step=args.sample_step)
+        with isolated_seed(args.data_seed, include_cuda=False):
+            raw_dataset_train, raw_dataset_valid = create_dataset(
+                args.train_dataset,
+                his_window=args.his_window,
+                fut_window=args.fut_window,
+                trim_head=args.trim_head,
+                trim_tail=args.trim_tail,
+                include=['train', 'valid'],
+                frequency=args.dataset_frequency,
+                step=args.sample_step,
+            )
 
         if args.limit_train_samples is not None:
             n = min(args.limit_train_samples, len(raw_dataset_train))
@@ -1318,8 +1394,22 @@ def run(args):
             raw_dataset_valid = torch.utils.data.Subset(raw_dataset_valid, range(n))
             print(f'\033[33mDebug:\033[0m truncated validation set to {n} samples (--limit-valid-samples).')
 
-        dataloader_train = DataLoader(raw_dataset_train, batch_size=args.bs, shuffle=True, pin_memory=True)
-        dataloader_valid = DataLoader(raw_dataset_valid, batch_size=args.bs, shuffle=False, pin_memory=True)
+        dataloader_train = DataLoader(
+            raw_dataset_train,
+            batch_size=args.bs,
+            shuffle=True,
+            pin_memory=True,
+            generator=make_data_generator(args.data_seed, offset=0),
+            worker_init_fn=seed_data_worker,
+        )
+        dataloader_valid = DataLoader(
+            raw_dataset_valid,
+            batch_size=args.bs,
+            shuffle=False,
+            pin_memory=True,
+            generator=make_data_generator(args.data_seed, offset=1),
+            worker_init_fn=seed_data_worker,
+        )
         steps_per_epoch = math.ceil(len(dataloader_train) / args.grad_accum_steps)
         total_step = steps_per_epoch * args.epochs
         if args.use_adalora:
@@ -1378,26 +1468,27 @@ def run(args):
         )
 
     if args.rank != -1:
-        plm = peft_model(
-            plm, args.plm_type, args.rank,
-            use_adalora=args.use_adalora,
-            total_step=total_step,
-            adalora_min_rank=args.adalora_min_rank,
-            adalora_ema_beta=args.adalora_ema_beta,
-            adalora_eps=args.adalora_eps,
-            adalora_allocation_interval=args.adalora_allocation_interval,
-            adalora_rank_budget=args.adalora_rank_budget,
-            adalora_rank_config=adalora_rank_config,
-            adalora_missing_grad_policy=args.adalora_missing_grad_policy,
-            lora_rank_pattern=lora_rank_pattern,
-            adalora_allocator=args.adalora_allocator,
-            adalora_shadow_update_policy=args.adalora_shadow_update_policy,
-            adalora_budget_mode=args.adalora_budget_mode,
-            adalora_relative_lambda=args.adalora_relative_lambda,
-            adalora_adaptive_min_budget=args.adalora_adaptive_min_budget,
-            adalora_adaptive_max_budget=args.adalora_adaptive_max_budget,
-            eva_state=eva_state,
-        )
+        with isolated_seed(args.lora_seed, include_cuda=True):
+            plm = peft_model(
+                plm, args.plm_type, args.rank,
+                use_adalora=args.use_adalora,
+                total_step=total_step,
+                adalora_min_rank=args.adalora_min_rank,
+                adalora_ema_beta=args.adalora_ema_beta,
+                adalora_eps=args.adalora_eps,
+                adalora_allocation_interval=args.adalora_allocation_interval,
+                adalora_rank_budget=args.adalora_rank_budget,
+                adalora_rank_config=adalora_rank_config,
+                adalora_missing_grad_policy=args.adalora_missing_grad_policy,
+                lora_rank_pattern=lora_rank_pattern,
+                adalora_allocator=args.adalora_allocator,
+                adalora_shadow_update_policy=args.adalora_shadow_update_policy,
+                adalora_budget_mode=args.adalora_budget_mode,
+                adalora_relative_lambda=args.adalora_relative_lambda,
+                adalora_adaptive_min_budget=args.adalora_adaptive_min_budget,
+                adalora_adaptive_max_budget=args.adalora_adaptive_max_budget,
+                eva_state=eva_state,
+            )
 
     # set up networking head
     input_dim = plm.hidden_size
@@ -1469,9 +1560,18 @@ def run(args):
                       f'their tail frames are clamp-repeated (see utils/frame_utils.py), which may distort MAE. '
                       f'Pass --exclude-short-videos-test to drop them from the test split instead.')
 
-        raw_dataset_test = create_dataset(args.test_dataset, dataset_video_split=test_video_split,
-                                          his_window=args.his_window, fut_window=args.fut_window,
-                                          trim_head=args.trim_head, trim_tail=args.trim_tail, include=['test'], frequency=args.dataset_frequency, step=args.sample_step)[0]
+        with isolated_seed(args.data_seed, include_cuda=False):
+            raw_dataset_test = create_dataset(
+                args.test_dataset,
+                dataset_video_split=test_video_split,
+                his_window=args.his_window,
+                fut_window=args.fut_window,
+                trim_head=args.trim_head,
+                trim_tail=args.trim_tail,
+                include=['test'],
+                frequency=args.dataset_frequency,
+                step=args.sample_step,
+            )[0]
 
         if args.limit_test_samples is not None:
             if args.limit_test_samples <= 0:
@@ -1480,7 +1580,14 @@ def run(args):
             raw_dataset_test = torch.utils.data.Subset(raw_dataset_test, range(n))
             print(f'\033[33mDebug:\033[0m truncated test set to {n} samples (--limit-test-samples).')
 
-        dataloader_test = DataLoader(raw_dataset_test, batch_size=args.bs, shuffle=True, pin_memory=True)
+        dataloader_test = DataLoader(
+            raw_dataset_test,
+            batch_size=args.bs,
+            shuffle=True,
+            pin_memory=True,
+            generator=make_data_generator(args.data_seed, offset=2),
+            worker_init_fn=seed_data_worker,
+        )
         test(args, pipeline, dataloader_test, models_dir, results_dir)
 
 
@@ -1562,6 +1669,14 @@ if __name__ == '__main__':
     parser.add_argument('--bs', action="store", dest='bs', help='(Optional) Neural network batch size.', type=int)
     parser.add_argument('--grad-accum-steps', action="store", dest='grad_accum_steps', type=int, default=16)
     parser.add_argument('--seed', action="store", dest='seed', type=int, default=1, help='(Optional) Random seed (default to 1).')
+    parser.add_argument(
+        '--lora-seed', type=int, default=None,
+        help='LoRA/AdaLoRA initialization seed. Defaults to --seed for compatibility.',
+    )
+    parser.add_argument(
+        '--data-seed', type=int, default=None,
+        help='Dataset/DataLoader ordering seed. Defaults to --seed for compatibility.',
+    )
     parser.add_argument('--multimodal', action="store_true", dest='using_multimodal', help='(deprecated) using multimodal image features; equivalent to --multimodal-mode baseline.')
     parser.add_argument('--multimodal-mode', action='store', dest='multimodal_mode', choices=['baseline', 'all-patch', 'patch-selection'],
                         help="(Optional) Multimodal mode: 'baseline' (single cached ViT CLS-token feature per frame), "
@@ -1735,6 +1850,12 @@ if __name__ == '__main__':
     parser.add_argument('--limit-test-samples', action='store', dest='limit_test_samples', type=int,
                         help='(Optional, smoke test) Truncate the test set to the first N samples.')
     args = parser.parse_args()
+    try:
+        args.seed, args.lora_seed, args.data_seed = resolve_experiment_seeds(
+            args.seed, args.lora_seed, args.data_seed
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.adalora_budget_mode == 'adaptive':
         if not args.use_adalora or args.adalora_allocator != 'nbs':
             parser.error(
