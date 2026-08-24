@@ -61,6 +61,36 @@ class NBSV19WiringTest(unittest.TestCase):
         ):
             self.assertIn(argument, source)
 
+    def test_numeric_guards_cover_forward_gradient_and_allocator(self):
+        trainer_source = (
+            ABR_ROOT / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+        low_rank_source = (
+            ABR_ROOT / 'plm_special' / 'models' / 'low_rank.py'
+        ).read_text(encoding='utf-8')
+        for guard in (
+            '_adalora_delta_issues', '_gradient_issues',
+            '_parameter_issues', '_allocator_numeric_issues',
+            'error_if_nonfinite=True',
+            'nbs_numeric_events.jsonl',
+        ):
+            source = trainer_source if guard != 'nbs_numeric_events.jsonl' else (
+                ABR_ROOT / 'run_plm.py'
+            ).read_text(encoding='utf-8')
+            self.assertIn(guard, source)
+        self.assertIn('result_fp32 = base_result.float()', low_rank_source)
+        self.assertIn('_nbs_last_precast_absmax', low_rank_source)
+
+    def test_rank_reallocation_resets_adam_moments(self):
+        source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(
+            encoding='utf-8'
+        )
+        self.assertIn('_reset_reallocated_optimizer_moments', source)
+        self.assertIn("('exp_avg', 'exp_avg_sq', 'max_exp_avg_sq')", source)
+        allocate = source.index('self.nbs_allocator.allocate')
+        reset = source.index('_reset_reallocated_optimizer_moments', allocate)
+        self.assertLess(allocate, reset)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -134,6 +134,10 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             os.path.join(checkpoint_dir, 'nbs_rank_diagnostics.csv')
             if args.nbs_v19 else None
         ),
+        nbs_numeric_log_path=(
+            os.path.join(checkpoint_dir, 'nbs_numeric_events.jsonl')
+            if args.nbs_v19 else None
+        ),
     )
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
@@ -209,6 +213,8 @@ def run(args):
             raise ValueError('NBS v19 uses the fixed rank budget 512')
         if args.nbs_allocation_interval <= 0:
             raise ValueError('--nbs-allocation-interval must be positive')
+        if args.nbs_max_consecutive_nonfinite <= 0:
+            raise ValueError('--nbs-max-consecutive-nonfinite must be positive')
         if args.adapt and (
             args.token_selector != 'none' or args.speculative_draft_steps != 0
         ):
@@ -398,6 +404,10 @@ if __name__ == '__main__':
         '--nbs-rank-config',
         default='configs/nbs_v19_rank_config.json',
         help='JSON file containing NBS per-layer min/max ranks',
+    )
+    parser.add_argument(
+        '--nbs-max-consecutive-nonfinite', type=int, default=3,
+        help='abort after this many consecutive skipped non-finite batches',
     )
     # state encoder settings
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)

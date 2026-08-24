@@ -37,7 +37,11 @@ def print_trainable_parameters(model):
 
 
 def _mixed_precision_adalora_forward(self, x):
-    """Run the frozen base branch in FP16 and AdaLoRA math in its own dtype."""
+    """Accumulate the AdaLoRA residual in FP32 before the base-dtype cast.
+
+    Detached health tensors are retained for one batched check in Trainer;
+    this avoids synchronizing every adapter layer during a normal forward.
+    """
     base_input = x.to(self.weight.dtype)
     if self.disable_adapters:
         if self.merged:
@@ -46,7 +50,10 @@ def _mixed_precision_adalora_forward(self, x):
     if self.merged:
         return self._linear(base_input)
 
-    result = self._linear(base_input)
+    base_result = self._linear(base_input)
+    result_fp32 = base_result.float()
+    delta_absmax = result_fp32.new_zeros(())
+    delta_finite = torch.ones((), dtype=torch.bool, device=result_fp32.device)
     for active_adapter in self.active_adapters:
         if active_adapter not in self.lora_A:
             continue
@@ -58,13 +65,25 @@ def _mixed_precision_adalora_forward(self, x):
         delta = (
             adapter_input @ (lora_a * lora_e).T @ lora_b.T
         ) * self.scaling[active_adapter] / ranknum
-        result = result + delta.to(result.dtype)
-    return result
+        detached_delta = delta.detach()
+        delta_absmax = torch.maximum(
+            delta_absmax, detached_delta.float().abs().amax()
+        )
+        delta_finite = delta_finite & torch.isfinite(detached_delta).all()
+        result_fp32 = result_fp32 + delta.float()
+
+    detached_result = result_fp32.detach()
+    self._nbs_last_delta_absmax = delta_absmax.detach()
+    self._nbs_last_delta_finite = delta_finite.detach()
+    self._nbs_last_precast_absmax = detached_result.abs().amax().detach()
+    self._nbs_last_precast_finite = torch.isfinite(detached_result).all().detach()
+    self._nbs_output_dtype = base_result.dtype
+    return result_fp32.to(base_result.dtype)
 
 
 def _patch_adalora_mixed_precision(model):
     patched = 0
-    for module in model.modules():
+    for module_name, module in model.named_modules():
         if module.__class__.__name__ != 'SVDLinear':
             continue
         if not all(hasattr(module, name) for name in (
@@ -72,6 +91,7 @@ def _patch_adalora_mixed_precision(model):
         )):
             continue
         module.forward = MethodType(_mixed_precision_adalora_forward, module)
+        module._nbs_module_name = module_name
         patched += 1
     return patched
 

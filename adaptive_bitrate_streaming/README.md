@@ -186,6 +186,16 @@ python analysis/run_nbs_v19_full_experiment.py \
   --resume-inference
 ```
 
+NBS mixed-precision training accumulates each AdaLoRA residual in FP32 and
+checks its range before the FP16 cast. Non-finite gradients skip the complete
+optimizer update, including scheduler and rank-allocation steps. Rank changes
+also clear Adam moments for changed A/B/E slots. Allocation events, skipped
+updates, GradScaler changes, and the offending layers/parameters are appended
+to `early_stop_-1_checkpoint/nbs_numeric_events.jsonl`. Three non-finite
+events before the next successful update abort training instead of producing
+a corrupted checkpoint; the threshold can be changed with
+`--nbs-max-consecutive-nonfinite`.
+
 ## Run baselines
 
 To run baselines, please run:
