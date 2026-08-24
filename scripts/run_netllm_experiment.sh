@@ -16,7 +16,8 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v20" && \
       "$VARIANT" != "nbs_v21" && "$VARIANT" != "nbs_v22" && \
       "$VARIANT" != "nbs_v23" && "$VARIANT" != "nbs_v24" && \
-      "$VARIANT" != "nbs_v25" && \
+      "$VARIANT" != "nbs_v25" && "$VARIANT" != "nbs_v27" && \
+      "$VARIANT" != "nbs_v28" && "$VARIANT" != "nbs_v29" && \
       "$VARIANT" != "nbs_v19_data2" && \
       "$VARIANT" != "nbs_budget256_seed1" && \
       "$VARIANT" != "nbs_adaptive_tau015" && \
@@ -24,7 +25,7 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "adalora_peft_r12" && \
       "$VARIANT" != "eva" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|nbs_v21|nbs_v22|nbs_v23|nbs_v24|nbs_v25|nbs_v19_data2|nbs_budget256_seed1|nbs_adaptive_tau015|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|nbs_v21|nbs_v22|nbs_v23|nbs_v24|nbs_v25|nbs_v27|nbs_v28|nbs_v29|nbs_v19_data2|nbs_budget256_seed1|nbs_adaptive_tau015|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
   exit 2
 fi
 
@@ -75,6 +76,20 @@ if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1"
   exit 2
 fi
 
+use_v19_schedule() {
+  EPOCHS=4
+  CHECKPOINT_INTERVAL=8820
+  VALIDATION_INTERVAL=4410
+  EVAL_PROGRESS_INTERVAL=500
+  SAVE_PERIODIC_CHECKPOINTS=0
+  GRAD_ACCUM_STEPS=32
+  LEARNING_RATE=0.0002
+  ADALORA_EMA_BETA=0.9
+  ADALORA_ALLOCATION_INTERVAL=10
+  ADALORA_BUDGET_MODE="fixed"
+  ADALORA_SHADOW_UPDATE_POLICY="legacy"
+}
+
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 ARTIFACT_ROOT="viewport_prediction/data/experiment_runs/netllm_vs_nbs"
 RUN_DIR="$ARTIFACT_ROOT/$VARIANT/$RUN_ID"
@@ -113,6 +128,8 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v20" || "$VARIANT" == "nbs_v21" || \
       "$VARIANT" == "nbs_v22" || "$VARIANT" == "nbs_v23" || \
       "$VARIANT" == "nbs_v24" || "$VARIANT" == "nbs_v25" || \
+      "$VARIANT" == "nbs_v27" || "$VARIANT" == "nbs_v28" || \
+      "$VARIANT" == "nbs_v29" || \
       "$VARIANT" == "nbs_v19_data2" || \
       "$VARIANT" == "nbs_budget256_seed1" || \
       "$VARIANT" == "nbs_adaptive_tau015" ]]; then
@@ -339,6 +356,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   elif [[ "$VARIANT" == "nbs_v19" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v19"
     DISPLAY_NAME="NBS-NetLLM v19 (min2-max32-budget512, mean-rank8, seed1)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
@@ -404,6 +422,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   elif [[ "$VARIANT" == "nbs_v24" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v24"
     DISPLAY_NAME="NBS-NetLLM v24 (v19 conditions: min2-max32-budget512, seed2)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
@@ -417,6 +436,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   elif [[ "$VARIANT" == "nbs_v25" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v25"
     DISPLAY_NAME="NBS-NetLLM v25 (v19 conditions: min2-max32-budget512, seed3)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
@@ -429,7 +449,65 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
+  elif [[ "$VARIANT" == "nbs_v27" ]]; then
+    use_v19_schedule
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v27"
+    DISPLAY_NAME="NBS-NetLLM v27 adaptive (min2-max32, floor128-cap512, tau0.05, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=512
+    SEED=1
+    LORA_SEED=1
+    DATA_SEED=1
+    ADALORA_BUDGET_MODE="adaptive"
+    ADALORA_RELATIVE_LAMBDA=0.05
+    ADALORA_ADAPTIVE_MIN_BUDGET=128
+    ADALORA_ADAPTIVE_MAX_BUDGET=512
+    ADALORA_SHADOW_UPDATE_POLICY="active-only"
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v27
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v28" ]]; then
+    use_v19_schedule
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v28"
+    DISPLAY_NAME="NBS-NetLLM v28 fixed-shadow ablation (min2-max32-budget512, active-only, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=512
+    SEED=1
+    LORA_SEED=1
+    DATA_SEED=1
+    ADALORA_BUDGET_MODE="fixed"
+    ADALORA_SHADOW_UPDATE_POLICY="active-only"
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v28
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v29" ]]; then
+    use_v19_schedule
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v29"
+    DISPLAY_NAME="NBS-NetLLM v29 ultra-low-budget (min2-max32-budget192, mean-rank3, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=192
+    SEED=1
+    LORA_SEED=1
+    DATA_SEED=1
+    ADALORA_BUDGET_MODE="fixed"
+    ADALORA_SHADOW_UPDATE_POLICY="legacy"
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v29
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
   elif [[ "$VARIANT" == "nbs_v19_data2" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_v19_data2"
     DISPLAY_NAME="NBS-NetLLM v19 data-seed ablation (min2-max32-budget512, LoRA seed1, data seed2)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
@@ -445,6 +523,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   elif [[ "$VARIANT" == "nbs_budget256_seed1" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_budget256_seed1"
     DISPLAY_NAME="NBS-NetLLM low-budget ablation (min2-max32-budget256, mean-rank4, seed1)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
@@ -460,6 +539,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
   elif [[ "$VARIANT" == "nbs_adaptive_tau015" ]]; then
+    use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_nbs_adaptive_tau015"
     DISPLAY_NAME="Adaptive NBS-NetLLM (min2-max32, cap512, tau0.15, seed1)"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
