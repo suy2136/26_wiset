@@ -36,6 +36,8 @@ def parse_args() -> argparse.Namespace:
                  "nbs_v14", "nbs_v15", "nbs_v16", "nbs_v17",
                  "nbs_v18", "nbs_v19", "nbs_v20", "nbs_v21", "nbs_v22",
                  "nbs_v23", "nbs_v24", "nbs_v25",
+                 "nbs_v19_data2", "nbs_budget256_seed1",
+                 "nbs_adaptive_tau015",
                  "uniform_r12", "uniform_b736", "adalora_peft_r12", "eva", "plain"),
         required=True,
     )
@@ -141,6 +143,45 @@ def read_allocator_diagnostics(path: Path | None) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def allocator_from_diagnostics(rows: list[dict[str, str]]) -> dict[str, Any] | None:
+    """Reconstruct the latest rank allocation when model state was not downloaded."""
+    snapshots: dict[tuple[str, str, str], dict[str, int]] = {}
+    order: list[tuple[str, str, str]] = []
+    for row in rows:
+        layer_name = row.get("layer_name")
+        rank = row.get("rank")
+        if not layer_name or rank in (None, ""):
+            continue
+        key = (
+            row.get("optimizer_step", ""),
+            row.get("event", ""),
+            row.get("validation_event", ""),
+        )
+        if key not in snapshots:
+            snapshots[key] = {}
+            order.append(key)
+        snapshots[key][layer_name] = int(float(rank))
+    if not order:
+        return None
+    ranks = snapshots[order[-1]]
+    if not ranks:
+        return None
+    values = list(ranks.values())
+    histogram: dict[str, int] = {}
+    for rank in values:
+        histogram[str(rank)] = histogram.get(str(rank), 0) + 1
+    return {
+        "path": "reconstructed from allocator diagnostics",
+        "layer_count": len(values),
+        "rank_min": min(values),
+        "rank_max": max(values),
+        "rank_mean": sum(values) / len(values),
+        "total_rank": sum(values),
+        "histogram": histogram,
+        "ranks": ranks,
+    }
+
+
 def read_latency(path: Path | None) -> dict[str, Any] | None:
     if path is None or not path.exists():
         return None
@@ -214,6 +255,8 @@ def main() -> None:
     aggregate, per_pair = read_results(args.result_csv)
     allocator = read_allocator_state(args.allocator_state or args.eva_state)
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
+    if allocator is None:
+        allocator = allocator_from_diagnostics(diagnostic_rows)
     latency = read_latency(args.latency_json)
     train_finite = finite_losses(train_curve)
     valid_finite = finite_losses(valid_curve)
@@ -245,6 +288,9 @@ def main() -> None:
         "nbs_v23": "NBS-NetLLM v23 (min2-max32-budget320, seed1)",
         "nbs_v24": "NBS-NetLLM v24 (min2-max32-budget512, seed2)",
         "nbs_v25": "NBS-NetLLM v25 (min2-max32-budget512, seed3)",
+        "nbs_v19_data2": "NBS-NetLLM v19 data-seed ablation",
+        "nbs_budget256_seed1": "NBS-NetLLM budget256 seed1",
+        "nbs_adaptive_tau015": "Adaptive NBS-NetLLM tau=0.15",
         "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
         "uniform_b736": "Fixed near-uniform NetLLM (ranks11/12, budget736, seed1)",
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
