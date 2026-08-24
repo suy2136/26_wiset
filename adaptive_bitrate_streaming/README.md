@@ -141,8 +141,9 @@ python analysis/run_speculative_sweep.py -- \
 
 **NBS allocation v19 experiment**
 
-NBS v19 uses seed 1, FP16 Llama2-7B, physical rank 32, per-layer ranks
-2--32, and a fixed total active-rank budget of 512. Train the allocator once
+The historical NBS v19 recipe uses seed 1, FP16 Llama2-7B, physical rank 32,
+per-layer ranks 2--32, and a total active-rank budget of 512. The budget is
+configurable with `--nbs-rank-budget`. Train the allocator once
 with both inference-only features disabled:
 
 ```sh
@@ -175,6 +176,22 @@ command, use the full experiment runner:
 python analysis/run_nbs_v19_full_experiment.py \
   --base-model-dir /workspace/26_wiset/downloaded_plms/llama/base
 ```
+
+For the ABR budget-1536 experiment (average active rank 24 over 64 q/v
+adapters), the following runner trains once, evaluates NBS-only and the
+official rank-128 NetLLM LoRA, then evaluates 40 speculative configurations:
+
+```sh
+python analysis/run_nbs_v19_budget1536_speculative.py \
+  --base-model-dir /workspace/26_wiset/downloaded_plms/llama/base \
+  --official-lora-dir /workspace/abr_checkpoint_download/extracted/try_llama2_7b
+```
+
+The result CSV/JSON includes QoE, bitrate, rebuffering, smoothness, latency
+percentiles, draft acceptance/fallbacks, and target-LLM-call reduction. The
+manifest records the checkpoint and the durable rank trajectory/Nash diagnostic
+CSV, whose rows include sensitivity, spectral energy, utility, marginal gain,
+and bargaining weight. Completed inference rows can be resumed with `--resume`.
 
 It selects the best seed-1 NBS v19 checkpoint created by that training run and
 then starts the inference matrix. If training has completed but inference was

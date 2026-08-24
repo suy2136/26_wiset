@@ -91,6 +91,31 @@ class NBSV19WiringTest(unittest.TestCase):
         reset = source.index('_reset_reallocated_optimizer_moments', allocate)
         self.assertLess(allocate, reset)
 
+    def test_rank_diagnostics_export_nash_analysis_fields(self):
+        allocator_source = (
+            ABR_ROOT.parent / 'models' / 'rank_allocator.py'
+        ).read_text(encoding='utf-8')
+        trainer_source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(
+            encoding='utf-8'
+        )
+        for field in (
+            '"rank"', '"utility"', '"next_marginal_gain"',
+            '"spectral_energy_total"', '"sensitivity"',
+        ):
+            self.assertIn(field, allocator_source)
+        self.assertIn("'bargaining_weight': row.get('alpha')", trainer_source)
+
+    def test_abr_metrics_export_qoe_components_and_latency_percentiles(self):
+        source = (ABR_ROOT / 'plm_special' / 'test.py').read_text(
+            encoding='utf-8'
+        )
+        for field in (
+            'qoe_raw_mean', 'mean_bitrate_mbps', 'total_rebuffer_s',
+            'mean_rebuffer_s_per_chunk', 'mean_smoothness_mbps',
+            'inference_latency_p50_ms', 'inference_latency_p95_ms',
+        ):
+            self.assertIn(field, source)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -53,6 +53,7 @@ class NBSV19FullExperimentTest(unittest.TestCase):
                 ) as stream:
                     json.dump({
                         'variant': 'nbs_v19', 'seed': 1, 'role': role,
+                        'effective_rank_budget': 512,
                     }, stream)
                 time.sleep(0.01)
             selected = full.discover_new_checkpoint(root, time.time() - 10)

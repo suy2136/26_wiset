@@ -21,7 +21,7 @@ def build_training_command(args):
         sys.executable, 'run_plm.py', '--adapt', '--nbs-v19', '--fp16',
         '--seed', '1', '--plm-type', 'llama', '--plm-size', 'base',
         '--plm-dir', str(args.base_model_dir.resolve()),
-        '--rank', '32', '--nbs-rank-budget', '512',
+        '--rank', '32', '--nbs-rank-budget', str(args.rank_budget),
         '--nbs-rank-config', 'configs/nbs_v19_rank_config.json',
         '--token-selector', 'none', '--speculative-draft-steps', '0',
         '--exp-pool-path', str(args.exp_pool_path.resolve()),
@@ -43,6 +43,7 @@ def build_inference_command(args, checkpoint_dir):
         '--exp-pool-path', str(args.exp_pool_path.resolve()),
         '--trace', args.test_trace, '--trace-num', str(args.trace_num),
         '--video', args.video, '--device', args.device,
+        '--rank-budget', str(args.rank_budget),
         '--output', str(args.output.resolve()),
     ]
     if args.resume_inference:
@@ -50,7 +51,7 @@ def build_inference_command(args, checkpoint_dir):
     return command
 
 
-def discover_new_checkpoint(model_root, started_at):
+def discover_new_checkpoint(model_root, started_at, rank_budget=512):
     candidates = []
     for metadata_path in model_root.rglob('checkpoint_metadata.json'):
         if metadata_path.stat().st_mtime < started_at:
@@ -61,6 +62,8 @@ def discover_new_checkpoint(model_root, started_at):
         except (OSError, ValueError):
             continue
         if metadata.get('variant') != 'nbs_v19' or metadata.get('seed') != 1:
+            continue
+        if metadata.get('effective_rank_budget') != rank_budget:
             continue
         if metadata.get('role') not in ('best', 'final'):
             continue
@@ -87,6 +90,7 @@ def save_pipeline_state(args, checkpoint_dir):
         'base_model_dir': str(args.base_model_dir.resolve()),
         'exp_pool_path': str(args.exp_pool_path.resolve()),
         'seed': 1,
+        'rank_budget': args.rank_budget,
         'status': 'training_complete',
     }
     with path.open('w', encoding='utf-8') as stream:
@@ -105,6 +109,8 @@ def load_pipeline_checkpoint(args):
         raise ValueError('pipeline state base model does not match this run')
     if state.get('exp_pool_path') != str(args.exp_pool_path.resolve()):
         raise ValueError('pipeline state experience pool does not match this run')
+    if state.get('rank_budget') != args.rank_budget:
+        raise ValueError('pipeline state rank budget does not match this run')
     return Path(state['checkpoint_dir'])
 
 
@@ -120,6 +126,7 @@ def parse_args(argv=None):
     parser.add_argument('--video', default='video1')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--grad-accum-steps', type=int, default=32)
+    parser.add_argument('--rank-budget', type=int, default=512)
     parser.add_argument('--lr', type=float, default=0.0001)
     parser.add_argument('--warmup-steps', type=int, default=2000)
     parser.add_argument('--num-epochs', type=int, default=80)
@@ -152,7 +159,9 @@ def main(argv=None):
         else:
             started_at = time.time() - 1.0
             subprocess.run(training_command, cwd=ABR_ROOT, check=True)
-            checkpoint_dir = discover_new_checkpoint(MODEL_ROOT, started_at)
+            checkpoint_dir = discover_new_checkpoint(
+                MODEL_ROOT, started_at, rank_budget=args.rank_budget
+            )
             save_pipeline_state(args, checkpoint_dir)
             print(f'[training] checkpoint selected: {checkpoint_dir}', flush=True)
 

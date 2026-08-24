@@ -35,7 +35,7 @@ class NBSV19InferenceMatrixTest(unittest.TestCase):
             base_model_dir=Path('base'), checkpoint_dir=Path('checkpoint'),
             exp_pool_path=Path('pool.pkl'), device='cuda:0', trace='fcc-test',
             trace_num=100, video='video1', buffer_tolerance=1.0,
-            state_tolerance=0.25, return_tolerance=0.01,
+            state_tolerance=0.25, return_tolerance=0.01, rank_budget=512,
         )
         for experiment in matrix.EXPERIMENTS:
             command = matrix.build_command(args, experiment)

@@ -245,10 +245,27 @@ class Trainer:
     def _write_nbs_diagnostics(self, rows):
         if not self.nbs_diagnostics_path or not rows:
             return
+        rows = [
+            {
+                **row,
+                # ``alpha`` is the normalized Nash bargaining weight. Keep
+                # both names so historical analyses and paper tables agree.
+                'bargaining_weight': row.get('alpha'),
+            }
+            for row in rows
+        ]
         os.makedirs(os.path.dirname(self.nbs_diagnostics_path), exist_ok=True)
         exists = os.path.isfile(self.nbs_diagnostics_path)
+        fieldnames = list(rows[0].keys())
+        if exists:
+            with open(
+                self.nbs_diagnostics_path, newline='', encoding='utf-8'
+            ) as existing_stream:
+                fieldnames = csv.DictReader(existing_stream).fieldnames or fieldnames
         with open(self.nbs_diagnostics_path, 'a', newline='', encoding='utf-8') as stream:
-            writer = csv.DictWriter(stream, fieldnames=list(rows[0].keys()))
+            writer = csv.DictWriter(
+                stream, fieldnames=fieldnames, extrasaction='ignore'
+            )
             if not exists:
                 writer.writeheader()
             writer.writerows(rows)

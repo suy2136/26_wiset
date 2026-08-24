@@ -209,8 +209,8 @@ def run(args):
             raise ValueError('NBS v19 currently supports --plm-type llama only')
         if args.rank != 32:
             raise ValueError('NBS v19 requires --rank 32')
-        if args.nbs_rank_budget != 512:
-            raise ValueError('NBS v19 uses the fixed rank budget 512')
+        if args.nbs_rank_budget <= 0:
+            raise ValueError('--nbs-rank-budget must be positive')
         if args.nbs_allocation_interval <= 0:
             raise ValueError('--nbs-allocation-interval must be positive')
         if args.nbs_max_consecutive_nonfinite <= 0:
@@ -327,7 +327,9 @@ def run(args):
     # extract training experience pool information
     train_exp_pool_info = args.exp_pool_path.split('/')[-4:-1]
     train_exp_pool_info = '_'.join(train_exp_pool_info)
-    nbs_tag = '_nbs_v19_budget512' if args.nbs_v19 else ''
+    nbs_tag = (
+        f'_nbs_v19_budget{args.nbs_rank_budget}' if args.nbs_v19 else ''
+    )
     models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
     selector_tag = (

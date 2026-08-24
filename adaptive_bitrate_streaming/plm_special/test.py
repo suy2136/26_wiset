@@ -144,6 +144,26 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
                                   str(reward) + '\n' )
             result_file.close()
     test_log['mean_reward'] = calc_mean_reward(result_files=os.listdir(results_dir), test_dir=results_dir, str='', skip_first_reward=True)
+    # NetLLM's ABR QoE excludes the first chunk of every trace.  Export the
+    # corresponding QoE components as well as the aggregate reward so model
+    # quality, rebuffering, and smoothness remain independently auditable.
+    evaluated_chunks = [
+        item for trace_values in results_log.values()
+        for item in trace_values[1:]
+    ]
+    if evaluated_chunks:
+        bitrates_mbps = [item[1] / M_IN_K for item in evaluated_chunks]
+        rebuffer_seconds = [item[3] for item in evaluated_chunks]
+        smoothness_mbps = [item[6] for item in evaluated_chunks]
+        raw_qoe = [item[7] for item in evaluated_chunks]
+        test_log.update({
+            'qoe_raw_mean': float(np.mean(raw_qoe)),
+            'mean_bitrate_mbps': float(np.mean(bitrates_mbps)),
+            'mean_rebuffer_s_per_chunk': float(np.mean(rebuffer_seconds)),
+            'total_rebuffer_s': float(np.sum(rebuffer_seconds)),
+            'mean_smoothness_mbps': float(np.mean(smoothness_mbps)),
+            'evaluated_video_chunks': len(evaluated_chunks),
+        })
     total_original_tokens = sum(original_token_counts)
     total_selected_tokens = sum(selected_token_counts)
     test_log.update({
@@ -151,6 +171,7 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         'selector_history_steps': getattr(args, 'selector_history_steps', None),
         'inference_calls': len(inference_latencies_ms),
         'inference_latency_mean_ms': float(np.mean(inference_latencies_ms)),
+        'inference_latency_p50_ms': float(np.percentile(inference_latencies_ms, 50)),
         'inference_latency_p95_ms': float(np.percentile(inference_latencies_ms, 95)),
         'original_tokens_mean': float(np.mean(original_token_counts)),
         'selected_tokens_mean': float(np.mean(selected_token_counts)),

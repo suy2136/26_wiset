@@ -33,7 +33,7 @@ EXPERIMENTS = (
 )
 
 
-def validate_checkpoint(checkpoint_dir):
+def validate_checkpoint(checkpoint_dir, rank_budget=512):
     required = (
         'adapter_config.json',
         'modules_except_plm.bin',
@@ -59,8 +59,11 @@ def validate_checkpoint(checkpoint_dir):
             raise ValueError('checkpoint metadata is not tagged nbs_v19')
         if metadata.get('seed') != 1:
             raise ValueError('the fixed experiment matrix requires a seed-1 checkpoint')
-        if metadata.get('effective_rank_budget') != 512:
-            raise ValueError('the fixed experiment matrix requires rank budget 512')
+        if metadata.get('effective_rank_budget') != rank_budget:
+            raise ValueError(
+                'checkpoint rank budget does not match --rank-budget: '
+                f'{metadata.get("effective_rank_budget")} != {rank_budget}'
+            )
     return metadata
 
 
@@ -68,7 +71,7 @@ def build_command(args, experiment):
     command = [
         sys.executable, 'run_plm.py', '--test', '--nbs-v19', '--fp16',
         '--plm-type', 'llama', '--plm-size', 'base', '--rank', '32',
-        '--nbs-rank-budget', '512', '--seed', '1',
+        '--nbs-rank-budget', str(args.rank_budget), '--seed', '1',
         '--plm-dir', str(args.base_model_dir.resolve()),
         '--model-dir', str(args.checkpoint_dir.resolve()),
         '--exp-pool-path', str(args.exp_pool_path.resolve()),
@@ -146,7 +149,7 @@ def run_signature(args):
         'base_model_dir': str(args.base_model_dir.resolve()),
         'exp_pool_path': str(args.exp_pool_path.resolve()),
         'seed': 1,
-        'rank_budget': 512,
+        'rank_budget': args.rank_budget,
         'trace': args.trace,
         'trace_num': args.trace_num,
         'video': args.video,
@@ -218,6 +221,7 @@ def main():
     parser.add_argument('--trace-num', type=int, default=100)
     parser.add_argument('--video', default='video1')
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--rank-budget', type=int, default=512)
     parser.add_argument('--buffer-tolerance', type=float, default=1.0)
     parser.add_argument('--state-tolerance', type=float, default=0.25)
     parser.add_argument('--return-tolerance', type=float, default=0.01)
@@ -240,7 +244,9 @@ def main():
     signature = run_signature(args)
     checkpoint_metadata = {}
     if not args.dry_run:
-        checkpoint_metadata = validate_checkpoint(args.checkpoint_dir)
+        checkpoint_metadata = validate_checkpoint(
+            args.checkpoint_dir, rank_budget=args.rank_budget
+        )
         if not (args.base_model_dir / 'config.json').is_file():
             raise FileNotFoundError(f'base model not found: {args.base_model_dir}')
         if not args.exp_pool_path.is_file():
@@ -271,7 +277,7 @@ def main():
             'metrics_path': str(metrics_path.resolve()),
             'nbs_checkpoint_role': checkpoint_metadata.get('role'),
             'nbs_effective_rank_budget': checkpoint_metadata.get(
-                'effective_rank_budget', 512
+                'effective_rank_budget', args.rank_budget
             ),
             **scalar_metrics(metrics),
         }
