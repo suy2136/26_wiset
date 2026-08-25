@@ -167,6 +167,7 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
     total_original_tokens = sum(original_token_counts)
     total_selected_tokens = sum(selected_token_counts)
     test_log.update({
+        'temporal_selector': getattr(args, 'temporal_selector', 'none'),
         'selector': getattr(args, 'token_selector', 'none'),
         'selector_history_steps': getattr(args, 'selector_history_steps', None),
         'event_max_events': getattr(args, 'event_max_events', None),
@@ -192,10 +193,13 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         ),
     })
     selector_metrics = model.get_selector_metrics()
-    selector_calls = selector_metrics['selector_calls']
+    event_selector_calls = (
+        selector_metrics['temporal_selector_calls']
+        or selector_metrics['selector_calls']
+    )
     selector_metrics['event_timesteps_selected_mean'] = (
-        0.0 if selector_calls == 0
-        else selector_metrics['event_timesteps_selected'] / selector_calls
+        0.0 if event_selector_calls == 0
+        else selector_metrics['event_timesteps_selected'] / event_selector_calls
     )
     test_log.update(selector_metrics)
     speculative_metrics = model.get_speculative_metrics()

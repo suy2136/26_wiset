@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from collections import deque
 
+from plm_special.models.event_selection import EventAwareDataSelector
 from plm_special.models.selectors import BaseSelector
 from plm_special.models.selection_layout import aligned_context_window
 from plm_special.speculative.acceptance import (
@@ -47,6 +48,7 @@ class OfflineRLPolicy(nn.Module):
             residual = False, 
             conv_size = 4,  
             which_layer = -1,  # for early stopping: specify which layer to stop
+            temporal_selector=None,
             token_selector=None,
             draft_generator=None,
             speculative_draft_steps=0,
@@ -103,6 +105,14 @@ class OfflineRLPolicy(nn.Module):
         self.which_layer = which_layer
         if token_selector is not None and not isinstance(token_selector, BaseSelector):
             raise TypeError("token_selector must be a BaseSelector instance or None")
+        if (
+            temporal_selector is not None
+            and not isinstance(temporal_selector, EventAwareDataSelector)
+        ):
+            raise TypeError(
+                "temporal_selector must be an EventAwareDataSelector or None"
+            )
+        self.temporal_selector = temporal_selector
         self.token_selector = token_selector
         if speculative_draft_steps < 0:
             raise ValueError("speculative_draft_steps must be non-negative")
@@ -148,6 +158,12 @@ class OfflineRLPolicy(nn.Module):
             "low_buffer_events_selected": 0,
             "bitrate_switch_events_selected": 0,
             "selected_timestep_counts": {},
+            "temporal_selector_calls": 0,
+            "temporal_history_steps_available": 0,
+            "temporal_history_steps_selected": 0,
+            "token_selector_calls": 0,
+            "token_selector_input_tokens": 0,
+            "token_selector_output_tokens": 0,
         }
         self.modules_except_plm = nn.ModuleList([  # used to save and load modules except plm
             self.state_encoder, self.embed_timestep, self.embed_return, self.embed_action, self.embed_ln, 
@@ -392,17 +408,15 @@ class OfflineRLPolicy(nn.Module):
         })
         return context
 
-    def _record_selection(self, selection):
-        self.selector_stats["selector_calls"] += 1
-        metadata = selection.metadata
-        if metadata.get("preserves_latest_history_step"):
-            self.selector_stats["latest_history_steps_preserved"] += 1
+    def _record_event_metadata(self, metadata):
         event_scores = metadata.get("event_scores", [])
         self.selector_stats["event_timesteps_selected"] += len(event_scores)
         timestep_counts = self.selector_stats["selected_timestep_counts"]
-        for timestep in metadata.get("selected_history_steps", []):
-            key = str(timestep)
-            timestep_counts[key] = timestep_counts.get(key, 0) + 1
+        selected_steps = metadata.get("selected_history_steps", [])
+        if isinstance(selected_steps, (list, tuple)):
+            for timestep in selected_steps:
+                key = str(timestep)
+                timestep_counts[key] = timestep_counts.get(key, 0) + 1
         reason_fields = {
             "rebuffer": "rebuffer_events_selected",
             "throughput_change": "throughput_change_events_selected",
@@ -414,6 +428,70 @@ class OfflineRLPolicy(nn.Module):
                 field = reason_fields.get(reason)
                 if field is not None:
                     self.selector_stats[field] += 1
+
+    def _record_temporal_selection(self, selection, available_steps):
+        self.selector_stats["temporal_selector_calls"] += 1
+        self.selector_stats["temporal_history_steps_available"] += available_steps
+        self.selector_stats["temporal_history_steps_selected"] += len(
+            selection["selected_steps"]
+        )
+        if selection.get("latest_step") is not None:
+            self.selector_stats["latest_history_steps_preserved"] += 1
+        metadata = {
+            "selected_history_steps": selection["selected_steps"],
+            "event_scores": selection["event_scores"],
+        }
+        self._record_event_metadata(metadata)
+
+    def _record_selection(self, selection):
+        self.selector_stats["selector_calls"] += 1
+        self.selector_stats["token_selector_calls"] += 1
+        metadata = selection.metadata
+        self.selector_stats["token_selector_input_tokens"] += (
+            metadata.get("history_original_tokens", selection.original_length)
+        )
+        self.selector_stats["token_selector_output_tokens"] += (
+            metadata.get("history_selected_tokens", selection.selected_length)
+        )
+        if (
+            metadata.get("preserves_latest_history_step")
+            or metadata.get("preserves_latest_history_block")
+        ) and self.temporal_selector is None:
+            self.selector_stats["latest_history_steps_preserved"] += 1
+        if metadata.get("event_scores"):
+            self._record_event_metadata(metadata)
+
+    def _apply_temporal_selection(
+        self, stacked_inputs, context_start, protected_suffix_tokens
+    ):
+        """Select raw history timesteps before context normalization."""
+        if self.temporal_selector is None:
+            return stacked_inputs, None
+        if context_start % ABR_HISTORY_BLOCK_TOKENS != 0:
+            raise ValueError("context truncation split an ABR history block")
+        history_tokens = int(stacked_inputs.shape[1]) - protected_suffix_tokens
+        if history_tokens < 0 or history_tokens % ABR_HISTORY_BLOCK_TOKENS:
+            raise ValueError("temporal input is not aligned to ABR blocks")
+        available_steps = history_tokens // ABR_HISTORY_BLOCK_TOKENS
+        dropped_steps = context_start // ABR_HISTORY_BLOCK_TOKENS
+        history_states = list(self.raw_states_dq)[dropped_steps:]
+        history_actions = list(self.raw_actions_dq)[dropped_steps:]
+        if len(history_states) != available_steps:
+            raise ValueError(
+                "raw and embedded histories are misaligned before temporal "
+                f"selection: raw={len(history_states)}, blocks={available_steps}"
+            )
+        temporal = self.temporal_selector(history_states, history_actions)
+        indices = []
+        for step in temporal["selected_steps"]:
+            start = step * ABR_HISTORY_BLOCK_TOKENS
+            indices.extend(range(start, start + ABR_HISTORY_BLOCK_TOKENS))
+        indices.extend(range(history_tokens, int(stacked_inputs.shape[1])))
+        index_tensor = torch.as_tensor(
+            indices, dtype=torch.long, device=stacked_inputs.device
+        )
+        self._record_temporal_selection(temporal, available_steps)
+        return stacked_inputs.index_select(1, index_tensor), temporal
 
     def _build_current_step_embeddings(self, state, target_return, timestep):
         """Build the protected ``[return, six states]`` current ABR block."""
@@ -480,26 +558,58 @@ class OfflineRLPolicy(nn.Module):
                 stacked_inputs, int(protected_suffix.shape[1])
             )
         )
+        original_length = int(stacked_inputs.shape[1])
+        stacked_inputs, temporal = self._apply_temporal_selection(
+            stacked_inputs,
+            context_start,
+            int(protected_suffix.shape[1]),
+        )
+        temporal_selected_length = int(stacked_inputs.shape[1])
         stacked_inputs_ln = self.embed_ln(stacked_inputs)
         attention_mask = torch.ones(
             stacked_inputs_ln.shape[:2], dtype=torch.long, device=self.device
         )
 
-        original_length = int(stacked_inputs_ln.shape[1])
         self.last_selection_output = None
         if self.token_selector is not None:
+            selector_context = self._selector_context(
+                context_start,
+                task="adaptive_bitrate_streaming",
+                stage="online_action_selection",
+                tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
+                current_step_tokens=ABR_CURRENT_BLOCK_TOKENS,
+                draft_tokens=int(draft_blocks.shape[1]),
+                protected_suffix_tokens=int(protected_suffix.shape[1]),
+            )
+            if temporal is not None:
+                if getattr(self.token_selector, "requires_raw_history", False):
+                    raise ValueError(
+                        "a raw-history token selector cannot follow temporal "
+                        "selection"
+                    )
+                selector_context.update({
+                    "selected_history_steps": temporal["selected_steps"],
+                    "latest_history_step": temporal["latest_step"],
+                    "event_scores": temporal["event_scores"],
+                })
+            elif getattr(
+                self.token_selector, "requires_temporal_metadata", False
+            ):
+                history_tokens = temporal_selected_length - int(
+                    protected_suffix.shape[1]
+                )
+                history_steps = history_tokens // ABR_HISTORY_BLOCK_TOKENS
+                selector_context.update({
+                    "selected_history_steps": list(range(history_steps)),
+                    "latest_history_step": (
+                        None if history_steps == 0 else history_steps - 1
+                    ),
+                    "event_scores": [],
+                })
             selection = self.token_selector(
                 stacked_inputs_ln,
                 attention_mask,
-                context=self._selector_context(
-                    context_start,
-                    task="adaptive_bitrate_streaming",
-                    stage="online_action_selection",
-                    tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
-                    current_step_tokens=ABR_CURRENT_BLOCK_TOKENS,
-                    draft_tokens=int(draft_blocks.shape[1]),
-                    protected_suffix_tokens=int(protected_suffix.shape[1]),
-                ),
+                context=selector_context,
             )
             stacked_inputs_ln = selection.embeddings
             attention_mask = selection.attention_mask
@@ -517,12 +627,18 @@ class OfflineRLPolicy(nn.Module):
             "pre_truncation_length": pre_truncation_length,
             "context_truncated_tokens": context_start,
             "plm_context_length": self.plm_context_length,
+            "temporal_selector_enabled": self.temporal_selector is not None,
+            "temporal_selector_class": (
+                None if self.temporal_selector is None
+                else type(self.temporal_selector).__name__
+            ),
             "selector_enabled": self.token_selector is not None,
             "selector_class": (
                 None if self.token_selector is None
                 else type(self.token_selector).__name__
             ),
             "original_length": original_length,
+            "temporal_selected_length": temporal_selected_length,
             "selected_length": int(stacked_inputs_ln.shape[1]),
             "history_block_tokens": ABR_HISTORY_BLOCK_TOKENS,
             "current_block_tokens": ABR_CURRENT_BLOCK_TOKENS,
@@ -580,25 +696,53 @@ class OfflineRLPolicy(nn.Module):
         stacked_inputs, context_start, pre_truncation_length = (
             self._truncate_inference_context(stacked_inputs, draft_tokens)
         )
+        original_length = int(stacked_inputs.shape[1])
+        stacked_inputs, temporal = self._apply_temporal_selection(
+            stacked_inputs, context_start, draft_tokens
+        )
+        temporal_selected_length = int(stacked_inputs.shape[1])
         stacked_inputs_ln = self.embed_ln(stacked_inputs)
         attention_mask = torch.ones(
             stacked_inputs_ln.shape[:2], dtype=torch.long, device=self.device
         )
 
-        original_length = int(stacked_inputs_ln.shape[1])
         self.last_selection_output = None
         if self.token_selector is not None:
+            selector_context = self._selector_context(
+                context_start,
+                task="adaptive_bitrate_streaming",
+                stage="mpc_speculative_verification",
+                tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
+                protected_suffix_tokens=draft_tokens,
+                draft_tokens=draft_tokens,
+            )
+            if temporal is not None:
+                if getattr(self.token_selector, "requires_raw_history", False):
+                    raise ValueError(
+                        "a raw-history token selector cannot follow temporal "
+                        "selection"
+                    )
+                selector_context.update({
+                    "selected_history_steps": temporal["selected_steps"],
+                    "latest_history_step": temporal["latest_step"],
+                    "event_scores": temporal["event_scores"],
+                })
+            elif getattr(
+                self.token_selector, "requires_temporal_metadata", False
+            ):
+                history_tokens = temporal_selected_length - draft_tokens
+                history_steps = history_tokens // ABR_HISTORY_BLOCK_TOKENS
+                selector_context.update({
+                    "selected_history_steps": list(range(history_steps)),
+                    "latest_history_step": (
+                        None if history_steps == 0 else history_steps - 1
+                    ),
+                    "event_scores": [],
+                })
             selection = self.token_selector(
                 stacked_inputs_ln,
                 attention_mask,
-                context=self._selector_context(
-                    context_start,
-                    task="adaptive_bitrate_streaming",
-                    stage="mpc_speculative_verification",
-                    tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
-                    protected_suffix_tokens=draft_tokens,
-                    draft_tokens=draft_tokens,
-                ),
+                context=selector_context,
             )
             stacked_inputs_ln = selection.embeddings
             attention_mask = selection.attention_mask
@@ -610,6 +754,11 @@ class OfflineRLPolicy(nn.Module):
             "pre_truncation_length": pre_truncation_length,
             "context_truncated_tokens": context_start,
             "plm_context_length": self.plm_context_length,
+            "temporal_selector_enabled": self.temporal_selector is not None,
+            "temporal_selector_class": (
+                None if self.temporal_selector is None
+                else type(self.temporal_selector).__name__
+            ),
             "selector_enabled": self.token_selector is not None,
             "selector_class": (
                 None if self.token_selector is None
@@ -617,6 +766,7 @@ class OfflineRLPolicy(nn.Module):
             ),
             "stage": "mpc_speculative_verification",
             "original_length": original_length,
+            "temporal_selected_length": temporal_selected_length,
             "selected_length": int(stacked_inputs_ln.shape[1]),
             "history_block_tokens": ABR_HISTORY_BLOCK_TOKENS,
             "draft_tokens": draft_tokens,
@@ -836,6 +986,16 @@ class OfflineRLPolicy(nn.Module):
         metrics = dict(self.selector_stats)
         metrics["selected_timestep_counts"] = dict(
             self.selector_stats["selected_timestep_counts"]
+        )
+        available = metrics["temporal_history_steps_available"]
+        metrics["temporal_history_reduction_ratio"] = (
+            0.0 if available == 0
+            else 1.0 - metrics["temporal_history_steps_selected"] / available
+        )
+        token_input = metrics["token_selector_input_tokens"]
+        metrics["intra_token_reduction_ratio"] = (
+            0.0 if token_input == 0
+            else 1.0 - metrics["token_selector_output_tokens"] / token_input
         )
         return metrics
 

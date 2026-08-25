@@ -21,8 +21,10 @@ from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
 from plm_special.data.dataset import ExperienceDataset
 from plm_special.models.rl_policy import OfflineRLPolicy
+from plm_special.models.event_selection import EventAwareDataSelector
 from plm_special.models.selectors import (
     EventAwareTemporalSelector,
+    IntraTimestepTokenSelector,
     RecentTimestepSelector,
 )
 from plm_special.models.state_encoder import EncoderNetwork
@@ -284,6 +286,14 @@ def run(args):
         raise ValueError('--event-buffer-threshold must be positive')
     if args.event_bitrate_jump_threshold <= 0:
         raise ValueError('--event-bitrate-jump-threshold must be positive')
+    if (
+        args.temporal_selector == 'event-aware'
+        and args.token_selector not in ('none', 'intra-timestep')
+    ):
+        raise ValueError(
+            'event-aware temporal selection supports token selector none or '
+            'intra-timestep only'
+        )
     if not 0 <= args.speculative_draft_steps <= 5:
         raise ValueError('--speculative-draft-steps must be between 0 and 5')
     if args.speculative_buffer_tolerance < 0:
@@ -308,7 +318,9 @@ def run(args):
         if args.nbs_max_consecutive_nonfinite <= 0:
             raise ValueError('--nbs-max-consecutive-nonfinite must be positive')
         if args.adapt and (
-            args.token_selector != 'none' or args.speculative_draft_steps != 0
+            args.temporal_selector != 'none'
+            or args.token_selector != 'none'
+            or args.speculative_draft_steps != 0
         ):
             raise ValueError(
                 'Train NBS v19 once with selector/speculative disabled; '
@@ -397,6 +409,15 @@ def run(args):
     # 4.3 create rl policy
     plm_embed_size = cfg.plm_embed_sizes[args.plm_type][args.plm_size]
     max_ep_len = exp_dataset_info.max_timestep + 1
+    temporal_selector = None
+    if args.temporal_selector == 'event-aware':
+        temporal_selector = EventAwareDataSelector(
+            max_events=args.event_max_events,
+            min_event_spacing=args.event_min_spacing,
+            throughput_change_threshold=args.event_throughput_threshold,
+            low_buffer_seconds=args.event_buffer_threshold,
+            bitrate_jump_threshold=args.event_bitrate_jump_threshold,
+        )
     token_selector = None
     if args.token_selector == 'recent-timestep':
         token_selector = RecentTimestepSelector(args.selector_history_steps)
@@ -408,6 +429,8 @@ def run(args):
             low_buffer_seconds=args.event_buffer_threshold,
             bitrate_jump_threshold=args.event_bitrate_jump_threshold,
         )
+    elif args.token_selector == 'intra-timestep':
+        token_selector = IntraTimestepTokenSelector()
     draft_generator = None
     if args.speculative_draft_steps > 0:
         draft_generator = RobustMPCDraftGenerator.from_video_size_dir(
@@ -415,7 +438,7 @@ def run(args):
         )
     rl_policy = OfflineRLPolicy(state_feature_dim=args.state_feature_dim, bitrate_levels=BITRATE_LEVELS, state_encoder=state_encoder, plm=plm, plm_embed_size=plm_embed_size,
                                            max_length=args.w, max_ep_len=max_ep_len, device=args.device, device_out=args.device_out, which_layer=args.which_layer,
-                                           token_selector=token_selector, draft_generator=draft_generator,
+                                           temporal_selector=temporal_selector, token_selector=token_selector, draft_generator=draft_generator,
                                            speculative_draft_steps=args.speculative_draft_steps,
                                            speculative_verification_mode=args.speculative_verification_mode,
                                            speculative_buffer_tolerance=args.speculative_buffer_tolerance,
@@ -432,11 +455,20 @@ def run(args):
     )
     models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
-    if args.token_selector == 'none':
+    if args.temporal_selector == 'event-aware':
+        selector_tag = (
+            f'temporal_event_aware_k{args.event_max_events}'
+            f'_spacing{args.event_min_spacing}'
+            f'_tp{args.event_throughput_threshold:g}'
+            f'_buf{args.event_buffer_threshold:g}'
+            f'_br{args.event_bitrate_jump_threshold}'
+            f'_token_{args.token_selector.replace("-", "_")}'
+        )
+    elif args.token_selector == 'none':
         selector_tag = 'selector_none'
     elif args.token_selector == 'recent-timestep':
         selector_tag = f'selector_recent_timestep_h{args.selector_history_steps}'
-    else:
+    elif args.token_selector == 'event-aware':
         selector_tag = (
             f'selector_event_aware_k{args.event_max_events}'
             f'_spacing{args.event_min_spacing}'
@@ -444,6 +476,8 @@ def run(args):
             f'_buf{args.event_buffer_threshold:g}'
             f'_br{args.event_bitrate_jump_threshold}'
         )
+    else:
+        selector_tag = 'selector_intra_timestep'
     speculative_tag = (
         'speculative_none' if args.speculative_draft_steps == 0
         else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
@@ -552,7 +586,9 @@ if __name__ == '__main__':
     parser.add_argument('--initial-best-return', type=float, default=float('-inf'))
     parser.add_argument('--target-return-scale', type=float, help='target return, which specifies the expected performance for the model to achieve', default=1.)
     parser.add_argument('--which-layer', type=int, help='for early stopping (not used in our experiments): specify which layer to stop (layer index starts from 0)', default=-1)
-    parser.add_argument('--token-selector', choices=('none', 'recent-timestep', 'event-aware'), default='none',
+    parser.add_argument('--temporal-selector', choices=('none', 'event-aware'), default='none',
+                        help='raw-history timestep selection before token encoding')
+    parser.add_argument('--token-selector', choices=('none', 'recent-timestep', 'event-aware', 'intra-timestep'), default='none',
                         help='inference-time token selection policy')
     parser.add_argument('--selector-history-steps', type=int, default=20,
                         help='number of complete real-history timesteps retained by recent-timestep')

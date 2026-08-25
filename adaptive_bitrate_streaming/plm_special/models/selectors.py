@@ -16,7 +16,8 @@ import torch.nn as nn
 from plm_special.models.selection_layout import recent_timestep_window
 from plm_special.models.event_selection import (
     ABREventConfig,
-    select_event_timesteps,
+    EventAwareDataSelector,
+    protected_history_token_offsets,
 )
 
 
@@ -202,6 +203,7 @@ class EventAwareTemporalSelector(BaseSelector):
             low_buffer_seconds=low_buffer_seconds,
             bitrate_jump_threshold=bitrate_jump_threshold,
         )
+        self.data_selector = EventAwareDataSelector(self.config)
         for name, value in (
             ("tokens_per_history_step", tokens_per_history_step),
             ("current_step_tokens", current_step_tokens),
@@ -246,9 +248,7 @@ class EventAwareTemporalSelector(BaseSelector):
                 f"raw={len(history_states)}, embedded={available_steps}"
             )
 
-        selected = select_event_timesteps(
-            history_states, history_actions, self.config
-        )
+        selected = self.data_selector(history_states, history_actions)
         token_indices = []
         for step in selected["selected_steps"]:
             start = step * self.tokens_per_history_step
@@ -288,5 +288,101 @@ class EventAwareTemporalSelector(BaseSelector):
                 "preserves_order": True,
                 "protected_suffix_tokens": protected,
                 "context_stage": context.get("stage"),
+            },
+        )
+
+
+class IntraTimestepTokenSelector(BaseSelector):
+    """Reduce tokens inside temporally selected ABR history blocks.
+
+    Temporal selection must run first and provide the absolute selected
+    timestep IDs and event metadata.  Return/action anchors are always kept,
+    event-causal state tokens are preserved, the latest historical block is
+    kept whole, and the current/MPC suffix is never pruned.
+    """
+
+    requires_temporal_metadata = True
+
+    def __init__(self, tokens_per_history_step=8, current_step_tokens=7):
+        super().__init__()
+        for name, value in (
+            ("tokens_per_history_step", tokens_per_history_step),
+            ("current_step_tokens", current_step_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if tokens_per_history_step != 8:
+            raise ValueError("intra-timestep ABR layout currently requires 8 tokens")
+        self.tokens_per_history_step = tokens_per_history_step
+        self.current_step_tokens = current_step_tokens
+
+    def forward(self, embeddings, attention_mask=None, context=None):
+        self.validate_inputs(embeddings, attention_mask)
+        context = {} if context is None else dict(context)
+        protected = context.get(
+            "protected_suffix_tokens", self.current_step_tokens
+        )
+        if (
+            isinstance(protected, bool) or not isinstance(protected, int)
+            or protected <= 0
+        ):
+            raise ValueError("protected_suffix_tokens must be a positive integer")
+
+        selected_steps = list(context.get("selected_history_steps", []))
+        latest_step = context.get("latest_history_step")
+        event_scores = context.get("event_scores", [])
+        event_reasons = {
+            item["timestep"]: tuple(item.get("reasons", {}))
+            for item in event_scores
+        }
+        original_length = int(embeddings.shape[1])
+        history_tokens = original_length - protected
+        if history_tokens < 0 or history_tokens % self.tokens_per_history_step:
+            raise ValueError("intra-timestep input is not aligned to ABR blocks")
+        block_count = history_tokens // self.tokens_per_history_step
+        if len(selected_steps) != block_count:
+            raise ValueError(
+                "selected timestep IDs do not match encoded history blocks: "
+                f"ids={len(selected_steps)}, blocks={block_count}"
+            )
+
+        token_indices = []
+        offsets_by_step = {}
+        selected_history_token_count = 0
+        for block_index, timestep in enumerate(selected_steps):
+            offsets = protected_history_token_offsets(
+                event_reasons.get(timestep),
+                preserve_all=timestep == latest_step,
+            )
+            offsets_by_step[str(timestep)] = list(offsets)
+            selected_history_token_count += len(offsets)
+            block_start = block_index * self.tokens_per_history_step
+            token_indices.extend(block_start + offset for offset in offsets)
+        token_indices.extend(range(history_tokens, original_length))
+        indices = torch.as_tensor(
+            token_indices, dtype=torch.long, device=embeddings.device
+        )
+        selected_mask = (
+            None if attention_mask is None
+            else attention_mask.index_select(1, indices)
+        )
+        return SelectionOutput(
+            embeddings=embeddings.index_select(1, indices),
+            attention_mask=selected_mask,
+            selected_indices=indices,
+            scores=None,
+            original_length=original_length,
+            selected_length=len(token_indices),
+            metadata={
+                "selector": type(self).__name__,
+                "selected_history_steps": selected_steps,
+                "latest_history_step": latest_step,
+                "event_token_offsets": offsets_by_step,
+                "always_preserved_offsets": [0, 7],
+                "history_original_tokens": history_tokens,
+                "history_selected_tokens": selected_history_token_count,
+                "preserves_latest_history_block": latest_step is not None,
+                "protected_suffix_tokens": protected,
+                "preserves_order": True,
             },
         )

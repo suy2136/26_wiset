@@ -4,6 +4,25 @@ from dataclasses import dataclass
 import math
 
 
+# Completed ABR blocks are ordered as
+# [return, bitrate, buffer, throughput, download time, chunk sizes,
+#  chunks remaining, action].  The current step omits the final action token.
+ABR_HISTORY_TOKEN_COUNT = 8
+ABR_RETURN_TOKEN = 0
+ABR_BITRATE_TOKEN = 1
+ABR_BUFFER_TOKEN = 2
+ABR_THROUGHPUT_TOKEN = 3
+ABR_DOWNLOAD_TIME_TOKEN = 4
+ABR_ACTION_TOKEN = 7
+
+EVENT_REASON_TOKEN_OFFSETS = {
+    "rebuffer": (ABR_BUFFER_TOKEN, ABR_DOWNLOAD_TIME_TOKEN),
+    "throughput_change": (ABR_THROUGHPUT_TOKEN,),
+    "low_buffer": (ABR_BUFFER_TOKEN,),
+    "bitrate_switch": (ABR_BITRATE_TOKEN, ABR_ACTION_TOKEN),
+}
+
+
 @dataclass(frozen=True)
 class ABREventConfig:
     """Thresholds selected from the local NetLLM ABR experience pool."""
@@ -40,6 +59,59 @@ class ABREventConfig:
             raise ValueError("bitrate_jump_threshold must be positive")
         if self.buffer_norm_seconds <= 0:
             raise ValueError("buffer_norm_seconds must be positive")
+
+
+class EventAwareDataSelector:
+    """Select raw ABR timesteps before token-level processing.
+
+    The output contains only chronological indices and auditable event
+    metadata.  State encoding is deliberately left to the caller so only the
+    selected aligned records need to enter the next stage.
+    """
+
+    def __init__(self, config=None, **config_values):
+        if config is not None and config_values:
+            raise ValueError("pass either config or config values, not both")
+        self.config = config or ABREventConfig(**config_values)
+
+    def select(self, history_states, history_actions):
+        return select_event_timesteps(
+            history_states, history_actions, self.config
+        )
+
+    __call__ = select
+
+
+def gather_selected_timesteps(values, selected_steps):
+    """Gather aligned raw records in chronological selector order."""
+    steps = list(selected_steps)
+    if steps != sorted(set(steps)):
+        raise ValueError("selected_steps must be unique and chronological")
+    if any(
+        isinstance(step, bool) or not isinstance(step, int)
+        or step < 0 or step >= len(values)
+        for step in steps
+    ):
+        raise IndexError("selected timestep is outside the aligned history")
+    return [values[step] for step in steps]
+
+
+def protected_history_token_offsets(event_reasons=None, preserve_all=False):
+    """Return token offsets retained inside one selected history block.
+
+    Return and action anchors are always retained.  Event-specific state
+    tokens are added according to the reason map; the latest history block can
+    request all eight offsets through ``preserve_all``.
+    """
+    if preserve_all:
+        return tuple(range(ABR_HISTORY_TOKEN_COUNT))
+    offsets = {ABR_RETURN_TOKEN, ABR_ACTION_TOKEN}
+    for reason in event_reasons or ():
+        try:
+            offsets.update(EVENT_REASON_TOKEN_OFFSETS[reason])
+        except KeyError as error:
+            raise ValueError(f"unknown ABR event reason: {reason}") from error
+    return tuple(sorted(offsets))
 
 
 def _state_value(state, row, column=-1):

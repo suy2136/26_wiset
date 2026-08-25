@@ -81,7 +81,7 @@ def discover_base_model(explicit_path=None, vp_checkpoint_candidates=VP_CHECKPOI
     return next((path for path in candidates if _valid_base_model(path)), DEFAULT_BASE_MODEL)
 
 
-def checkpoint_problems(checkpoint_dir, base_model_dir):
+def checkpoint_problems(checkpoint_dir, base_model_dir, nbs_v19=False):
     checkpoint_dir = Path(checkpoint_dir)
     base_model_dir = Path(base_model_dir)
     problems = []
@@ -105,19 +105,32 @@ def checkpoint_problems(checkpoint_dir, base_model_dir):
             'LoRA adapter weights not found (expected adapter_model.safetensors '
             f'or adapter_model.bin in {checkpoint_dir})'
         )
+    if nbs_v19:
+        for filename in ('nash_rank_allocator.pt', 'checkpoint_metadata.json'):
+            if not (checkpoint_dir / filename).is_file():
+                problems.append(
+                    f'NBS checkpoint file not found: {checkpoint_dir / filename}'
+                )
     return problems
 
 
 def common_command(args):
-    return [
+    command = [
         sys.executable, 'run_plm.py', '--test',
-        '--plm-type', 'llama', '--plm-size', 'base', '--rank', '128',
+        '--plm-type', 'llama', '--plm-size', 'base',
+        '--rank', str(args.rank),
         '--fp16',
         '--plm-dir', str(Path(args.base_model_dir).resolve()),
         '--model-dir', str(Path(args.checkpoint_dir).resolve()),
         '--device', args.device, '--device-out', args.device,
         '--trace-num', '1', '--fixed-order',
     ]
+    if args.nbs_v19:
+        command.extend([
+            '--nbs-v19', '--nbs-rank-budget', str(args.nbs_rank_budget),
+            '--nbs-rank-config', str(args.nbs_rank_config),
+        ])
+    return command
 
 
 def feature_command(feature, args):
@@ -134,6 +147,27 @@ def feature_command(feature, args):
             '--speculative-draft-steps', str(args.speculative_draft_steps),
             '--speculative-verification-mode', 'greedy',
         ])
+    elif feature in ('temporal', 'intra', 'hierarchical',
+                     'hierarchical-speculative'):
+        temporal_enabled = feature in ('temporal', 'hierarchical',
+                                       'hierarchical-speculative')
+        intra_enabled = feature in ('intra', 'hierarchical',
+                                    'hierarchical-speculative')
+        command.extend([
+            '--temporal-selector', (
+                'event-aware' if temporal_enabled else 'none'
+            ),
+            '--token-selector', (
+                'intra-timestep' if intra_enabled else 'none'
+            ),
+            '--event-max-events', str(args.event_max_events),
+            '--speculative-draft-steps', (
+                str(args.speculative_draft_steps)
+                if feature == 'hierarchical-speculative' else '0'
+            ),
+        ])
+        if feature == 'hierarchical-speculative':
+            command.extend(['--speculative-verification-mode', 'greedy'])
     else:
         raise ValueError(f'unknown feature: {feature}')
     return command
@@ -159,16 +193,40 @@ def validate_metrics(feature, metrics):
             'original_tokens_mean', 0
         ):
             raise RuntimeError('selector: selected token count increased')
-    else:
+    elif feature == 'speculative':
         if metrics.get('speculative_draft_steps', 0) <= 0:
             raise RuntimeError('speculative: draft generation was not enabled')
         if metrics.get('draft_attempts', 0) <= 0 or metrics.get('drafted_actions', 0) <= 0:
             raise RuntimeError('speculative: MPC draft path was not exercised')
+    else:
+        temporal_expected = feature in (
+            'temporal', 'hierarchical', 'hierarchical-speculative'
+        )
+        intra_expected = feature in (
+            'intra', 'hierarchical', 'hierarchical-speculative'
+        )
+        if temporal_expected and (
+            metrics.get('temporal_selector') != 'event-aware'
+            or metrics.get('temporal_selector_calls', 0) <= 0
+        ):
+            raise RuntimeError(f'{feature}: temporal selector was not exercised')
+        if intra_expected and (
+            metrics.get('selector') != 'intra-timestep'
+            or metrics.get('token_selector_calls', 0) <= 0
+        ):
+            raise RuntimeError(f'{feature}: intra-token selector was not exercised')
+        if feature == 'hierarchical-speculative' and (
+            metrics.get('draft_attempts', 0) <= 0
+            or metrics.get('drafted_actions', 0) <= 0
+        ):
+            raise RuntimeError(
+                'hierarchical-speculative: MPC draft path was not exercised'
+            )
 
 
 def run_real(args):
     summaries = {}
-    for feature in ('selector', 'speculative'):
+    for feature in args.features:
         command = feature_command(feature, args)
         print(f'[{feature}]', subprocess.list2cmdline(command), flush=True)
         started = time.time() - 1.0
@@ -181,6 +239,12 @@ def run_real(args):
             'metrics_path': str(metrics_path),
             'mean_reward': metrics.get('mean_reward'),
             'token_reduction_ratio': metrics.get('token_reduction_ratio'),
+            'temporal_history_reduction_ratio': metrics.get(
+                'temporal_history_reduction_ratio'
+            ),
+            'intra_token_reduction_ratio': metrics.get(
+                'intra_token_reduction_ratio'
+            ),
             'draft_attempts': metrics.get('draft_attempts'),
             'acceptance_rate': metrics.get('acceptance_rate'),
             'llm_call_reduction_ratio': metrics.get('llm_call_reduction_ratio'),
@@ -210,13 +274,32 @@ def parse_args(argv=None):
         help='base Llama directory; omitted means auto-detect the model used by VP',
     )
     parser.add_argument('--device', default='cuda:0')
+    parser.add_argument('--nbs-v19', action='store_true')
+    parser.add_argument('--rank', type=int, default=128)
+    parser.add_argument('--nbs-rank-budget', type=int, default=512)
+    parser.add_argument(
+        '--nbs-rank-config', default='configs/nbs_v19_rank_config.json'
+    )
     parser.add_argument('--selector-history-steps', type=int, default=5)
     parser.add_argument('--speculative-draft-steps', type=int, default=2)
+    parser.add_argument('--event-max-events', type=int, default=3)
+    parser.add_argument(
+        '--features', nargs='+',
+        choices=(
+            'selector', 'speculative', 'temporal', 'intra', 'hierarchical',
+            'hierarchical-speculative',
+        ),
+        default=['selector', 'speculative'],
+    )
     args = parser.parse_args(argv)
     if args.selector_history_steps <= 0:
         parser.error('--selector-history-steps must be positive')
     if not 1 <= args.speculative_draft_steps <= 5:
         parser.error('--speculative-draft-steps must be between 1 and 5')
+    if args.event_max_events < 0:
+        parser.error('--event-max-events must be non-negative')
+    if args.rank <= 0 or args.nbs_rank_budget <= 0:
+        parser.error('rank and NBS rank budget must be positive')
     return args
 
 
@@ -225,7 +308,9 @@ def main(argv=None):
     args.base_model_dir = discover_base_model(args.base_model_dir)
     if _valid_base_model(args.base_model_dir):
         print(f'Base model selected: {args.base_model_dir}')
-    problems = checkpoint_problems(args.checkpoint_dir, args.base_model_dir)
+    problems = checkpoint_problems(
+        args.checkpoint_dir, args.base_model_dir, nbs_v19=args.nbs_v19
+    )
     if problems:
         print('Real-model prerequisites: NOT READY')
         for problem in problems:

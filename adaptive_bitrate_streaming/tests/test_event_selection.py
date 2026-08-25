@@ -2,6 +2,9 @@ import unittest
 
 from adaptive_bitrate_streaming.plm_special.models.event_selection import (
     ABREventConfig,
+    EventAwareDataSelector,
+    gather_selected_timesteps,
+    protected_history_token_offsets,
     score_abr_event,
     select_event_timesteps,
 )
@@ -79,6 +82,34 @@ class ABREventSelectionTest(unittest.TestCase):
         self.assertEqual(len(event_steps), 1)
         self.assertIn(event_steps[0], (1, 2))
         self.assertGreaterEqual(abs(4 - event_steps[0]), 2)
+
+    def test_data_selector_returns_indices_for_aligned_pre_encoding_gather(self):
+        states = [state(), state(buffer_seconds=5, throughput=2.0), state()]
+        actions = [0, 1, 1]
+        result = EventAwareDataSelector(
+            max_events=1, min_event_spacing=1
+        )(states, actions)
+        self.assertEqual(result["selected_steps"], [1, 2])
+        self.assertEqual(
+            gather_selected_timesteps(["r0", "r1", "r2"], result["selected_steps"]),
+            ["r1", "r2"],
+        )
+
+    def test_event_reasons_map_to_required_intra_timestep_tokens(self):
+        self.assertEqual(
+            protected_history_token_offsets(
+                ["rebuffer", "throughput_change", "bitrate_switch"]
+            ),
+            (0, 1, 2, 3, 4, 7),
+        )
+        self.assertEqual(
+            protected_history_token_offsets(["low_buffer"]),
+            (0, 2, 7),
+        )
+        self.assertEqual(
+            protected_history_token_offsets(preserve_all=True),
+            tuple(range(8)),
+        )
 
 
 if __name__ == "__main__":
