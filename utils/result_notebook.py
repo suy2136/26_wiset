@@ -83,8 +83,14 @@ class ResultNotebook:
             file.close()
         
         if write_predictions:
-            stem, _ = os.path.splitext(result_path)
-            details_path = stem.replace('_results', '_predictions') + '.txt'
+            # Only rewrite the result *file name*.  Replacing on the complete
+            # path also changes a parent such as ``generated_results`` into
+            # ``generated_predictions`` and then fails because that accidental
+            # sibling directory does not exist.
+            result_dir, result_name = os.path.split(result_path)
+            stem, _ = os.path.splitext(result_name)
+            details_name = stem.replace('_results', '_predictions') + '.txt'
+            details_path = os.path.join(result_dir, details_name)
             with open(details_path, 'w') as file:
                 for i in range(len(total_pred)):
                     pred_line = 'pred: '
