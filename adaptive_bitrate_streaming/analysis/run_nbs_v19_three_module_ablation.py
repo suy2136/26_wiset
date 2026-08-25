@@ -1,14 +1,15 @@
 """Run temporal and token-selection ABR ablations on one NBS checkpoint.
 
-The matrix contains one NBS-only baseline, three temporal-selection settings,
-and three recent-token-selection settings. Speculative decoding is disabled
-throughout because it is evaluated by the existing speculative sweep. The
-runner never trains or mutates the checkpoint and supports safe resume.
+The matrix contains three temporal-selection settings and three recent-token-
+selection settings. An existing NBS-only result is reused as the baseline, so
+the runner never evaluates or trains NBS-only again. Speculative decoding is
+disabled throughout because it is evaluated by the existing speculative sweep.
 """
 
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 import shlex
 import subprocess
@@ -24,7 +25,6 @@ DEFAULT_OUTPUT = RESULTS_ROOT / 'nbs_v19_three_module_ablation.csv'
 
 
 EXPERIMENTS = (
-    {'name': 'nbs_only', 'family': 'baseline'},
     {'name': 'temporal_k1', 'family': 'temporal', 'max_events': 1},
     {'name': 'temporal_k3', 'family': 'temporal', 'max_events': 3},
     {'name': 'temporal_k4', 'family': 'temporal', 'max_events': 4},
@@ -32,6 +32,55 @@ EXPERIMENTS = (
     {'name': 'token_h5', 'family': 'token', 'history_steps': 5},
     {'name': 'token_h12', 'family': 'token', 'history_steps': 12},
 )
+
+
+def validate_baseline_metrics(metrics_path):
+    if not metrics_path.is_file():
+        raise FileNotFoundError(f'baseline metrics not found: {metrics_path}')
+    metrics = json.loads(metrics_path.read_text(encoding='utf-8'))
+    if metrics.get('selector') != 'none':
+        raise ValueError('baseline metrics must have selector=none')
+    if metrics.get('temporal_selector', 'none') != 'none':
+        raise ValueError('baseline metrics must have temporal_selector=none')
+    if int(metrics.get('speculative_draft_steps', 0)) != 0:
+        raise ValueError('baseline metrics must have speculative_draft_steps=0')
+    for key in ('mean_reward', 'inference_latency_mean_ms'):
+        value = metrics.get(key)
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            raise ValueError(f'baseline metrics must contain finite {key}')
+    return metrics
+
+
+def discover_baseline_metrics(args, explicit_path=None, results_root=RESULTS_ROOT):
+    if explicit_path is not None:
+        path = explicit_path.resolve()
+        return path, validate_baseline_metrics(path)
+
+    rank_tag = f'rank_{args.physical_rank}_nbs_v19_budget{args.rank_budget}'
+    trace_tag = f'{args.trace}_{args.video}'
+    trace_num_tag = f'trace_num_{args.trace_num}_fixed_True'
+    candidates = []
+    for path in results_root.rglob('selector_metrics.json'):
+        parts = path.parts
+        if not all((
+            any(rank_tag in part for part in parts),
+            any(trace_tag in part for part in parts),
+            any(trace_num_tag in part for part in parts),
+            'selector_none' in parts,
+            'speculative_none' in parts,
+        )):
+            continue
+        candidates.append(path)
+    for path in sorted(candidates, key=lambda item: item.stat().st_mtime,
+                       reverse=True):
+        try:
+            return path.resolve(), validate_baseline_metrics(path)
+        except (ValueError, json.JSONDecodeError):
+            continue
+    raise FileNotFoundError(
+        'matching existing NBS-only selector_metrics.json was not found; '
+        'provide it with --baseline-metrics-json'
+    )
 
 
 def validate_checkpoint(checkpoint_dir, rank_budget):
@@ -143,7 +192,7 @@ def add_baseline_comparisons(rows):
     return rows
 
 
-def run_signature(args):
+def run_signature(args, baseline_metrics_path):
     return {
         'checkpoint_dir': str(args.checkpoint_dir.resolve()),
         'base_model_dir': str(args.base_model_dir.resolve()),
@@ -159,6 +208,7 @@ def run_signature(args):
         'throughput_threshold': args.throughput_threshold,
         'buffer_threshold': args.buffer_threshold,
         'bitrate_jump_threshold': args.bitrate_jump_threshold,
+        'baseline_metrics_path': str(baseline_metrics_path.resolve()),
         'experiments': [item['name'] for item in EXPERIMENTS],
     }
 
@@ -232,6 +282,7 @@ def main():
     parser.add_argument('--video', default='video1')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument('--baseline-metrics-json', type=Path)
     parser.add_argument(
         '--only', nargs='*', choices=[item['name'] for item in EXPERIMENTS]
     )
@@ -245,21 +296,38 @@ def main():
         item for item in EXPERIMENTS
         if not args.only or item['name'] in args.only
     ]
-    signature = run_signature(args)
-    metadata = {}
-    if not args.dry_run:
-        metadata = validate_checkpoint(args.checkpoint_dir, args.rank_budget)
-        if not (args.base_model_dir / 'config.json').is_file():
-            raise FileNotFoundError(f'base model not found: {args.base_model_dir}')
-        if not args.exp_pool_path.is_file():
-            raise FileNotFoundError(
-                f'experience pool not found: {args.exp_pool_path}'
-            )
+    if args.dry_run:
+        for experiment in selected:
+            command = build_command(args, experiment)
+            print(f"[{experiment['name']}] {shlex.join(command)}", flush=True)
+        return
+
+    metadata = validate_checkpoint(args.checkpoint_dir, args.rank_budget)
+    if not (args.base_model_dir / 'config.json').is_file():
+        raise FileNotFoundError(f'base model not found: {args.base_model_dir}')
+    if not args.exp_pool_path.is_file():
+        raise FileNotFoundError(f'experience pool not found: {args.exp_pool_path}')
+    baseline_path, baseline_metrics = discover_baseline_metrics(
+        args, args.baseline_metrics_json
+    )
+    signature = run_signature(args, baseline_path)
 
     rows = (
-        load_resume_rows(args.output, signature)
-        if args.resume and not args.dry_run else []
+        load_resume_rows(args.output, signature) if args.resume else []
     )
+    if not any(row['experiment'] == 'nbs_only' for row in rows):
+        rows.insert(0, {
+            'experiment': 'nbs_only',
+            'family': 'baseline',
+            'seed': 1,
+            'checkpoint_dir': str(args.checkpoint_dir.resolve()),
+            'rank_budget': args.rank_budget,
+            'nbs_checkpoint_role': metadata.get('role'),
+            'baseline_reused': True,
+            'metrics_path': str(baseline_path),
+            **scalar_metrics(baseline_metrics),
+        })
+        write_results(rows, args.output, signature)
     completed = {row['experiment'] for row in rows}
     for experiment in selected:
         if experiment['name'] in completed:
@@ -267,8 +335,6 @@ def main():
             continue
         command = build_command(args, experiment)
         print(f"[{experiment['name']}] {shlex.join(command)}", flush=True)
-        if args.dry_run:
-            continue
         started_at = time.time() - 1.0
         subprocess.run(command, cwd=ABR_ROOT, check=True)
         metrics_path = newest_metrics(started_at)
@@ -285,8 +351,7 @@ def main():
         })
         write_results(rows, args.output, signature)
 
-    if not args.dry_run:
-        print(f'Results saved at: {args.output.resolve()}')
+    print(f'Results saved at: {args.output.resolve()}')
 
 
 if __name__ == '__main__':

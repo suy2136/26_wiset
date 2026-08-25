@@ -25,14 +25,15 @@ def args():
 
 
 class ThreeModuleAblationTest(unittest.TestCase):
-    def test_matrix_has_baseline_and_three_variants_per_selector(self):
+    def test_matrix_has_only_three_variants_per_selector(self):
         counts = {}
         for experiment in ablation.EXPERIMENTS:
             counts[experiment['family']] = counts.get(experiment['family'], 0) + 1
         self.assertEqual(
             counts,
-            {'baseline': 1, 'temporal': 3, 'token': 3},
+            {'temporal': 3, 'token': 3},
         )
+        self.assertNotIn('nbs_only', {item['name'] for item in ablation.EXPERIMENTS})
 
     def test_each_family_isolated_and_uses_same_checkpoint(self):
         values = args()
@@ -89,6 +90,40 @@ class ThreeModuleAblationTest(unittest.TestCase):
         self.assertAlmostEqual(
             rows[1]['inference_latency_reduction_vs_nbs'], 0.25
         )
+
+    def test_discovers_matching_existing_nbs_baseline(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = (
+                Path(temp_dir) / 'fcc-test_video1' /
+                'trace_num_100_fixed_True' /
+                'rank_32_nbs_v19_budget1536_seed_1' /
+                'selector_none' / 'speculative_none' /
+                'selector_metrics.json'
+            )
+            metrics_path.parent.mkdir(parents=True)
+            metrics_path.write_text(json.dumps({
+                'selector': 'none', 'speculative_draft_steps': 0,
+                'mean_reward': 0.8, 'inference_latency_mean_ms': 80.0,
+            }), encoding='utf-8')
+            found, metrics = ablation.discover_baseline_metrics(
+                args(), results_root=Path(temp_dir)
+            )
+            self.assertEqual(found, metrics_path.resolve())
+            self.assertEqual(metrics['mean_reward'], 0.8)
+
+    def test_explicit_baseline_rejects_selector_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            metrics_path = Path(temp_dir) / 'selector_metrics.json'
+            metrics_path.write_text(json.dumps({
+                'selector': 'recent-timestep',
+                'speculative_draft_steps': 0,
+                'mean_reward': 0.8,
+                'inference_latency_mean_ms': 80.0,
+            }), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'selector=none'):
+                ablation.discover_baseline_metrics(
+                    args(), explicit_path=metrics_path
+                )
 
     def test_resume_reuses_only_an_identical_signature(self):
         with tempfile.TemporaryDirectory() as temp_dir:
