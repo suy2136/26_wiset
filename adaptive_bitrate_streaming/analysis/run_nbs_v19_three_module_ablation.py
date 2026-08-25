@@ -1,9 +1,9 @@
-"""Run three independent ABR inference ablations on one NBS-v19 checkpoint.
+"""Run temporal and token-selection ABR ablations on one NBS checkpoint.
 
-The matrix contains one NBS-only baseline plus three temporal-selection,
-three recent-token-selection, and three MPC-speculative configurations.  It
-never trains or mutates the supplied checkpoint and writes partial results
-after every completed configuration for safe resume.
+The matrix contains one NBS-only baseline, three temporal-selection settings,
+and three recent-token-selection settings. Speculative decoding is disabled
+throughout because it is evaluated by the existing speculative sweep. The
+runner never trains or mutates the checkpoint and supports safe resume.
 """
 
 import argparse
@@ -31,21 +31,6 @@ EXPERIMENTS = (
     {'name': 'token_h1', 'family': 'token', 'history_steps': 1},
     {'name': 'token_h5', 'family': 'token', 'history_steps': 5},
     {'name': 'token_h12', 'family': 'token', 'history_steps': 12},
-    {
-        'name': 'spec_k2_bt0.5_st0.25_rt0.01', 'family': 'speculative',
-        'draft_steps': 2, 'buffer_tolerance': 0.5,
-        'state_tolerance': 0.25, 'return_tolerance': 0.01,
-    },
-    {
-        'name': 'spec_k2_bt1.0_st0.25_rt0.01', 'family': 'speculative',
-        'draft_steps': 2, 'buffer_tolerance': 1.0,
-        'state_tolerance': 0.25, 'return_tolerance': 0.01,
-    },
-    {
-        'name': 'spec_k3_bt3.0_st0.40_rt0.01', 'family': 'speculative',
-        'draft_steps': 3, 'buffer_tolerance': 3.0,
-        'state_tolerance': 0.40, 'return_tolerance': 0.01,
-    },
 )
 
 
@@ -81,7 +66,6 @@ def build_command(args, experiment):
     family = experiment['family']
     temporal_selector = 'event-aware' if family == 'temporal' else 'none'
     token_selector = 'recent-timestep' if family == 'token' else 'none'
-    draft_steps = experiment.get('draft_steps', 0)
     command = [
         sys.executable, 'run_plm.py', '--test', '--nbs-v19', '--fp16',
         '--seed', '1', '--plm-type', 'llama', '--plm-size', 'base',
@@ -96,7 +80,7 @@ def build_command(args, experiment):
         '--device', args.device, '--device-out', args.device,
         '--temporal-selector', temporal_selector,
         '--token-selector', token_selector,
-        '--speculative-draft-steps', str(draft_steps),
+        '--speculative-draft-steps', '0',
     ]
     if family == 'temporal':
         command.extend([
@@ -109,16 +93,6 @@ def build_command(args, experiment):
     elif family == 'token':
         command.extend([
             '--selector-history-steps', str(experiment['history_steps'])
-        ])
-    elif family == 'speculative':
-        command.extend([
-            '--speculative-verification-mode', 'greedy',
-            '--speculative-buffer-tolerance',
-            str(experiment['buffer_tolerance']),
-            '--speculative-state-tolerance',
-            str(experiment['state_tolerance']),
-            '--speculative-return-tolerance',
-            str(experiment['return_tolerance']),
         ])
     return command
 
@@ -216,8 +190,6 @@ def write_results(rows, output, signature):
         'inference_latency_reduction_vs_nbs', 'original_tokens_mean',
         'selected_tokens_mean', 'token_reduction_ratio',
         'temporal_history_reduction_ratio', 'intra_token_reduction_ratio',
-        'acceptance_rate', 'target_plm_calls', 'llm_call_reduction_ratio',
-        'draft_attempts', 'drafted_actions', 'accepted_actions',
         'time', 'metrics_path',
     ]
     all_fields = {key for row in rows for key in row}

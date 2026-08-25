@@ -25,13 +25,13 @@ def args():
 
 
 class ThreeModuleAblationTest(unittest.TestCase):
-    def test_matrix_has_baseline_and_three_variants_per_module(self):
+    def test_matrix_has_baseline_and_three_variants_per_selector(self):
         counts = {}
         for experiment in ablation.EXPERIMENTS:
             counts[experiment['family']] = counts.get(experiment['family'], 0) + 1
         self.assertEqual(
             counts,
-            {'baseline': 1, 'temporal': 3, 'token': 3, 'speculative': 3},
+            {'baseline': 1, 'temporal': 3, 'token': 3},
         )
 
     def test_each_family_isolated_and_uses_same_checkpoint(self):
@@ -56,7 +56,7 @@ class ThreeModuleAblationTest(unittest.TestCase):
             draft_steps = int(
                 command[command.index('--speculative-draft-steps') + 1]
             )
-            self.assertEqual(draft_steps > 0, family == 'speculative')
+            self.assertEqual(draft_steps, 0)
 
     def test_checkpoint_validation_enforces_budget(self):
         with tempfile.TemporaryDirectory() as temp_dir:
