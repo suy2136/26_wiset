@@ -417,6 +417,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     )
     best_post_nbs_model_path = os.path.join(checkpoint_root, 'best_post_nbs_model')
     final_nbs_model_path = os.path.join(checkpoint_root, 'final_nbs_model')
+    final_shapley_model_path = os.path.join(
+        checkpoint_root, 'final_shapley_model'
+    )
     console_log = open(os.path.join(models_dir, file_prefix + '_console.log'), 'w')
     sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
 
@@ -474,6 +477,55 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             allocator.snapshot_diagnostics(step=0, event=initial_event),
         )
         print('NBS rank diagnostics saved at', nash_diagnostics_path)
+
+    if (args.rank != -1 and args.use_adalora and
+            args.adalora_allocator == 'shapley'):
+        shapley_allocator = getattr(
+            pipeline.plm, 'shapley_rank_allocator', None
+        )
+        if shapley_allocator is None:
+            raise RuntimeError(
+                'Shapley allocator was requested but was not attached to the PEFT model'
+            )
+        fixed_batches = []
+        for batch_index, (history, future, video_user_info) in enumerate(
+                dataloader_valid):
+            if batch_index >= args.shapley_validation_batches:
+                break
+            fixed_batches.append((
+                normalize_data(history.to(args.device), args.train_dataset),
+                normalize_data(future.to(args.device), args.train_dataset),
+                video_user_info,
+            ))
+        if not fixed_batches:
+            raise RuntimeError('Shapley allocator could not capture a validation batch')
+
+        def shapley_validation_loss():
+            was_training = pipeline.training
+            pipeline.eval()
+            try:
+                with torch.no_grad():
+                    losses = [
+                        pipeline(
+                            history,
+                            future,
+                            video_user_info,
+                            teacher_forcing=(
+                                args.shapley_value_mode == 'teacher-forcing'
+                            ),
+                        ).float().item()
+                        for history, future, video_user_info in fixed_batches
+                    ]
+                return sum(losses) / len(losses)
+            finally:
+                pipeline.train(was_training)
+
+        shapley_allocator.set_loss_fn(shapley_validation_loss)
+        print(
+            '[Shapley AdaLoRA] fixed validation batches={}, value mode={}'.format(
+                len(fixed_batches), args.shapley_value_mode
+            )
+        )
 
     if not args.freeze_plm:
         no_decay = ['bias', 'LayerNorm.weight']
@@ -947,6 +999,22 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             )
             final_storage_description = final_nbs_model_path
         print('Final NBS model saved as', final_storage_description)
+    elif (args.rank != -1 and args.use_adalora and
+          args.adalora_allocator == 'shapley'):
+        save_model(
+            args,
+            pipeline,
+            final_shapley_model_path,
+            metadata={
+                'checkpoint_role': 'final_shapley',
+                'optimizer_step': int(opt_step),
+                'validation_loss': last_valid_loss,
+                'teacher_forcing_validation_loss': (
+                    last_teacher_forcing_valid_loss
+                ),
+            },
+        )
+        print('Final Shapley AdaLoRA model saved at', final_shapley_model_path)
 
     print('Done adaptation, average training loss =', tot_loss / global_step)
 
@@ -1487,6 +1555,10 @@ def run(args):
                 adalora_relative_lambda=args.adalora_relative_lambda,
                 adalora_adaptive_min_budget=args.adalora_adaptive_min_budget,
                 adalora_adaptive_max_budget=args.adalora_adaptive_max_budget,
+                shapley_permutations=args.shapley_permutations,
+                shapley_truncate_fraction=args.shapley_truncate_fraction,
+                shapley_antithetic=args.shapley_antithetic,
+                shapley_seed=args.lora_seed,
                 eva_state=eva_state,
             )
 
@@ -1602,7 +1674,7 @@ if __name__ == '__main__':
     parser.add_argument('--model-path', action="store", dest='model_path', type=str, help='(Optional) The directory of model weights to be loaded for testing.')
     parser.add_argument(
         '--evaluation-tag',
-        choices=['best_ar', 'best_post_nbs', 'final_nbs'],
+        choices=['best_ar', 'best_post_nbs', 'final_nbs', 'final_shapley'],
         default=None,
         help='Optional checkpoint role appended to evaluation result filenames.',
     )
@@ -1753,9 +1825,8 @@ if __name__ == '__main__':
                         help='Optional JSON output for selector/speculative trace statistics.')
     parser.add_argument('--rank', action="store", dest='rank', help='the rank of low rank matrices', type=int, default=-1)
     parser.add_argument('--use-adalora', action='store_true', dest='use_adalora',
-                         help='(Optional) Use AdaLoRA (rank-adaptive LoRA) instead of plain LoRA. '
-                              'Only has an effect when --rank != -1. Uses gradient/spectral '
-                              'Nash rank allocation over physical slots sized to the largest configured max_rank.')
+                         help='Use AdaLoRA instead of plain LoRA when --rank != -1; '
+                              'the allocator is selected by --adalora-allocator.')
     parser.add_argument('--use-eva', action='store_true',
                         help='Initialize fixed LoRA ranks and lora_A directions from a precomputed EVA state. '
                              'Mutually exclusive with AdaLoRA and fixed --lora-rank-config.')
@@ -1806,8 +1877,22 @@ if __name__ == '__main__':
                         help='JSON file containing a fixed plain-LoRA rank_pattern dictionary.')
     parser.add_argument('--adalora-missing-grad-policy', choices=['zero', 'hold'], default='zero',
                         help='Sensitivity EMA behavior when a layer has no A/B gradient: decay with zero or hold.')
-    parser.add_argument('--adalora-allocator', choices=['nbs', 'peft'], default='nbs',
-                        help='Use the proposed NBS allocator or stock PEFT AdaLoRA allocator.')
+    parser.add_argument('--adalora-allocator', choices=['nbs', 'peft', 'shapley'], default='nbs',
+                        help='Use the proposed NBS allocator, stock PEFT allocator, or '
+                             'the optional validation-loss Shapley comparison allocator.')
+    parser.add_argument('--shapley-permutations', type=int, default=3,
+                        help='Monte Carlo module permutations per Shapley allocation.')
+    parser.add_argument('--shapley-validation-batches', type=int, default=4,
+                        help='Fixed validation batches used for each coalition value.')
+    parser.add_argument('--shapley-truncate-fraction', type=float, default=0.05,
+                        help='Early truncation tolerance as a fraction of full-minus-empty value.')
+    parser.add_argument('--shapley-value-mode',
+                        choices=['autoregressive', 'teacher-forcing'],
+                        default='autoregressive',
+                        help='Validation forward used as the Shapley coalition value.')
+    parser.add_argument('--no-shapley-antithetic', action='store_false',
+                        dest='shapley_antithetic', default=True,
+                        help='Disable reversed-permutation antithetic sampling.')
     parser.add_argument(
         '--adalora-shadow-update-policy',
         choices=['legacy', 'active-only'],
@@ -1832,7 +1917,7 @@ if __name__ == '__main__':
                                  'nbs_v19_data2', 'nbs_budget256_seed1',
                                  'nbs_adaptive_tau015',
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
-                                 'eva'],
+                                 'adalora_shapley', 'eva'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
@@ -1869,6 +1954,27 @@ if __name__ == '__main__':
                 '--adalora-budget-mode adaptive requires '
                 '--adalora-shadow-update-policy active-only'
             )
+    if args.adalora_allocator == 'shapley':
+        if not args.use_adalora or args.rank == -1:
+            parser.error(
+                '--adalora-allocator shapley requires --use-adalora and --rank'
+            )
+        if any(value is not None for value in (
+                args.adalora_min_rank,
+                args.adalora_rank_budget,
+                args.adalora_rank_config,
+        )):
+            parser.error(
+                'Shapley uses --rank as PEFT target_r; do not pass NBS '
+                '--adalora-min-rank, --adalora-rank-budget, or '
+                '--adalora-rank-config options'
+            )
+    if args.shapley_permutations <= 0:
+        parser.error('--shapley-permutations must be positive')
+    if args.shapley_validation_batches <= 0:
+        parser.error('--shapley-validation-batches must be positive')
+    if not 0.0 <= args.shapley_truncate_fraction <= 1.0:
+        parser.error('--shapley-truncate-fraction must be in [0, 1]')
 
     # resolve the 3-way multimodal mode; --multimodal (legacy) maps to 'baseline' when
     # --multimodal-mode isn't explicitly given

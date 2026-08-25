@@ -23,9 +23,10 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_adaptive_tau015" && \
       "$VARIANT" != "uniform_r12" && "$VARIANT" != "uniform_b736" && \
       "$VARIANT" != "adalora_peft_r12" && \
+      "$VARIANT" != "shapley_v19" && \
       "$VARIANT" != "eva" && \
       "$VARIANT" != "plain" ]]; then
-  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|nbs_v21|nbs_v22|nbs_v23|nbs_v24|nbs_v25|nbs_v27|nbs_v28|nbs_v29|nbs_v19_data2|nbs_budget256_seed1|nbs_adaptive_tau015|uniform_r12|uniform_b736|adalora_peft_r12|eva|plain}"
+  echo "Usage: bash scripts/run_netllm_experiment.sh {nbs|nbs_v2|nbs_v3|nbs_v4|nbs_v5|nbs_v6|nbs_v7|nbs_v8|nbs_v9|nbs_v10|nbs_v11|nbs_v12|nbs_v12_repeat|nbs_v13|nbs_v14|nbs_v15|nbs_v16|nbs_v17|nbs_v18|nbs_v19|nbs_v20|nbs_v21|nbs_v22|nbs_v23|nbs_v24|nbs_v25|nbs_v27|nbs_v28|nbs_v29|nbs_v19_data2|nbs_budget256_seed1|nbs_adaptive_tau015|uniform_r12|uniform_b736|adalora_peft_r12|shapley_v19|eva|plain}"
   exit 2
 fi
 
@@ -644,6 +645,35 @@ elif [[ "$VARIANT" == "adalora_peft_r12" ]]; then
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
+elif [[ "$VARIANT" == "shapley_v19" ]]; then
+  use_v19_schedule
+  MODEL_TAG="llama_base_low_rank_adalora_shapley_v19"
+  ADALORA_ALLOCATOR_MODE="shapley"
+  DISPLAY_NAME="Shapley AdaLoRA (v19 conditions, target budget512, seed1)"
+  RANK=8
+  RANK_BUDGET=512
+  SEED=1
+  LORA_SEED=1
+  DATA_SEED=1
+  BEST_MODEL_NAME="best_ar_model"
+  SHAPLEY_PERMUTATIONS="${SHAPLEY_PERMUTATIONS:-3}"
+  SHAPLEY_VALIDATION_BATCHES="${SHAPLEY_VALIDATION_BATCHES:-4}"
+  SHAPLEY_TRUNCATE_FRACTION="${SHAPLEY_TRUNCATE_FRACTION:-0.05}"
+  SHAPLEY_VALUE_MODE="${SHAPLEY_VALUE_MODE:-autoregressive}"
+  EARLY_STOPPING_PATIENCE=2
+  EARLY_STOPPING_MIN_DELTA=0.0001
+  EXTRA_ARGS=(
+    --use-adalora
+    --adalora-allocator shapley
+    --adalora-allocation-interval "$ADALORA_ALLOCATION_INTERVAL"
+    --shapley-permutations "$SHAPLEY_PERMUTATIONS"
+    --shapley-validation-batches "$SHAPLEY_VALIDATION_BATCHES"
+    --shapley-truncate-fraction "$SHAPLEY_TRUNCATE_FRACTION"
+    --shapley-value-mode "$SHAPLEY_VALUE_MODE"
+    --experiment-tag adalora_shapley
+    --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+    --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+  )
 else
   MODEL_TAG="llama_base_low_rank"
   DISPLAY_NAME="NetLLM"
@@ -670,7 +700,11 @@ if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
 else
   BEST_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/$BEST_MODEL_NAME"
   BEST_POST_NBS_MODEL=""
-  FINAL_NBS_MODEL=""
+  if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
+    FINAL_NBS_MODEL="$MODEL_ROOT/$TRAIN_PREFIX/final_shapley_model"
+  else
+    FINAL_NBS_MODEL=""
+  fi
 fi
 RESULT_ROOT="viewport_prediction/data/results/$MODEL_TAG/freeze_plm_False/multimodal_${MULTIMODAL_MODE}/Jin2022/5Hz/$RUN_ID"
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
@@ -794,6 +828,12 @@ if [[ "$VARIANT" == "eva" ]]; then
     exit "$code"
   fi
 fi
+if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
+  printf 'shapley_permutations=%s\nshapley_validation_batches=%s\nshapley_truncate_fraction=%s\nshapley_value_mode=%s\ntarget_rank_budget=%s\n' \
+    "$SHAPLEY_PERMUTATIONS" "$SHAPLEY_VALIDATION_BATCHES" \
+    "$SHAPLEY_TRUNCATE_FRACTION" "$SHAPLEY_VALUE_MODE" "$RANK_BUDGET" \
+    >> "$RUN_DIR/metadata.env"
+fi
 write_status "training" "running" 0
 printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$SEED" "$LORA_SEED" "$DATA_SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
@@ -868,6 +908,9 @@ fi
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   CHECKPOINT_ROLES=(best_ar best_post_nbs final_nbs)
   CHECKPOINT_PATHS=("$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL")
+elif [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
+  CHECKPOINT_ROLES=(best final_shapley)
+  CHECKPOINT_PATHS=("$BEST_MODEL" "$FINAL_NBS_MODEL")
 else
   CHECKPOINT_ROLES=(best)
   CHECKPOINT_PATHS=("$BEST_MODEL")

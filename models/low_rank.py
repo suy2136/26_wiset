@@ -141,7 +141,12 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_budget_mode="fixed",
                 adalora_relative_lambda=0.15,
                 adalora_adaptive_min_budget=None,
-                adalora_adaptive_max_budget=None, eva_state=None):
+                adalora_adaptive_max_budget=None,
+                shapley_permutations=3,
+                shapley_truncate_fraction=0.05,
+                shapley_antithetic=True,
+                shapley_seed=0,
+                eva_state=None):
     """
     :param use_adalora: if True, wrap with AdaLoraConfig instead of plain LoraConfig.
         Uses the largest configured layer max_rank as the physical init_r
@@ -153,8 +158,18 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         update steps (post grad-accumulation) over the whole run, used to derive
         the rank-pruning warmup/cooldown schedule.
     """
-    if adalora_allocator not in ("nbs", "peft"):
-        raise ValueError("adalora_allocator must be 'nbs' or 'peft'")
+    if adalora_allocator not in ("nbs", "peft", "shapley"):
+        raise ValueError("adalora_allocator must be 'nbs', 'peft', or 'shapley'")
+    if adalora_allocator == "shapley" and not use_adalora:
+        raise ValueError("the Shapley allocator requires use_adalora=True")
+    if adalora_allocator == "shapley" and any(
+        value is not None
+        for value in (adalora_min_rank, adalora_rank_budget, adalora_rank_config)
+    ):
+        raise ValueError(
+            "Shapley uses PEFT's target_r budget schedule; NBS min-rank, "
+            "rank-budget, and layer-rank-config options are not supported"
+        )
     if adalora_budget_mode not in ("fixed", "adaptive"):
         raise ValueError("adalora_budget_mode must be 'fixed' or 'adaptive'")
     if adalora_allocator != "nbs" and adalora_budget_mode != "fixed":
@@ -295,6 +310,40 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                     cooldown_start,
                     total_step,
                     adalora_allocation_interval,
+                )
+            )
+        elif adalora_allocator == "shapley":
+            # Lazy import keeps every historical LoRA/AdaLoRA/NBS path
+            # independent from the optional comparison allocator.
+            from models.shapley_allocator import ShapleyRankAllocator
+
+            adalora_model = model.base_model
+            adapter_name = adalora_model.trainable_adapter_name
+            shapley_allocator = ShapleyRankAllocator(
+                adalora_model.model,
+                adalora_model.peft_config[adapter_name],
+                adapter_name,
+                n_permutations=shapley_permutations,
+                truncate_fraction=shapley_truncate_fraction,
+                seed=shapley_seed,
+                antithetic=shapley_antithetic,
+            )
+            adalora_model.rankallocator = shapley_allocator
+            model.shapley_rank_allocator = shapley_allocator
+            print(
+                "Shapley AdaLoRA allocator: permutations={}, "
+                "truncate_fraction={}, antithetic={}, seed={}".format(
+                    shapley_permutations,
+                    shapley_truncate_fraction,
+                    shapley_antithetic,
+                    shapley_seed,
+                )
+            )
+            print(
+                "PEFT AdaLoRA rank schedule: init_r={}, target_r={}, tinit={}, "
+                "tfinal={}, deltaT={}, total_step={}".format(
+                    physical_rank, rank, tinit, tfinal,
+                    adalora_allocation_interval, total_step,
                 )
             )
         else:
