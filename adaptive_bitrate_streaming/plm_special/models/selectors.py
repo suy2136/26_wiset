@@ -14,6 +14,10 @@ import torch
 import torch.nn as nn
 
 from plm_special.models.selection_layout import recent_timestep_window
+from plm_special.models.event_selection import (
+    ABREventConfig,
+    select_event_timesteps,
+)
 
 
 @dataclass
@@ -166,5 +170,123 @@ class RecentTimestepSelector(BaseSelector):
                 "preserves_timestep_blocks": True,
                 "preserves_order": True,
                 "context": context,
+            },
+        )
+
+
+class EventAwareTemporalSelector(BaseSelector):
+    """Keep the latest history block and the top-K scored ABR events.
+
+    Nearby events are de-duplicated, complete timestep blocks are retained,
+    and the final token order remains chronological. Raw history is supplied
+    through the policy context and is never embedded solely for scoring.
+    """
+
+    requires_raw_history = True
+
+    def __init__(
+        self,
+        max_events=3,
+        min_event_spacing=2,
+        throughput_change_threshold=0.60,
+        low_buffer_seconds=6.0,
+        bitrate_jump_threshold=1,
+        tokens_per_history_step=8,
+        current_step_tokens=7,
+    ):
+        super().__init__()
+        self.config = ABREventConfig(
+            max_events=max_events,
+            min_event_spacing=min_event_spacing,
+            throughput_change_threshold=throughput_change_threshold,
+            low_buffer_seconds=low_buffer_seconds,
+            bitrate_jump_threshold=bitrate_jump_threshold,
+        )
+        for name, value in (
+            ("tokens_per_history_step", tokens_per_history_step),
+            ("current_step_tokens", current_step_tokens),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        self.tokens_per_history_step = tokens_per_history_step
+        self.current_step_tokens = current_step_tokens
+
+    def forward(self, embeddings, attention_mask=None, context=None):
+        self.validate_inputs(embeddings, attention_mask)
+        if embeddings.shape[0] != 1:
+            raise ValueError(
+                "event-aware inference currently requires batch size 1"
+            )
+        context = {} if context is None else dict(context)
+        protected = context.get(
+            "protected_suffix_tokens", self.current_step_tokens
+        )
+        if (
+            isinstance(protected, bool)
+            or not isinstance(protected, int)
+            or protected <= 0
+        ):
+            raise ValueError("protected_suffix_tokens must be a positive integer")
+        history_states = context.get("history_states")
+        history_actions = context.get("history_actions")
+        if history_states is None or history_actions is None:
+            raise ValueError(
+                "event-aware selection requires history_states and "
+                "history_actions in context"
+            )
+
+        original_length = int(embeddings.shape[1])
+        history_tokens = original_length - protected
+        if history_tokens < 0 or history_tokens % self.tokens_per_history_step:
+            raise ValueError("event-aware input is not aligned to ABR blocks")
+        available_steps = history_tokens // self.tokens_per_history_step
+        if len(history_states) != available_steps:
+            raise ValueError(
+                "raw history length does not match embedded history blocks: "
+                f"raw={len(history_states)}, embedded={available_steps}"
+            )
+
+        selected = select_event_timesteps(
+            history_states, history_actions, self.config
+        )
+        token_indices = []
+        for step in selected["selected_steps"]:
+            start = step * self.tokens_per_history_step
+            token_indices.extend(
+                range(start, start + self.tokens_per_history_step)
+            )
+        token_indices.extend(range(history_tokens, original_length))
+        indices = torch.as_tensor(
+            token_indices, dtype=torch.long, device=embeddings.device
+        )
+        selected_mask = (
+            None if attention_mask is None
+            else attention_mask.index_select(1, indices)
+        )
+        event_scores = selected["event_scores"]
+        score_tensor = torch.as_tensor(
+            [item["score"] for item in event_scores],
+            dtype=torch.float32, device=embeddings.device,
+        )
+        return SelectionOutput(
+            embeddings=embeddings.index_select(1, indices),
+            attention_mask=selected_mask,
+            selected_indices=indices,
+            scores=score_tensor,
+            original_length=original_length,
+            selected_length=len(token_indices),
+            metadata={
+                "selector": type(self).__name__,
+                "available_history_steps": available_steps,
+                "selected_history_steps": selected["selected_steps"],
+                "latest_history_step": selected["latest_step"],
+                "event_scores": event_scores,
+                "max_events": self.config.max_events,
+                "min_event_spacing": self.config.min_event_spacing,
+                "preserves_timestep_blocks": True,
+                "preserves_latest_history_step": available_steps > 0,
+                "preserves_order": True,
+                "protected_suffix_tokens": protected,
+                "context_stage": context.get("stage"),
             },
         )

@@ -96,6 +96,8 @@ class OfflineRLPolicy(nn.Module):
         self.states_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
         self.returns_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
         self.actions_dq = deque([torch.zeros((1, 0, plm_embed_size), device=device)], maxlen=max_length)
+        self.raw_states_dq = deque(maxlen=max_length)
+        self.raw_actions_dq = deque(maxlen=max_length)
 
         self.residual = residual
         self.which_layer = which_layer
@@ -137,6 +139,16 @@ class OfflineRLPolicy(nn.Module):
         }
         self.last_selection_output = None
         self.last_selection_trace = {}
+        self.selector_stats = {
+            "selector_calls": 0,
+            "event_timesteps_selected": 0,
+            "latest_history_steps_preserved": 0,
+            "rebuffer_events_selected": 0,
+            "throughput_change_events_selected": 0,
+            "low_buffer_events_selected": 0,
+            "bitrate_switch_events_selected": 0,
+            "selected_timestep_counts": {},
+        }
         self.modules_except_plm = nn.ModuleList([  # used to save and load modules except plm
             self.state_encoder, self.embed_timestep, self.embed_return, self.embed_action, self.embed_ln, 
             self.embed_state1, self.embed_state2, self.embed_state3, self.embed_state4, self.embed_state5,
@@ -367,6 +379,42 @@ class OfflineRLPolicy(nn.Module):
             previous_blocks.append(block)
         return torch.cat(previous_blocks, dim=1)
 
+    def _selector_context(self, context_start, **values):
+        context = dict(values)
+        if not getattr(self.token_selector, "requires_raw_history", False):
+            return context
+        if context_start % ABR_HISTORY_BLOCK_TOKENS != 0:
+            raise ValueError("context truncation split a raw ABR history block")
+        dropped_steps = context_start // ABR_HISTORY_BLOCK_TOKENS
+        context.update({
+            "history_states": list(self.raw_states_dq)[dropped_steps:],
+            "history_actions": list(self.raw_actions_dq)[dropped_steps:],
+        })
+        return context
+
+    def _record_selection(self, selection):
+        self.selector_stats["selector_calls"] += 1
+        metadata = selection.metadata
+        if metadata.get("preserves_latest_history_step"):
+            self.selector_stats["latest_history_steps_preserved"] += 1
+        event_scores = metadata.get("event_scores", [])
+        self.selector_stats["event_timesteps_selected"] += len(event_scores)
+        timestep_counts = self.selector_stats["selected_timestep_counts"]
+        for timestep in metadata.get("selected_history_steps", []):
+            key = str(timestep)
+            timestep_counts[key] = timestep_counts.get(key, 0) + 1
+        reason_fields = {
+            "rebuffer": "rebuffer_events_selected",
+            "throughput_change": "throughput_change_events_selected",
+            "low_buffer": "low_buffer_events_selected",
+            "bitrate_switch": "bitrate_switch_events_selected",
+        }
+        for event in event_scores:
+            for reason in event.get("reasons", {}):
+                field = reason_fields.get(reason)
+                if field is not None:
+                    self.selector_stats[field] += 1
+
     def _build_current_step_embeddings(self, state, target_return, timestep):
         """Build the protected ``[return, six states]`` current ABR block."""
         target_return = torch.as_tensor(
@@ -443,14 +491,15 @@ class OfflineRLPolicy(nn.Module):
             selection = self.token_selector(
                 stacked_inputs_ln,
                 attention_mask,
-                context={
-                    "task": "adaptive_bitrate_streaming",
-                    "stage": "online_action_selection",
-                    "tokens_per_history_step": ABR_HISTORY_BLOCK_TOKENS,
-                    "current_step_tokens": ABR_CURRENT_BLOCK_TOKENS,
-                    "draft_tokens": int(draft_blocks.shape[1]),
-                    "protected_suffix_tokens": int(protected_suffix.shape[1]),
-                },
+                context=self._selector_context(
+                    context_start,
+                    task="adaptive_bitrate_streaming",
+                    stage="online_action_selection",
+                    tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
+                    current_step_tokens=ABR_CURRENT_BLOCK_TOKENS,
+                    draft_tokens=int(draft_blocks.shape[1]),
+                    protected_suffix_tokens=int(protected_suffix.shape[1]),
+                ),
             )
             stacked_inputs_ln = selection.embeddings
             attention_mask = selection.attention_mask
@@ -461,6 +510,7 @@ class OfflineRLPolicy(nn.Module):
                     device=stacked_inputs_ln.device,
                 )
             self.last_selection_output = selection
+            self._record_selection(selection)
 
         self.last_selection_trace = {
             "target_model_called": True,
@@ -541,17 +591,19 @@ class OfflineRLPolicy(nn.Module):
             selection = self.token_selector(
                 stacked_inputs_ln,
                 attention_mask,
-                context={
-                    "task": "adaptive_bitrate_streaming",
-                    "stage": "mpc_speculative_verification",
-                    "tokens_per_history_step": ABR_HISTORY_BLOCK_TOKENS,
-                    "protected_suffix_tokens": draft_tokens,
-                    "draft_tokens": draft_tokens,
-                },
+                context=self._selector_context(
+                    context_start,
+                    task="adaptive_bitrate_streaming",
+                    stage="mpc_speculative_verification",
+                    tokens_per_history_step=ABR_HISTORY_BLOCK_TOKENS,
+                    protected_suffix_tokens=draft_tokens,
+                    draft_tokens=draft_tokens,
+                ),
             )
             stacked_inputs_ln = selection.embeddings
             attention_mask = selection.attention_mask
             self.last_selection_output = selection
+            self._record_selection(selection)
 
         self.last_selection_trace = {
             "target_model_called": True,
@@ -644,11 +696,13 @@ class OfflineRLPolicy(nn.Module):
             self._build_current_step_embeddings(state, target_return, timestep)
         )
         self._append_embedded_action(
-            return_embeddings, state_embeddings, time_embeddings, bitrate
+            return_embeddings, state_embeddings, time_embeddings, bitrate,
+            raw_state=state,
         )
 
     def _append_embedded_action(
-        self, return_embeddings, state_embeddings, time_embeddings, bitrate
+        self, return_embeddings, state_embeddings, time_embeddings, bitrate,
+        raw_state=None,
     ):
         action_tensor = torch.zeros(
             1, 1, 1, dtype=torch.float32, device=self.device
@@ -658,6 +712,16 @@ class OfflineRLPolicy(nn.Module):
         self.returns_dq.append(return_embeddings)
         self.states_dq.append(state_embeddings)
         self.actions_dq.append(action_embeddings)
+        if raw_state is not None:
+            raw = torch.as_tensor(raw_state).detach().cpu()
+            while raw.ndim > 2:
+                raw = raw[0]
+            if tuple(raw.shape) != (6, 6):
+                raise ValueError(
+                    f"raw ABR state must reduce to [6,6], got {tuple(raw.shape)}"
+                )
+            self.raw_states_dq.append(raw.clone())
+            self.raw_actions_dq.append(int(bitrate))
 
     def _fallback_sample(self, state, target_return, timestep):
         self.speculative_stats["fallback_calls"] += 1
@@ -768,6 +832,13 @@ class OfflineRLPolicy(nn.Module):
         metrics["pending_actions"] = len(self._speculative_queue)
         return metrics
 
+    def get_selector_metrics(self):
+        metrics = dict(self.selector_stats)
+        metrics["selected_timestep_counts"] = dict(
+            self.selector_stats["selected_timestep_counts"]
+        )
+        return metrics
+
     def sample(self, state, target_return, timestep, **kwargs):
         """
         Sample action function, used for evaluation/testing.
@@ -789,7 +860,8 @@ class OfflineRLPolicy(nn.Module):
         bitrate, _ = self._sample(action_pred)
 
         self._append_embedded_action(
-            return_embeddings, state_embeddings, time_embeddings, bitrate
+            return_embeddings, state_embeddings, time_embeddings, bitrate,
+            raw_state=state,
         )
 
         return bitrate
@@ -798,6 +870,8 @@ class OfflineRLPolicy(nn.Module):
         self.states_dq.clear()
         self.actions_dq.clear()
         self.returns_dq.clear()
+        self.raw_states_dq.clear()
+        self.raw_actions_dq.clear()
         
         self.states_dq.append(torch.zeros((1, 0, self.plm_embed_size), device=self.device))
         self.actions_dq.append(torch.zeros((1, 0, self.plm_embed_size), device=self.device))

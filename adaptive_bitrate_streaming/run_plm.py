@@ -21,7 +21,10 @@ from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
 from plm_special.data.dataset import ExperienceDataset
 from plm_special.models.rl_policy import OfflineRLPolicy
-from plm_special.models.selectors import RecentTimestepSelector
+from plm_special.models.selectors import (
+    EventAwareTemporalSelector,
+    RecentTimestepSelector,
+)
 from plm_special.models.state_encoder import EncoderNetwork
 from plm_special.models.low_rank import peft_model
 from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
@@ -271,6 +274,16 @@ def run(args):
     assert args.video in cfg.video_size_dirs.keys()
     if args.selector_history_steps <= 0:
         raise ValueError('--selector-history-steps must be positive')
+    if args.event_max_events < 0:
+        raise ValueError('--event-max-events must be non-negative')
+    if args.event_min_spacing <= 0:
+        raise ValueError('--event-min-spacing must be positive')
+    if args.event_throughput_threshold <= 0:
+        raise ValueError('--event-throughput-threshold must be positive')
+    if args.event_buffer_threshold <= 0:
+        raise ValueError('--event-buffer-threshold must be positive')
+    if args.event_bitrate_jump_threshold <= 0:
+        raise ValueError('--event-bitrate-jump-threshold must be positive')
     if not 0 <= args.speculative_draft_steps <= 5:
         raise ValueError('--speculative-draft-steps must be between 0 and 5')
     if args.speculative_buffer_tolerance < 0:
@@ -387,6 +400,14 @@ def run(args):
     token_selector = None
     if args.token_selector == 'recent-timestep':
         token_selector = RecentTimestepSelector(args.selector_history_steps)
+    elif args.token_selector == 'event-aware':
+        token_selector = EventAwareTemporalSelector(
+            max_events=args.event_max_events,
+            min_event_spacing=args.event_min_spacing,
+            throughput_change_threshold=args.event_throughput_threshold,
+            low_buffer_seconds=args.event_buffer_threshold,
+            bitrate_jump_threshold=args.event_bitrate_jump_threshold,
+        )
     draft_generator = None
     if args.speculative_draft_steps > 0:
         draft_generator = RobustMPCDraftGenerator.from_video_size_dir(
@@ -411,10 +432,18 @@ def run(args):
     )
     models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
-    selector_tag = (
-        'selector_none' if args.token_selector == 'none'
-        else f'selector_recent_timestep_h{args.selector_history_steps}'
-    )
+    if args.token_selector == 'none':
+        selector_tag = 'selector_none'
+    elif args.token_selector == 'recent-timestep':
+        selector_tag = f'selector_recent_timestep_h{args.selector_history_steps}'
+    else:
+        selector_tag = (
+            f'selector_event_aware_k{args.event_max_events}'
+            f'_spacing{args.event_min_spacing}'
+            f'_tp{args.event_throughput_threshold:g}'
+            f'_buf{args.event_buffer_threshold:g}'
+            f'_br{args.event_bitrate_jump_threshold}'
+        )
     speculative_tag = (
         'speculative_none' if args.speculative_draft_steps == 0
         else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
@@ -523,10 +552,20 @@ if __name__ == '__main__':
     parser.add_argument('--initial-best-return', type=float, default=float('-inf'))
     parser.add_argument('--target-return-scale', type=float, help='target return, which specifies the expected performance for the model to achieve', default=1.)
     parser.add_argument('--which-layer', type=int, help='for early stopping (not used in our experiments): specify which layer to stop (layer index starts from 0)', default=-1)
-    parser.add_argument('--token-selector', choices=('none', 'recent-timestep'), default='none',
+    parser.add_argument('--token-selector', choices=('none', 'recent-timestep', 'event-aware'), default='none',
                         help='inference-time token selection policy')
     parser.add_argument('--selector-history-steps', type=int, default=20,
                         help='number of complete real-history timesteps retained by recent-timestep')
+    parser.add_argument('--event-max-events', type=int, default=3,
+                        help='maximum older events retained by event-aware selector')
+    parser.add_argument('--event-min-spacing', type=int, default=2,
+                        help='minimum timestep distance between retained events')
+    parser.add_argument('--event-throughput-threshold', type=float, default=0.60,
+                        help='relative throughput change that triggers an event')
+    parser.add_argument('--event-buffer-threshold', type=float, default=6.0,
+                        help='buffer seconds at or below which an event is triggered')
+    parser.add_argument('--event-bitrate-jump-threshold', type=int, default=1,
+                        help='minimum bitrate-index jump that triggers an event')
     parser.add_argument('--speculative-draft-steps', type=int, default=0,
                         help='MPC draft horizon; 0 disables speculative draft generation')
     parser.add_argument('--speculative-verification-mode', choices=('greedy', 'sample'), default='sample',

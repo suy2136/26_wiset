@@ -2,6 +2,8 @@ import os
 import sys
 import unittest
 
+import numpy as np
+
 
 ABR_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ABR_ROOT not in sys.path:
@@ -17,7 +19,12 @@ except ImportError:
 class SelectorTensorContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from plm_special.models.selectors import IdentitySelector, RecentTimestepSelector
+        from plm_special.models.selectors import (
+            EventAwareTemporalSelector,
+            IdentitySelector,
+            RecentTimestepSelector,
+        )
+        cls.EventAwareTemporalSelector = EventAwareTemporalSelector
         cls.IdentitySelector = IdentitySelector
         cls.RecentTimestepSelector = RecentTimestepSelector
 
@@ -38,6 +45,56 @@ class SelectorTensorContractTest(unittest.TestCase):
         self.assertEqual(output.selected_length, 103)
         self.assertTrue(torch.equal(output.embeddings[:, -23:], embeddings[:, -23:]))
         self.assertEqual(output.metadata['protected_suffix_tokens'], 23)
+
+    def test_event_selector_keeps_complete_chronological_blocks_and_suffix(self):
+        def state(buffer=10.0, throughput=1.0, download=1.0):
+            value = torch.zeros((6, 6), dtype=torch.float32)
+            value[1, -1] = buffer / 10.0
+            value[2, -1] = throughput
+            value[3, -1] = download / 10.0
+            return value
+
+        embeddings = torch.arange(39, dtype=torch.float32).reshape(1, 39, 1)
+        states = [
+            state(),
+            state(buffer=5.0, throughput=2.0),
+            state(buffer=10.0, throughput=2.0),
+            state(buffer=10.0, throughput=2.0),
+        ]
+        output = self.EventAwareTemporalSelector(max_events=1)(
+            embeddings,
+            context={
+                'history_states': states,
+                'history_actions': [0, 1, 1, 1],
+                'protected_suffix_tokens': 7,
+            },
+        )
+        expected = torch.as_tensor([*range(8, 16), *range(24, 39)])
+        self.assertTrue(torch.equal(output.selected_indices.cpu(), expected))
+        self.assertEqual(output.metadata['selected_history_steps'], [1, 3])
+        self.assertTrue(output.metadata['preserves_timestep_blocks'])
+        self.assertTrue(output.metadata['preserves_order'])
+
+        class Recorder:
+            selector_stats = {
+                'selector_calls': 0,
+                'event_timesteps_selected': 0,
+                'latest_history_steps_preserved': 0,
+                'rebuffer_events_selected': 0,
+                'throughput_change_events_selected': 0,
+                'low_buffer_events_selected': 0,
+                'bitrate_switch_events_selected': 0,
+                'selected_timestep_counts': {},
+            }
+
+        from plm_special.models.rl_policy import OfflineRLPolicy
+        recorder = Recorder()
+        OfflineRLPolicy._record_selection(recorder, output)
+        self.assertEqual(recorder.selector_stats['selector_calls'], 1)
+        self.assertEqual(
+            recorder.selector_stats['selected_timestep_counts'],
+            {'1': 1, '3': 1},
+        )
 
 
 @unittest.skipIf(torch is None, 'PyTorch is not installed in this environment')

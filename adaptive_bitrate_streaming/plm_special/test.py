@@ -169,6 +169,17 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
     test_log.update({
         'selector': getattr(args, 'token_selector', 'none'),
         'selector_history_steps': getattr(args, 'selector_history_steps', None),
+        'event_max_events': getattr(args, 'event_max_events', None),
+        'event_min_spacing': getattr(args, 'event_min_spacing', None),
+        'event_throughput_threshold': getattr(
+            args, 'event_throughput_threshold', None
+        ),
+        'event_buffer_threshold': getattr(
+            args, 'event_buffer_threshold', None
+        ),
+        'event_bitrate_jump_threshold': getattr(
+            args, 'event_bitrate_jump_threshold', None
+        ),
         'inference_calls': len(inference_latencies_ms),
         'inference_latency_mean_ms': float(np.mean(inference_latencies_ms)),
         'inference_latency_p50_ms': float(np.percentile(inference_latencies_ms, 50)),
@@ -180,6 +191,13 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             else 1.0 - total_selected_tokens / total_original_tokens
         ),
     })
+    selector_metrics = model.get_selector_metrics()
+    selector_calls = selector_metrics['selector_calls']
+    selector_metrics['event_timesteps_selected_mean'] = (
+        0.0 if selector_calls == 0
+        else selector_metrics['event_timesteps_selected'] / selector_calls
+    )
+    test_log.update(selector_metrics)
     speculative_metrics = model.get_speculative_metrics()
     target_plm_calls = speculative_metrics['target_plm_calls']
     test_log.update({
