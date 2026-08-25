@@ -20,6 +20,17 @@ ABR_HISTORY_BLOCK_TOKENS = 2 + ABR_STATE_TOKEN_COUNT
 ABR_CURRENT_BLOCK_TOKENS = 1 + ABR_STATE_TOKEN_COUNT
 
 
+class NonFiniteInferenceError(FloatingPointError):
+    """A non-finite tensor reached the ABR inference decision path."""
+
+    def __init__(self, details):
+        self.details = dict(details)
+        super().__init__(
+            f'non-finite ABR inference tensor at {details.get("stage")}: '
+            f'{details}'
+        )
+
+
 class OfflineRLPolicy(nn.Module):
     def __init__(
             self,
@@ -78,6 +89,7 @@ class OfflineRLPolicy(nn.Module):
         self.action_head = nn.Linear(plm_embed_size, bitrate_levels).to(device)  # the so-called networking head in our paper
 
         self.device = device
+        self.last_nonfinite_inference = None
         self.device_out = device_out
 
         # the following are used for evaluation
@@ -179,23 +191,95 @@ class OfflineRLPolicy(nn.Module):
             return weight.dtype
         raise RuntimeError("could not determine PLM input dtype")
 
+    def _adalora_overflow_candidates(self):
+        candidates = []
+        for name, module in self.plm.named_modules():
+            if not hasattr(module, '_nbs_last_precast_finite'):
+                continue
+            output_dtype = getattr(module, '_nbs_output_dtype', None)
+            dtype_limit = (
+                float(torch.finfo(output_dtype).max)
+                if output_dtype is not None and output_dtype.is_floating_point
+                else None
+            )
+            precast_absmax = getattr(module, '_nbs_last_precast_absmax', None)
+            delta_absmax = getattr(module, '_nbs_last_delta_absmax', None)
+            precast_finite = bool(
+                module._nbs_last_precast_finite.detach().item()
+            )
+            delta_finite = bool(
+                module._nbs_last_delta_finite.detach().item()
+            )
+            exceeds_range = bool(
+                dtype_limit is not None
+                and precast_absmax is not None
+                and float(precast_absmax.detach().item()) > dtype_limit
+            )
+            if precast_finite and delta_finite and not exceeds_range:
+                continue
+            candidates.append({
+                'module': getattr(module, '_nbs_module_name', name),
+                'output_dtype': str(output_dtype),
+                'dtype_limit': dtype_limit,
+                'precast_absmax': (
+                    None if precast_absmax is None
+                    else float(precast_absmax.detach().item())
+                ),
+                'delta_absmax': (
+                    None if delta_absmax is None
+                    else float(delta_absmax.detach().item())
+                ),
+                'precast_finite': precast_finite,
+                'delta_finite': delta_finite,
+            })
+        return candidates
+
+    def _require_finite(self, tensor, stage):
+        detached = tensor.detach()
+        finite_mask = torch.isfinite(detached)
+        if bool(finite_mask.all().item()):
+            return tensor
+        finite_values = detached[finite_mask]
+        details = {
+            'stage': stage,
+            'dtype': str(detached.dtype),
+            'shape': list(detached.shape),
+            'finite_elements': int(finite_mask.sum().item()),
+            'total_elements': int(detached.numel()),
+            'finite_absmax': (
+                float(finite_values.float().abs().max().item())
+                if finite_values.numel() else None
+            ),
+            'adalora_overflow_candidates': self._adalora_overflow_candidates(),
+        }
+        self.last_nonfinite_inference = details
+        raise NonFiniteInferenceError(details)
+
     def _run_plm(self, inputs_embeds, attention_mask):
         """Bridge FP32 ABR embeddings to the PLM dtype for every call path."""
         plm_inputs = inputs_embeds.to(self._plm_compute_dtype())
+        self._require_finite(plm_inputs, 'plm_inputs')
         outputs = self.plm(
             inputs_embeds=plm_inputs,
             attention_mask=attention_mask,
             output_hidden_states=True,
             stop_layer_idx=self.which_layer,
         )
-        hidden = outputs['last_hidden_state']
+        # The task-head boundary is inexpensive to keep in FP32 and avoids a
+        # final FP16 residual addition overflowing otherwise-finite PLM output.
+        hidden = outputs['last_hidden_state'].float()
+        self._require_finite(hidden, 'plm_hidden')
         if self.residual:
-            hidden = hidden + plm_inputs
+            hidden = hidden + plm_inputs.float()
+            self._require_finite(hidden, 'plm_hidden_after_residual')
         return hidden
 
     def _run_action_head(self, hidden):
         """Bridge PLM outputs back to the FP32 ABR task head."""
-        return self.action_head(hidden.to(self.action_head.weight.dtype))
+        action_logits = self.action_head(
+            hidden.to(self.action_head.weight.dtype)
+        )
+        return self._require_finite(action_logits, 'action_logits')
 
     def forward(self, states, actions, returns, timesteps, attention_mask=None):
         """
@@ -723,7 +807,25 @@ class OfflineRLPolicy(nn.Module):
             self.draft_generator.reset()
 
     def _sample(self, logits):
-        pi = F.softmax(logits, 0).cpu().numpy()
+        logits = self._require_finite(logits.float(), 'sampling_logits')
+        pi_tensor = F.softmax(logits, dim=0)
+        pi_tensor = self._require_finite(
+            pi_tensor, 'sampling_probabilities'
+        )
+        probability_sum = float(pi_tensor.sum().item())
+        if probability_sum <= 0.0:
+            details = {
+                'stage': 'sampling_probability_sum',
+                'dtype': str(pi_tensor.dtype),
+                'shape': list(pi_tensor.shape),
+                'probability_sum': probability_sum,
+                'adalora_overflow_candidates': (
+                    self._adalora_overflow_candidates()
+                ),
+            }
+            self.last_nonfinite_inference = details
+            raise NonFiniteInferenceError(details)
+        pi = (pi_tensor / probability_sum).detach().cpu().double().numpy()
         idx = random.choices(np.arange(pi.size), pi)[0]
-        lgprob = np.log(pi[idx])
+        lgprob = np.log(max(pi[idx], np.finfo(np.float64).tiny))
         return idx, lgprob

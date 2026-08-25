@@ -213,6 +213,12 @@ events before the next successful update abort training instead of producing
 a corrupted checkpoint; the threshold can be changed with
 `--nbs-max-consecutive-nonfinite`.
 
+ABR inference also checks PLM inputs, hidden states, task-head logits, and
+sampling probabilities for finite values. The PLM/task-head residual boundary
+is accumulated in FP32. A non-finite validation is logged with its trace,
+timestep, tensor range, and candidate overflowing AdaLoRA modules; it is marked
+invalid, cannot replace the best checkpoint, and does not terminate training.
+
 ## Run baselines
 
 To run baselines, please run:

@@ -161,6 +161,19 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         if epoch % args.eval_per_epoch == 0:
             eval_logs = evaluate_on_env(args, env_settings=eval_env_settings, model=model, target_return=target_return, max_ep_num=args.trace_num,
                                         process_reward_fn=eval_process_reward_fn)
+            if not eval_logs.get('evaluation_valid', True):
+                trainer.record_invalid_validation(
+                    epoch=epoch,
+                    trace_index=eval_logs.get('nonfinite_trace_index'),
+                    trace_name=eval_logs.get('nonfinite_trace_name'),
+                    timestep=eval_logs.get('nonfinite_timestep'),
+                    error=eval_logs.get('nonfinite_error'),
+                    inference_details=eval_logs.get('nonfinite_details'),
+                )
+                eval_logs['best_return'] = best_eval_return
+                print('>' * 10, 'Invalid Evaluation (best model unchanged)')
+                pprint(eval_logs)
+                continue
             episodes_return = eval_logs['episodes_return']
             if best_eval_return < episodes_return:
                 best_eval_return = episodes_return

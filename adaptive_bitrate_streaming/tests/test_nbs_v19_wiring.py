@@ -116,6 +116,37 @@ class NBSV19WiringTest(unittest.TestCase):
         ):
             self.assertIn(field, source)
 
+    def test_inference_nonfinite_is_guarded_before_probability_sampling(self):
+        policy_source = (
+            ABR_ROOT / 'plm_special' / 'models' / 'rl_policy.py'
+        ).read_text(encoding='utf-8')
+        sample_start = policy_source.index('    def _sample(self, logits):')
+        sample_block = policy_source[sample_start:]
+        self.assertLess(
+            sample_block.index("_require_finite(logits.float()"),
+            sample_block.index('F.softmax'),
+        )
+        self.assertLess(
+            sample_block.index("'sampling_probabilities'"),
+            sample_block.index('random.choices'),
+        )
+        self.assertIn("outputs['last_hidden_state'].float()", policy_source)
+        self.assertIn('hidden + plm_inputs.float()', policy_source)
+
+    def test_invalid_validation_cannot_replace_best_checkpoint(self):
+        run_source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')
+        start = run_source.index("if not eval_logs.get('evaluation_valid', True)")
+        end = run_source.index("episodes_return = eval_logs['episodes_return']", start)
+        invalid_block = run_source[start:end]
+        self.assertIn('record_invalid_validation', invalid_block)
+        self.assertIn('continue', invalid_block)
+        self.assertNotIn('save_model(', invalid_block)
+        evaluate_source = (
+            ABR_ROOT / 'plm_special' / 'evaluate.py'
+        ).read_text(encoding='utf-8')
+        self.assertIn("'evaluation_valid': False", evaluate_source)
+        self.assertIn("'nonfinite_timestep': int(timestep)", evaluate_source)
+
 
 if __name__ == '__main__':
     unittest.main()

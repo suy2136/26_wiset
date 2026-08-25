@@ -31,6 +31,7 @@ class Trainer:
         self.nbs_numeric_log_path = nbs_numeric_log_path
         self.skipped_nonfinite_updates = 0
         self.consecutive_nonfinite = 0
+        self.invalid_nonfinite_validations = 0
         self.max_consecutive_nonfinite = getattr(
             args, 'nbs_max_consecutive_nonfinite', 3
         )
@@ -80,6 +81,14 @@ class Trainer:
                 f'{event} repeated {self.consecutive_nonfinite} times; '
                 f'see {self.nbs_numeric_log_path}'
             )
+
+    def record_invalid_validation(self, **details):
+        self.invalid_nonfinite_validations += 1
+        self._record_numeric_event(
+            'validation_nonfinite',
+            invalid_nonfinite_validations=self.invalid_nonfinite_validations,
+            **details,
+        )
 
     def _adalora_delta_issues(self):
         monitored = []
@@ -454,6 +463,9 @@ class Trainer:
         logs['training/train_loss_mean'] = np.mean(train_losses)
         logs['training/train_loss_std'] = np.std(train_losses)
         logs['training/skipped_nonfinite_updates'] = self.skipped_nonfinite_updates
+        logs['training/invalid_nonfinite_validations'] = (
+            self.invalid_nonfinite_validations
+        )
 
         return logs, train_losses
 
