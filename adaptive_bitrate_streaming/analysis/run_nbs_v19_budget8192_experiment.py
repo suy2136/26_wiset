@@ -11,6 +11,8 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import math
+import re
 import shlex
 import subprocess
 import sys
@@ -18,6 +20,10 @@ import time
 
 
 ABR_ROOT = Path(__file__).resolve().parents[1]
+if str(ABR_ROOT) not in sys.path:
+    sys.path.insert(0, str(ABR_ROOT))
+from plm_special.utils.checkpoints import prepare_best_latest_retention
+
 MODEL_ROOT = ABR_ROOT / "data" / "ft_plms"
 RESULTS_ROOT = ABR_ROOT / "artifacts" / "results"
 DEFAULT_BASE_MODEL = ABR_ROOT.parent / "downloaded_plms" / "llama" / "base"
@@ -31,6 +37,41 @@ PHYSICAL_RANK = 256
 RANK_CONFIG = "configs/nbs_v19_rank_config_max256.json"
 
 
+def clean_previous_epoch_checkpoints():
+    """Migrate this experiment's old numeric saves and remove corrupt ones."""
+    marker = f"rank_{PHYSICAL_RANK}_nbs_v19_budget{RANK_BUDGET}_"
+    cleaned = []
+    for root in MODEL_ROOT.rglob("early_stop_-1_checkpoint"):
+        if marker not in str(root.parent):
+            continue
+        removed = prepare_best_latest_retention(root)
+        latest = root / "latest"
+        latest_epoch = None
+        if latest.is_dir():
+            metadata_path = latest / "checkpoint_metadata.json"
+            if metadata_path.is_file():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                match = re.fullmatch(r"epoch_(\d+)", metadata.get("role", ""))
+                if match:
+                    latest_epoch = int(match.group(1))
+        cleaned.append((root, removed, latest_epoch))
+    return cleaned
+
+
+def previous_best_return(checkpoint_root):
+    console_path = checkpoint_root.parent / "early_stop_-1_console.log"
+    if not console_path.is_file():
+        return float("-inf")
+    content = console_path.read_text(encoding="utf-8", errors="replace")
+    values = [
+        float(match.group(1)) for match in re.finditer(
+            r"'best_return':\s*([-+0-9.eE]+)", content
+        )
+    ]
+    finite = [value for value in values if math.isfinite(value)]
+    return max(finite, default=float("-inf"))
+
+
 def common_args(args):
     return [
         "--fp16", "--seed", "1", "--plm-type", "llama", "--plm-size", "base",
@@ -42,8 +83,8 @@ def common_args(args):
     ]
 
 
-def training_command(args):
-    return [
+def training_command(args, warm_start=None, start_epoch=0, best_return=None):
+    command = [
         sys.executable, "run_plm.py", "--adapt", "--nbs-v19",
         *common_args(args), "--rank", str(PHYSICAL_RANK),
         "--nbs-rank-budget", str(RANK_BUDGET),
@@ -53,7 +94,16 @@ def training_command(args):
         "--warmup-steps", str(args.warmup_steps),
         "--num-epochs", str(args.num_epochs),
         "--eval-per-epoch", str(args.eval_per_epoch),
+        "--save-checkpoint-per-epoch", "10",
+        "--checkpoint-retention", "best-latest",
     ]
+    if warm_start is not None:
+        command.extend([
+            "--warm-start-model-dir", str(warm_start.resolve()),
+            "--start-epoch", str(start_epoch),
+            "--initial-best-return", str(best_return),
+        ])
+    return command
 
 
 def nbs_test_command(args, checkpoint):
@@ -75,10 +125,10 @@ def official_test_command(args):
     ]
 
 
-def discover_checkpoint(started_at):
+def discover_checkpoint(started_at, allow_existing=False):
     candidates = []
     for path in MODEL_ROOT.rglob("checkpoint_metadata.json"):
-        if path.stat().st_mtime < started_at:
+        if not allow_existing and path.stat().st_mtime < started_at:
             continue
         try:
             metadata = json.loads(path.read_text(encoding="utf-8"))
@@ -207,6 +257,30 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    warm_start = None
+    start_epoch = 0
+    initial_best_return = float("-inf")
+    if args.checkpoint_dir is None and not args.dry_run:
+        for root, removed, latest_epoch in clean_previous_epoch_checkpoints():
+            print(f"[checkpoint-cleanup] retained latest under {root}", flush=True)
+            if removed:
+                print(
+                    "[checkpoint-cleanup] removed incomplete epochs: "
+                    + ", ".join(removed),
+                    flush=True,
+                )
+            if latest_epoch is not None and (
+                warm_start is None or latest_epoch + 1 > start_epoch
+            ):
+                warm_start = root / "latest"
+                start_epoch = latest_epoch + 1
+                initial_best_return = previous_best_return(root)
+        if warm_start is not None:
+            print(
+                f"[warm-start] {warm_start} -> epoch {start_epoch}; "
+                f"previous best return={initial_best_return}",
+                flush=True,
+            )
     if not args.dry_run:
         if not (args.base_model_dir / "config.json").is_file():
             raise FileNotFoundError(f"base model not found: {args.base_model_dir}")
@@ -217,14 +291,19 @@ def main(argv=None):
 
     checkpoint = args.checkpoint_dir
     if checkpoint is None:
-        command = training_command(args)
+        command = training_command(
+            args, warm_start=warm_start, start_epoch=start_epoch,
+            best_return=initial_best_return,
+        )
         print(f"[training] {shlex.join(command)}", flush=True)
         if args.dry_run:
             checkpoint = MODEL_ROOT / "NEW_BUDGET8192_BEST_MODEL"
         else:
             started_at = time.time() - 1.0
             subprocess.run(command, cwd=ABR_ROOT, check=True)
-            checkpoint = discover_checkpoint(started_at)
+            checkpoint = discover_checkpoint(
+                started_at, allow_existing=warm_start is not None
+            )
             print(f"[training] selected {checkpoint}", flush=True)
     if not args.dry_run:
         validate_checkpoint(checkpoint)

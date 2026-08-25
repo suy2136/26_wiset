@@ -28,6 +28,10 @@ from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
+from plm_special.utils.checkpoints import (
+    atomic_save_nbs_checkpoint,
+    prepare_best_latest_retention,
+)
 
 
 PLM_LAYER_SIZES = {
@@ -141,10 +145,58 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
     )
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
-    best_eval_return = float('-inf')
+    best_eval_return = args.initial_best_return
+
+    rotate_best_latest = (
+        args.nbs_v19 and args.checkpoint_retention == 'best-latest'
+    )
+    if rotate_best_latest:
+        removed = prepare_best_latest_retention(checkpoint_dir)
+        if removed:
+            print(
+                'Removed incomplete NBS epoch checkpoints:',
+                ', '.join(removed),
+            )
+
+    def save_training_checkpoint(path, role):
+        if rotate_best_latest:
+            atomic_save_nbs_checkpoint(
+                path,
+                lambda temporary: save_model(
+                    args, model, temporary, role=role
+                ),
+            )
+        else:
+            save_model(args, model, path, role=role)
+
+    if args.start_epoch > 0:
+        updates_per_epoch = max(
+            1, math.ceil(len(exp_dataset) / args.grad_accum_steps)
+        )
+        resumed_optimizer_step = args.start_epoch * updates_per_epoch
+        trainer.optimizer_step = resumed_optimizer_step
+        lr_factor = min(
+            (resumed_optimizer_step + 1) / args.warmup_steps, 1.0
+        )
+        resumed_lrs = []
+        for group, base_lr in zip(
+            optimizer.param_groups, lr_scheduler.base_lrs
+        ):
+            resumed_lr = base_lr * lr_factor
+            group['lr'] = resumed_lr
+            resumed_lrs.append(resumed_lr)
+        lr_scheduler.last_epoch = resumed_optimizer_step
+        lr_scheduler._last_lr = resumed_lrs
+        print(
+            'Warm-start schedule:',
+            f'epoch={args.start_epoch}',
+            f'optimizer_step={resumed_optimizer_step}',
+            f'lr={resumed_lrs[0]:.8g}',
+            '(optimizer moments were reinitialized)',
+        )
 
     total_train_losses = []
-    for epoch in range(args.num_epochs):
+    for epoch in range(args.start_epoch, args.num_epochs):
         train_logs, train_losses = trainer.train_epoch()
         total_train_losses.extend(train_losses)
         print('='* 20, f'Training Iteration #{epoch}', '=' * 20)
@@ -152,10 +204,15 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         pprint(train_logs)
 
         if epoch % args.save_checkpoint_per_epoch == 0:  # save checkpoint
-            checkpoint_dir_epoch = os.path.join(checkpoint_dir, str(epoch))
+            checkpoint_dir_epoch = os.path.join(
+                checkpoint_dir,
+                'latest' if rotate_best_latest else str(epoch),
+            )
             if not os.path.exists(checkpoint_dir_epoch):
                 os.makedirs(checkpoint_dir_epoch)
-            save_model(args, model, checkpoint_dir_epoch, role=f'epoch_{epoch}')
+            save_training_checkpoint(
+                checkpoint_dir_epoch, role=f'epoch_{epoch}'
+            )
             print('Checkpoint saved at:', checkpoint_dir_epoch)
 
         if epoch % args.eval_per_epoch == 0:
@@ -177,7 +234,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             episodes_return = eval_logs['episodes_return']
             if best_eval_return < episodes_return:
                 best_eval_return = episodes_return
-                save_model(args, model, best_model_dir, role='best')
+                save_training_checkpoint(best_model_dir, role='best')
                 print('Best model saved at:', best_model_dir)
 
             eval_logs['best_return'] = best_eval_return
@@ -187,8 +244,13 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
     train_losses_path = os.path.join(checkpoint_dir, 'train_losses.txt')
     np.savetxt(train_losses_path, total_train_losses, fmt='%.6f', delimiter='\n')
     trainer.snapshot_nbs(event='training_end')
-    save_model(args, model, final_model_dir, role='final')
-    print('Final model saved at:', final_model_dir)
+    if rotate_best_latest:
+        latest_model_dir = os.path.join(checkpoint_dir, 'latest')
+        save_training_checkpoint(latest_model_dir, role='final')
+        print('Final/latest model saved at:', latest_model_dir)
+    else:
+        save_model(args, model, final_model_dir, role='final')
+        print('Final model saved at:', final_model_dir)
 
 
 def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, test_process_reward_fn):
@@ -217,6 +279,10 @@ def run(args):
         raise ValueError('--speculative-state-tolerance must be non-negative')
     if args.speculative_return_tolerance < 0:
         raise ValueError('--speculative-return-tolerance must be non-negative')
+    if args.start_epoch < 0 or args.start_epoch >= args.num_epochs:
+        raise ValueError('--start-epoch must be in [0, --num-epochs)')
+    if args.start_epoch > 0 and args.warm_start_model_dir is None:
+        raise ValueError('--start-epoch requires --warm-start-model-dir')
     if args.nbs_v19:
         if args.plm_type != 'llama':
             raise ValueError('NBS v19 currently supports --plm-type llama only')
@@ -375,7 +441,17 @@ def run(args):
             os.makedirs(checkpoint_dir)
         if not os.path.exists(best_model_dir):
             os.makedirs(best_model_dir)
-        console_log = open(os.path.join(models_dir, f'early_stop_{args.which_layer}_console.log'), 'w')
+        if args.warm_start_model_dir is not None:
+            rl_policy = load_model(
+                args, rl_policy, args.warm_start_model_dir
+            )
+            print('Warm-start model loaded from:', args.warm_start_model_dir)
+        console_log = open(
+            os.path.join(
+                models_dir, f'early_stop_{args.which_layer}_console.log'
+            ),
+            'a' if args.start_epoch > 0 else 'w',
+        )
         sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
         adapt(
             args, rl_policy, exp_dataset, exp_dataset_info, env_settings,
@@ -435,6 +511,16 @@ if __name__ == '__main__':
     parser.add_argument('--num-epochs', type=int, default=80)
     parser.add_argument('--eval-per-epoch', type=int, help='evaluation per epoch', default=1)
     parser.add_argument('--save-checkpoint-per-epoch', type=int, help='saving checkpoint per iteration')
+    parser.add_argument(
+        '--checkpoint-retention', choices=('all', 'best-latest'), default='all',
+        help='retain all epoch checkpoints or rotate only NBS best/latest',
+    )
+    parser.add_argument(
+        '--warm-start-model-dir',
+        help='load model/allocator weights before adaptation (not exact resume)',
+    )
+    parser.add_argument('--start-epoch', type=int, default=0)
+    parser.add_argument('--initial-best-return', type=float, default=float('-inf'))
     parser.add_argument('--target-return-scale', type=float, help='target return, which specifies the expected performance for the model to achieve', default=1.)
     parser.add_argument('--which-layer', type=int, help='for early stopping (not used in our experiments): specify which layer to stop (layer index starts from 0)', default=-1)
     parser.add_argument('--token-selector', choices=('none', 'recent-timestep'), default='none',

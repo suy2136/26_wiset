@@ -36,6 +36,8 @@ class NBSV19WiringTest(unittest.TestCase):
         for setting in (
             'RANK_BUDGET = 8192', 'PHYSICAL_RANK = 256',
             'nbs_v19_rank_config_max256.json',
+            '"--save-checkpoint-per-epoch", "10"',
+            '"--checkpoint-retention", "best-latest"',
         ):
             self.assertIn(setting, source)
 
@@ -50,6 +52,17 @@ class NBSV19WiringTest(unittest.TestCase):
         self.assertIn("init_r=rank", low_rank_source)
         self.assertNotIn("init_r=32", low_rank_source)
         self.assertIn("shadow_update_policy='legacy'", low_rank_source)
+
+    def test_warm_start_restores_weights_and_training_position(self):
+        source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')
+        for behavior in (
+            'rl_policy = load_model(',
+            'range(args.start_epoch, args.num_epochs)',
+            'trainer.optimizer_step = resumed_optimizer_step',
+            "'a' if args.start_epoch > 0 else 'w'",
+            '(optimizer moments were reinitialized)',
+        ):
+            self.assertIn(behavior, source)
 
     def test_training_order_matches_v19_gradient_definition(self):
         source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(
