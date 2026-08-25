@@ -220,8 +220,8 @@ def run(args):
     if args.nbs_v19:
         if args.plm_type != 'llama':
             raise ValueError('NBS v19 currently supports --plm-type llama only')
-        if args.rank != 32:
-            raise ValueError('NBS v19 requires --rank 32')
+        if args.rank <= 0:
+            raise ValueError('NBS v19 requires a positive physical --rank')
         if args.nbs_rank_budget <= 0:
             raise ValueError('--nbs-rank-budget must be positive')
         if args.nbs_allocation_interval <= 0:

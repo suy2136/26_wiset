@@ -40,11 +40,14 @@ class NBSV19WiringTest(unittest.TestCase):
             self.assertIn(setting, source)
 
     def test_v19_accepts_configurable_physical_rank_with_legacy_shadow(self):
-        source = (
+        low_rank_source = (
             ABR_ROOT / 'plm_special' / 'models' / 'low_rank.py'
         ).read_text(encoding='utf-8')
-        self.assertNotIn("if rank != 32:", source)
-        self.assertIn("shadow_update_policy='legacy'", source)
+        run_source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')
+        self.assertNotIn("if rank != 32:", low_rank_source)
+        self.assertNotIn("if args.rank != 32:", run_source)
+        self.assertIn("if args.rank <= 0:", run_source)
+        self.assertIn("shadow_update_policy='legacy'", low_rank_source)
 
     def test_training_order_matches_v19_gradient_definition(self):
         source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(
