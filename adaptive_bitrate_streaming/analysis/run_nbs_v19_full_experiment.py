@@ -32,6 +32,12 @@ def build_training_command(args):
         '--lr', str(args.lr), '--warmup-steps', str(args.warmup_steps),
         '--num-epochs', str(args.num_epochs),
         '--eval-per-epoch', str(args.eval_per_epoch),
+        '--early-stopping-patience', str(args.early_stopping_patience),
+        '--early-stopping-min-epochs', str(args.early_stopping_min_epochs),
+        '--early-stopping-min-delta', str(args.early_stopping_min_delta),
+        '--plateau-lr-patience', str(args.plateau_lr_patience),
+        '--plateau-lr-factor', str(args.plateau_lr_factor),
+        '--plateau-min-lr', str(args.plateau_min_lr),
     ]
 
 
@@ -131,6 +137,12 @@ def parse_args(argv=None):
     parser.add_argument('--warmup-steps', type=int, default=2000)
     parser.add_argument('--num-epochs', type=int, default=80)
     parser.add_argument('--eval-per-epoch', type=int, default=2)
+    parser.add_argument('--early-stopping-patience', type=int, default=10)
+    parser.add_argument('--early-stopping-min-epochs', type=int, default=20)
+    parser.add_argument('--early-stopping-min-delta', type=float, default=0.003)
+    parser.add_argument('--plateau-lr-patience', type=int, default=5)
+    parser.add_argument('--plateau-lr-factor', type=float, default=0.5)
+    parser.add_argument('--plateau-min-lr', type=float, default=1e-6)
     parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         '--resume-inference', action='store_true',

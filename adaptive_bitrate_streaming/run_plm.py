@@ -30,6 +30,7 @@ from plm_special.models.selectors import (
 from plm_special.models.state_encoder import EncoderNetwork
 from plm_special.models.low_rank import peft_model
 from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
+from plm_special.training_control import ValidationPlateauController
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
@@ -130,10 +131,13 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    lr_scheduler = LambdaLR(
-        optimizer,
-        lambda steps: min((steps + 1) / args.warmup_steps, 1)
-    )
+    lr_scale = {'value': 1.0}
+
+    def learning_rate_multiplier(steps):
+        warmup = min((steps + 1) / args.warmup_steps, 1.0)
+        return warmup * lr_scale['value']
+
+    lr_scheduler = LambdaLR(optimizer, learning_rate_multiplier)
     loss_fn = CrossEntropyLoss()
     trainer = Trainer(
         args, model=model, optimizer=optimizer, exp_dataset=exp_dataset,
@@ -151,6 +155,13 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
     best_eval_return = args.initial_best_return
+    plateau_controller = ValidationPlateauController(
+        min_delta=args.early_stopping_min_delta,
+        early_stopping_patience=args.early_stopping_patience,
+        min_epochs=args.early_stopping_min_epochs,
+        lr_patience=args.plateau_lr_patience,
+        initial_metric=args.initial_best_return,
+    )
 
     rotate_best_latest = (
         args.nbs_v19 and args.checkpoint_retention == 'best-latest'
@@ -201,6 +212,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         )
 
     total_train_losses = []
+    early_stopped = False
     for epoch in range(args.start_epoch, args.num_epochs):
         train_logs, train_losses = trainer.train_epoch()
         total_train_losses.extend(train_losses)
@@ -242,13 +254,72 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
                 save_training_checkpoint(best_model_dir, role='best')
                 print('Best model saved at:', best_model_dir)
 
+            plateau = plateau_controller.update(
+                episodes_return, completed_epochs=epoch + 1
+            )
+            lr_reduced = False
+            old_lr = optimizer.param_groups[0]['lr']
+            if plateau.reduce_learning_rate:
+                minimum_scale = args.plateau_min_lr / args.lr
+                new_scale = max(
+                    lr_scale['value'] * args.plateau_lr_factor,
+                    minimum_scale,
+                )
+                if new_scale < lr_scale['value']:
+                    lr_scale['value'] = new_scale
+                    warmup_factor = min(
+                        (trainer.optimizer_step + 1) / args.warmup_steps,
+                        1.0,
+                    )
+                    new_lrs = []
+                    for group, base_lr in zip(
+                        optimizer.param_groups, lr_scheduler.base_lrs
+                    ):
+                        new_lr = max(
+                            base_lr * warmup_factor * new_scale,
+                            args.plateau_min_lr,
+                        )
+                        group['lr'] = new_lr
+                        new_lrs.append(new_lr)
+                    lr_scheduler._last_lr = new_lrs
+                    lr_reduced = True
+                    print(
+                        'Validation plateau: learning rate reduced',
+                        f'{old_lr:.8g} -> {new_lrs[0]:.8g}',
+                    )
+
             eval_logs['best_return'] = best_eval_return
+            eval_logs['early_stopping/reference_return'] = (
+                plateau.reference_metric
+            )
+            eval_logs['early_stopping/no_improvement_validations'] = (
+                plateau.validations_without_improvement
+            )
+            eval_logs['early_stopping/significant_improvement'] = (
+                plateau.significant_improvement
+            )
+            eval_logs['early_stopping/should_stop'] = plateau.should_stop
+            eval_logs['learning_rate/current'] = optimizer.param_groups[0]['lr']
+            eval_logs['learning_rate/reduced'] = lr_reduced
             print('>' * 10, 'Evaluation Information')
             pprint(eval_logs)
+            if plateau.should_stop:
+                early_stopped = True
+                print(
+                    'Early stopping triggered:',
+                    f'epoch={epoch}',
+                    'completed_epochs=', epoch + 1,
+                    'validations_without_improvement=',
+                    plateau.validations_without_improvement,
+                    f'min_delta={args.early_stopping_min_delta}',
+                )
+                break
     # save training losses
     train_losses_path = os.path.join(checkpoint_dir, 'train_losses.txt')
     np.savetxt(train_losses_path, total_train_losses, fmt='%.6f', delimiter='\n')
-    trainer.snapshot_nbs(event='training_end')
+    trainer.snapshot_nbs(
+        event='early_stopping' if early_stopped else 'training_end'
+    )
     if rotate_best_latest:
         latest_model_dir = os.path.join(checkpoint_dir, 'latest')
         save_training_checkpoint(latest_model_dir, role='final')
@@ -306,6 +377,22 @@ def run(args):
         raise ValueError('--start-epoch must be in [0, --num-epochs)')
     if args.start_epoch > 0 and args.warm_start_model_dir is None:
         raise ValueError('--start-epoch requires --warm-start-model-dir')
+    if args.lr <= 0:
+        raise ValueError('--lr must be positive')
+    if args.warmup_steps <= 0:
+        raise ValueError('--warmup-steps must be positive')
+    if args.early_stopping_patience < 0:
+        raise ValueError('--early-stopping-patience must be non-negative')
+    if args.early_stopping_min_epochs < 0:
+        raise ValueError('--early-stopping-min-epochs must be non-negative')
+    if args.early_stopping_min_delta < 0:
+        raise ValueError('--early-stopping-min-delta must be non-negative')
+    if args.plateau_lr_patience < 0:
+        raise ValueError('--plateau-lr-patience must be non-negative')
+    if not 0 < args.plateau_lr_factor < 1:
+        raise ValueError('--plateau-lr-factor must be between 0 and 1')
+    if not 0 <= args.plateau_min_lr <= args.lr:
+        raise ValueError('--plateau-min-lr must be between 0 and --lr')
     if args.nbs_v19:
         if args.plm_type != 'llama':
             raise ValueError('NBS v19 currently supports --plm-type llama only')
@@ -573,6 +660,24 @@ if __name__ == '__main__':
     parser.add_argument('--warmup-steps', type=int, default=2000)
     parser.add_argument('--num-epochs', type=int, default=80)
     parser.add_argument('--eval-per-epoch', type=int, help='evaluation per epoch', default=1)
+    parser.add_argument(
+        '--early-stopping-patience', type=int, default=10,
+        help='stop after this many valid evaluations without min-delta improvement; 0 disables',
+    )
+    parser.add_argument(
+        '--early-stopping-min-epochs', type=int, default=20,
+        help='minimum completed epochs before validation-based stopping',
+    )
+    parser.add_argument(
+        '--early-stopping-min-delta', type=float, default=0.003,
+        help='minimum validation-return increase that resets plateau counters',
+    )
+    parser.add_argument(
+        '--plateau-lr-patience', type=int, default=5,
+        help='halve LR after this many valid plateau evaluations; 0 disables',
+    )
+    parser.add_argument('--plateau-lr-factor', type=float, default=0.5)
+    parser.add_argument('--plateau-min-lr', type=float, default=1e-6)
     parser.add_argument('--save-checkpoint-per-epoch', type=int, help='saving checkpoint per iteration')
     parser.add_argument(
         '--checkpoint-retention', choices=('all', 'best-latest'), default='all',

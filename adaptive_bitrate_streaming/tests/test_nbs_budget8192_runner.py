@@ -19,6 +19,12 @@ class Args:
     warmup_steps = 2000
     num_epochs = 80
     eval_per_epoch = 2
+    early_stopping_patience = 10
+    early_stopping_min_epochs = 20
+    early_stopping_min_delta = 0.003
+    plateau_lr_patience = 5
+    plateau_lr_factor = 0.5
+    plateau_min_lr = 1e-6
 
 
 class NBSBudget8192RunnerTest(unittest.TestCase):
