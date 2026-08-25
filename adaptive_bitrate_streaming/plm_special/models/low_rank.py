@@ -131,7 +131,10 @@ def peft_model(
         tfinal = max(tinit + 1, int(total_step * 0.15))
         cooldown_start = max(tinit + 1, total_step - tfinal)
         config = AdaLoraConfig(
-            init_r=32,
+            # ``rank`` is the physical AdaLoRA slot capacity.  Keeping this
+            # hard-coded at 32 made larger NBS max-rank configurations pass
+            # CLI validation but fail when the allocator inspected the model.
+            init_r=rank,
             target_r=rank,
             tinit=tinit,
             tfinal=tfinal,

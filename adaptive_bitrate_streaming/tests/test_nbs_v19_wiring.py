@@ -47,6 +47,8 @@ class NBSV19WiringTest(unittest.TestCase):
         self.assertNotIn("if rank != 32:", low_rank_source)
         self.assertNotIn("if args.rank != 32:", run_source)
         self.assertIn("if args.rank <= 0:", run_source)
+        self.assertIn("init_r=rank", low_rank_source)
+        self.assertNotIn("init_r=32", low_rank_source)
         self.assertIn("shadow_update_policy='legacy'", low_rank_source)
 
     def test_training_order_matches_v19_gradient_definition(self):
