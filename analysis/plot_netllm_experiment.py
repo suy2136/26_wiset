@@ -38,13 +38,19 @@ def parse_args() -> argparse.Namespace:
                  "nbs_v23", "nbs_v24", "nbs_v25", "nbs_v27", "nbs_v28", "nbs_v29",
                  "nbs_v19_data2", "nbs_budget256_seed1",
                  "nbs_adaptive_tau015",
-                 "uniform_r12", "uniform_b736", "adalora_peft_r12", "eva", "plain"),
+                 "uniform_r12", "uniform_b736", "adalora_peft_r12",
+                 "shapley_v19", "eva", "plain"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
     parser.add_argument("--result-csv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--allocator-state", type=Path)
+    parser.add_argument(
+        "--adapter-config",
+        type=Path,
+        help="PEFT adapter_config.json containing a saved rank_pattern.",
+    )
     parser.add_argument("--eva-state", type=Path)
     parser.add_argument("--allocator-diagnostics", type=Path)
     parser.add_argument("--latency-json", type=Path)
@@ -52,7 +58,7 @@ def parse_args() -> argparse.Namespace:
                         help="Optional plot/summary title override for an inference mode.")
     parser.add_argument(
         "--checkpoint-role",
-        choices=("best", "best_ar", "best_post_nbs", "final_nbs"),
+        choices=("best", "best_ar", "best_post_nbs", "final_nbs", "final_shapley"),
         default="best",
     )
     return parser.parse_args()
@@ -133,6 +139,37 @@ def read_allocator_state(path: Path | None) -> dict[str, Any] | None:
         "mean_rank": sum(values) / len(values),
         "histogram": histogram,
         "ranks": {str(key): int(value) for key, value in ranks.items()},
+    }
+
+
+def read_adapter_rank_pattern(path: Path | None) -> dict[str, Any] | None:
+    """Read PEFT's JSON rank mask without importing torch or loading pickle."""
+    if path is None or not path.exists():
+        return None
+    with path.open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    pattern = config.get("rank_pattern") or {}
+    ranks: dict[str, int] = {}
+    for name, mask in pattern.items():
+        if isinstance(mask, list):
+            ranks[str(name)] = sum(bool(value) for value in mask)
+        elif isinstance(mask, (int, float)):
+            ranks[str(name)] = int(mask)
+    if not ranks:
+        return None
+    values = list(ranks.values())
+    histogram: dict[str, int] = {}
+    for rank in values:
+        histogram[str(rank)] = histogram.get(str(rank), 0) + 1
+    return {
+        "path": str(path),
+        "layer_count": len(values),
+        "total_rank": sum(values),
+        "minimum_rank": min(values),
+        "maximum_rank": max(values),
+        "mean_rank": sum(values) / len(values),
+        "histogram": histogram,
+        "ranks": ranks,
     }
 
 
@@ -254,6 +291,8 @@ def main() -> None:
     train_curve, valid_curve, teacher_forcing_valid_curve = parse_train_log(args.train_log)
     aggregate, per_pair = read_results(args.result_csv)
     allocator = read_allocator_state(args.allocator_state or args.eva_state)
+    if allocator is None:
+        allocator = read_adapter_rank_pattern(args.adapter_config)
     diagnostic_rows = read_allocator_diagnostics(args.allocator_diagnostics)
     if allocator is None:
         allocator = allocator_from_diagnostics(diagnostic_rows)
@@ -297,6 +336,7 @@ def main() -> None:
         "uniform_r12": "Uniform-rank NetLLM (rank12, budget768)",
         "uniform_b736": "Fixed near-uniform NetLLM (ranks11/12, budget736, seed1)",
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
+        "shapley_v19": "Shapley AdaLoRA (v19 training conditions)",
         "eva": "EVA-NetLLM (activation-PCA rank allocation)",
         "plain": "NetLLM",
     }
@@ -338,6 +378,7 @@ def main() -> None:
                 str(args.allocator_diagnostics) if args.allocator_diagnostics else None
             ),
             "eva_state": str(args.eva_state) if args.eva_state else None,
+            "adapter_config": str(args.adapter_config) if args.adapter_config else None,
             "latency_json": str(args.latency_json) if args.latency_json else None,
         },
     }
@@ -420,7 +461,12 @@ def main() -> None:
     if allocator and allocator.get("histogram"):
         rank_items = sorted((int(rank), count) for rank, count in allocator["histogram"].items())
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
-        allocation_name = "EVA" if args.variant == "eva" else "NBS"
+        if args.variant == "eva":
+            allocation_name = "EVA"
+        elif args.variant == "shapley_v19":
+            allocation_name = "Shapley"
+        else:
+            allocation_name = "NBS"
         axes[1, 2].set(
             title=f"{allocation_name} allocated ranks",
             xlabel="Rank",

@@ -670,7 +670,7 @@ elif [[ "$VARIANT" == "shapley_v19" ]]; then
     --shapley-validation-batches "$SHAPLEY_VALIDATION_BATCHES"
     --shapley-truncate-fraction "$SHAPLEY_TRUNCATE_FRACTION"
     --shapley-value-mode "$SHAPLEY_VALUE_MODE"
-    --experiment-tag adalora_shapley
+    --experiment-tag shapley_v19
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
@@ -828,12 +828,6 @@ if [[ "$VARIANT" == "eva" ]]; then
     exit "$code"
   fi
 fi
-if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
-  printf 'shapley_permutations=%s\nshapley_validation_batches=%s\nshapley_truncate_fraction=%s\nshapley_value_mode=%s\ntarget_rank_budget=%s\n' \
-    "$SHAPLEY_PERMUTATIONS" "$SHAPLEY_VALIDATION_BATCHES" \
-    "$SHAPLEY_TRUNCATE_FRACTION" "$SHAPLEY_VALUE_MODE" "$RANK_BUDGET" \
-    >> "$RUN_DIR/metadata.env"
-fi
 write_status "training" "running" 0
 printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$SEED" "$LORA_SEED" "$DATA_SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
@@ -852,6 +846,12 @@ if [[ "$VARIANT" == "eva" ]]; then
   printf 'eva_state=%s\neva_rank_budget=%s\neva_min_rank=%s\neva_max_rank=%s\neva_rho=%s\neva_metric=%s\n' \
     "$EVA_STATE_ARTIFACT" "$RANK_BUDGET" "$EVA_MIN_RANK" "$EVA_MAX_RANK" \
     "$EVA_RHO" "${EVA_METRIC:-ratio}" >> "$RUN_DIR/metadata.env"
+fi
+if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
+  printf 'shapley_permutations=%s\nshapley_validation_batches=%s\nshapley_truncate_fraction=%s\nshapley_value_mode=%s\ntarget_rank_budget=%s\n' \
+    "$SHAPLEY_PERMUTATIONS" "$SHAPLEY_VALIDATION_BATCHES" \
+    "$SHAPLEY_TRUNCATE_FRACTION" "$SHAPLEY_VALUE_MODE" "$RANK_BUDGET" \
+    >> "$RUN_DIR/metadata.env"
 fi
 
 TRAIN_CMD=(
@@ -1100,6 +1100,9 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
   fi
   if [[ "$VARIANT" == "eva" ]]; then
     PLOT_CMD+=(--eva-state "$EVA_STATE_ARTIFACT")
+  fi
+  if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" ]]; then
+    PLOT_CMD+=(--adapter-config "$CANONICAL_MODEL_PATH/adapter_config.json")
   fi
 
   write_status "visualization_${ROLE}" "running" 0

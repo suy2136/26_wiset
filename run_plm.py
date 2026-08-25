@@ -1917,7 +1917,7 @@ if __name__ == '__main__':
                                  'nbs_v19_data2', 'nbs_budget256_seed1',
                                  'nbs_adaptive_tau015',
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
-                                 'adalora_shapley', 'eva'],
+                                 'adalora_shapley', 'shapley_v19', 'eva'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
