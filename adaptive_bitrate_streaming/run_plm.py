@@ -132,10 +132,30 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         weight_decay=args.weight_decay,
     )
     lr_scale = {'value': 1.0}
+    updates_per_epoch = max(
+        1, math.ceil(len(exp_dataset) / args.grad_accum_steps)
+    )
+    total_optimizer_steps = max(1, updates_per_epoch * args.num_epochs)
+    minimum_lr_scale = args.plateau_min_lr / args.lr
 
     def learning_rate_multiplier(steps):
-        warmup = min((steps + 1) / args.warmup_steps, 1.0)
-        return warmup * lr_scale['value']
+        completed_steps = steps + 1
+        if completed_steps <= args.warmup_steps:
+            return (completed_steps / args.warmup_steps) * lr_scale['value']
+        schedule_scale = 1.0
+        if args.lr_schedule == 'cosine':
+            decay_steps = max(1, total_optimizer_steps - args.warmup_steps)
+            progress = min(
+                max((completed_steps - args.warmup_steps) / decay_steps, 0.0),
+                1.0,
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            schedule_scale = minimum_lr_scale + (
+                1.0 - minimum_lr_scale
+            ) * cosine
+        return max(
+            schedule_scale * lr_scale['value'], minimum_lr_scale
+        )
 
     lr_scheduler = LambdaLR(optimizer, learning_rate_multiplier)
     loss_fn = CrossEntropyLoss()
@@ -186,14 +206,9 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             save_model(args, model, path, role=role)
 
     if args.start_epoch > 0:
-        updates_per_epoch = max(
-            1, math.ceil(len(exp_dataset) / args.grad_accum_steps)
-        )
         resumed_optimizer_step = args.start_epoch * updates_per_epoch
         trainer.optimizer_step = resumed_optimizer_step
-        lr_factor = min(
-            (resumed_optimizer_step + 1) / args.warmup_steps, 1.0
-        )
+        lr_factor = learning_rate_multiplier(resumed_optimizer_step)
         resumed_lrs = []
         for group, base_lr in zip(
             optimizer.param_groups, lr_scheduler.base_lrs
@@ -260,25 +275,20 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             lr_reduced = False
             old_lr = optimizer.param_groups[0]['lr']
             if plateau.reduce_learning_rate:
-                minimum_scale = args.plateau_min_lr / args.lr
                 new_scale = max(
                     lr_scale['value'] * args.plateau_lr_factor,
-                    minimum_scale,
+                    minimum_lr_scale,
                 )
                 if new_scale < lr_scale['value']:
                     lr_scale['value'] = new_scale
-                    warmup_factor = min(
-                        (trainer.optimizer_step + 1) / args.warmup_steps,
-                        1.0,
+                    current_factor = learning_rate_multiplier(
+                        trainer.optimizer_step
                     )
                     new_lrs = []
                     for group, base_lr in zip(
                         optimizer.param_groups, lr_scheduler.base_lrs
                     ):
-                        new_lr = max(
-                            base_lr * warmup_factor * new_scale,
-                            args.plateau_min_lr,
-                        )
+                        new_lr = base_lr * current_factor
                         group['lr'] = new_lr
                         new_lrs.append(new_lr)
                     lr_scheduler._last_lr = new_lrs
@@ -656,6 +666,10 @@ if __name__ == '__main__':
     parser.add_argument('--w', type=int, help='context window for learning return distribution', default=20)
     parser.add_argument('--gamma', type=float, help='discounted factor of reward', default=1.)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument(
+        '--lr-schedule', choices=('constant', 'cosine'), default='constant',
+        help='post-warmup learning-rate schedule',
+    )
     parser.add_argument('--weight-decay', type=float, default=1e-4)
     parser.add_argument('--warmup-steps', type=int, default=2000)
     parser.add_argument('--num-epochs', type=int, default=80)
