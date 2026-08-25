@@ -125,8 +125,8 @@ def peft_model(
     if nbs_v19:
         if total_step is None or total_step <= 0:
             raise ValueError('NBS v19 requires a positive total optimizer-step count')
-        if rank != 32:
-            raise ValueError('NBS v19 requires --rank 32')
+        if rank <= 0:
+            raise ValueError('NBS v19 requires a positive physical --rank')
         tinit = max(1, int(total_step * 0.1))
         tfinal = max(tinit + 1, int(total_step * 0.15))
         cooldown_start = max(tinit + 1, total_step - tfinal)
@@ -173,9 +173,9 @@ def peft_model(
         )
         model.nbs_variant = 'nbs_v19'
         print(
-            'NBS v19 enabled: min=2 max=32 budget={} seed-controlled '
-            'initialization, allocation interval={}'.format(
-                nbs_rank_budget, nbs_allocation_interval
+            'NBS v19 enabled: physical_rank={} budget={} seed-controlled '
+            'initialization, allocation interval={}, shadow_policy=legacy'.format(
+                rank, nbs_rank_budget, nbs_allocation_interval
             )
         )
     if print_trainable:

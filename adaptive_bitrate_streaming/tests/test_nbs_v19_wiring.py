@@ -20,6 +20,32 @@ class NBSV19WiringTest(unittest.TestCase):
             for bounds in config.values()
         ))
 
+    def test_equal_capacity_rank_config_and_runner(self):
+        config_path = (
+            ABR_ROOT / 'configs' / 'nbs_v19_rank_config_max256.json'
+        )
+        with config_path.open(encoding='utf-8') as stream:
+            config = json.load(stream)
+        self.assertTrue(all(
+            bounds == {'min_rank': 2, 'max_rank': 256}
+            for bounds in config.values()
+        ))
+        source = (
+            ABR_ROOT / 'analysis' / 'run_nbs_v19_budget8192_experiment.py'
+        ).read_text(encoding='utf-8')
+        for setting in (
+            'RANK_BUDGET = 8192', 'PHYSICAL_RANK = 256',
+            'nbs_v19_rank_config_max256.json',
+        ):
+            self.assertIn(setting, source)
+
+    def test_v19_accepts_configurable_physical_rank_with_legacy_shadow(self):
+        source = (
+            ABR_ROOT / 'plm_special' / 'models' / 'low_rank.py'
+        ).read_text(encoding='utf-8')
+        self.assertNotIn("if rank != 32:", source)
+        self.assertIn("shadow_update_policy='legacy'", source)
+
     def test_training_order_matches_v19_gradient_definition(self):
         source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(
             encoding='utf-8'
