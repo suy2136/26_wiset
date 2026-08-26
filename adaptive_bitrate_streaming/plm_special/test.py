@@ -192,6 +192,35 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             else 1.0 - total_selected_tokens / total_original_tokens
         ),
     })
+    compaction = getattr(model.plm, 'nbs_compaction_report', None)
+    validation = getattr(model, 'nbs_compaction_validation', None)
+    test_log.update({
+        'nbs_compact_inference': compaction is not None,
+        'nbs_physical_rank_total_before': (
+            None if compaction is None
+            else compaction['physical_rank_total_before']
+        ),
+        'nbs_compact_rank_total': (
+            None if compaction is None else compaction['compact_rank_total']
+        ),
+        'nbs_compaction_rank_reduction_ratio': (
+            0.0 if compaction is None
+            else 1.0 - compaction['compact_rank_total']
+            / compaction['physical_rank_total_before']
+        ),
+        'nbs_compaction_logits_equivalent': (
+            None if validation is None
+            else validation['logits_validation']['passed']
+        ),
+        'nbs_compaction_logits_max_abs_error': (
+            None if validation is None
+            else validation['logits_validation']['max_abs_error']
+        ),
+        'nbs_compaction_logits_max_rel_error': (
+            None if validation is None
+            else validation['logits_validation']['max_rel_error']
+        ),
+    })
     selector_metrics = model.get_selector_metrics()
     event_selector_calls = (
         selector_metrics['temporal_selector_calls']

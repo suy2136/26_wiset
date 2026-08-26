@@ -82,7 +82,9 @@ class CompactLoRALinear(nn.Module):
             F.linear(F.linear(adapter_input, self.lora_a), self.lora_b)
             * self.adapter_scale
         )
-        return result + delta.to(result.dtype)
+        # Match ABR's mixed-precision AdaLoRA bridge: accumulate the base and
+        # LoRA residual in FP32, then cross the PLM boundary in the base dtype.
+        return (result.float() + delta.float()).to(result.dtype)
 
 
 def _parameter_tensor(container, adapter_name):

@@ -38,6 +38,11 @@ from plm_special.utils.checkpoints import (
     atomic_save_nbs_checkpoint,
     prepare_best_latest_retention,
 )
+from models.nbs_compaction import (
+    compact_nbs_model_for_inference,
+    extract_nbs_compaction_specs,
+    validate_nbs_compaction_factors,
+)
 
 
 PLM_LAYER_SIZES = {
@@ -93,7 +98,70 @@ def save_model(args, model, save_dir, role='checkpoint'):
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
 
 
-def load_model(args, model, model_dir):
+def _validate_and_compact_nbs_for_inference(args, model):
+    """Compact a restored NBS adapter after checking factor/logit parity."""
+    model.eval()
+    specs, mask_source = extract_nbs_compaction_specs(model.plm)
+    factor_validation = validate_nbs_compaction_factors(
+        model.plm,
+        specs,
+        trials=args.nbs_compaction_validation_trials,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    # A deterministic two-step ABR batch checks the complete state encoder,
+    # PLM adapter and action head, rather than only isolated LoRA factors.
+    device = torch.device(args.device)
+    states = torch.linspace(
+        0.0, 1.0, steps=72, dtype=torch.float32, device=device
+    ).reshape(1, 2, 6, 6)
+    actions = torch.tensor([[[0.0], [1.0]]], device=device)
+    returns = torch.tensor([[[0.75], [0.25]]], device=device)
+    timesteps = torch.tensor([[0, 1]], dtype=torch.long, device=device)
+    with torch.no_grad():
+        dense_logits = model(states, actions, returns, timesteps).float().cpu()
+
+    compaction_report = compact_nbs_model_for_inference(model.plm)
+    with torch.no_grad():
+        compact_logits = model(states, actions, returns, timesteps).float().cpu()
+    difference = (compact_logits - dense_logits).abs()
+    denominator = dense_logits.abs().clamp_min(args.nbs_compaction_atol)
+    logits_validation = {
+        'passed': bool(torch.allclose(
+            compact_logits, dense_logits,
+            rtol=args.nbs_compaction_rtol,
+            atol=args.nbs_compaction_atol,
+        )),
+        'shape': list(dense_logits.shape),
+        'max_abs_error': float(difference.max().item()),
+        'max_rel_error': float((difference / denominator).max().item()),
+        'rtol': args.nbs_compaction_rtol,
+        'atol': args.nbs_compaction_atol,
+    }
+    if not logits_validation['passed']:
+        raise RuntimeError(
+            'NBS compaction action-logit equivalence failed: '
+            f'{logits_validation}'
+        )
+    report = {
+        'passed': bool(factor_validation['passed']),
+        'mask_source': mask_source,
+        'factor_validation': factor_validation,
+        'logits_validation': logits_validation,
+        **compaction_report,
+    }
+    model.nbs_compaction_validation = report
+    print(
+        'NBS inference compaction enabled:',
+        f"rank {report['physical_rank_total_before']} -> "
+        f"{report['compact_rank_total']}",
+        f"logits max_abs_error={logits_validation['max_abs_error']:.6g}",
+    )
+    return model
+
+
+def load_model(args, model, model_dir, compact_for_inference=False):
     if args.rank > 0:
         # load lora weights
         model.plm.load_adapter(model_dir, adapter_name='default')
@@ -120,6 +188,10 @@ def load_model(args, model, model_dir):
             map_location=args.device or 'cpu',
         )
         model.load_state_dict(model_state)
+    if compact_for_inference:
+        if not args.nbs_v19:
+            raise ValueError('--nbs-compact-inference requires --nbs-v19')
+        model = _validate_and_compact_nbs_for_inference(args, model)
     return model
 
 
@@ -340,11 +412,25 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
 
 
 def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, test_process_reward_fn):
-    model = load_model(args, model, model_dir)
+    model = load_model(
+        args, model, model_dir,
+        compact_for_inference=args.nbs_compact_inference,
+    )
+    model.eval()
     print('Load model from:', model_dir)
     target_return = exp_dataset_info.max_return * args.target_return_scale
     results = test_on_env(args, model, result_dir, env_settings, target_return, args.trace_num, test_process_reward_fn, seed=args.seed)
     print(results)
+    compaction_validation = getattr(
+        model, 'nbs_compaction_validation', None
+    )
+    if compaction_validation is not None:
+        validation_path = os.path.join(
+            result_dir, 'nbs_compaction_equivalence.json'
+        )
+        with open(validation_path, 'w', encoding='utf-8') as stream:
+            json.dump(compaction_validation, stream, indent=2, sort_keys=True)
+        print('Compaction equivalence saved at:', validation_path)
     print('Test time:', results['time'], '\nMean reward:', results['mean_reward'])
     print('Results saved at:', result_dir)
 
@@ -414,6 +500,10 @@ def run(args):
             raise ValueError('--nbs-allocation-interval must be positive')
         if args.nbs_max_consecutive_nonfinite <= 0:
             raise ValueError('--nbs-max-consecutive-nonfinite must be positive')
+        if args.nbs_compaction_validation_trials <= 0:
+            raise ValueError('--nbs-compaction-validation-trials must be positive')
+        if args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0:
+            raise ValueError('NBS compaction tolerances must be non-negative')
         if args.adapt and (
             args.temporal_selector != 'none'
             or args.token_selector != 'none'
@@ -579,8 +669,20 @@ def run(args):
         'speculative_none' if args.speculative_draft_steps == 0
         else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
     )
-    results_dir = os.path.join(cfg.results_dir, f'{args.trace}_{args.video}', f'trace_num_{args.trace_num}_fixed_{args.fixed_order}', f'{args.plm_type}_{args.plm_size}',
-                               f'early_stop_{args.which_layer}_rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}', selector_tag, speculative_tag)
+    result_parts = [
+        cfg.results_dir,
+        f'{args.trace}_{args.video}',
+        f'trace_num_{args.trace_num}_fixed_{args.fixed_order}',
+        f'{args.plm_type}_{args.plm_size}',
+        f'early_stop_{args.which_layer}_rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}',
+        selector_tag,
+        speculative_tag,
+    ]
+    if args.nbs_v19:
+        result_parts.append(
+            'nbs_compact' if args.nbs_compact_inference else 'nbs_dense'
+        )
+    results_dir = os.path.join(*result_parts)
     checkpoint_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_checkpoint')
     best_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_best_model')
     final_model_dir = os.path.join(models_dir, f'early_stop_{args.which_layer}_final_model')
@@ -660,6 +762,21 @@ if __name__ == '__main__':
         '--nbs-max-consecutive-nonfinite', type=int, default=3,
         help='abort after this many consecutive skipped non-finite batches',
     )
+    compaction_group = parser.add_mutually_exclusive_group()
+    compaction_group.add_argument(
+        '--nbs-compact-inference', dest='nbs_compact_inference',
+        action='store_true',
+        help='physically remove masked NBS ranks before inference (default for NBS test)',
+    )
+    compaction_group.add_argument(
+        '--no-nbs-compact-inference', dest='nbs_compact_inference',
+        action='store_false',
+        help='retain dense physical-rank AdaLoRA factors for comparison',
+    )
+    parser.set_defaults(nbs_compact_inference=None)
+    parser.add_argument('--nbs-compaction-validation-trials', type=int, default=2)
+    parser.add_argument('--nbs-compaction-rtol', type=float, default=5e-3)
+    parser.add_argument('--nbs-compaction-atol', type=float, default=5e-3)
     # state encoder settings
     parser.add_argument('--state-feature-dim', type=int, help='feature dim of the state encoder', default=256)
     # rl policy related settings
@@ -743,6 +860,9 @@ if __name__ == '__main__':
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='device (cuda or cpu) to place the split of model between the input and output')
     
     args = parser.parse_args()
+
+    if args.nbs_compact_inference is None:
+        args.nbs_compact_inference = bool(args.test and args.nbs_v19)
 
     # >>> for debug <<<
     # args.exp_pool_path = 'artifacts/exp_pools/exp_pool.pkl'
