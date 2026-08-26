@@ -95,12 +95,15 @@ def discover_best_checkpoint(experiment, started_at):
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def load_state(path, resume):
+def load_state(path, resume, experiments=EXPERIMENTS):
+    order = [item["name"] for item in experiments]
     if not resume or not path.is_file():
-        return {"order": [item["name"] for item in EXPERIMENTS], "runs": {}}
+        return {"order": order, "runs": {}}
     state = json.loads(path.read_text(encoding="utf-8"))
-    if state.get("order") != [item["name"] for item in EXPERIMENTS]:
-        raise ValueError("saved state does not use C-A-D experiment order")
+    if state.get("order") != order:
+        raise ValueError(
+            f"saved state does not use {'-'.join(order)} experiment order"
+        )
     return state
 
 
@@ -113,7 +116,7 @@ def save_state(path, state):
     temporary.replace(path)
 
 
-def parse_args(argv=None):
+def parse_args(argv=None, default_state=DEFAULT_STATE):
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-model-dir", type=Path, default=DEFAULT_BASE_MODEL)
     parser.add_argument("--exp-pool-path", type=Path, default=DEFAULT_EXP_POOL)
@@ -135,21 +138,20 @@ def parse_args(argv=None):
     parser.add_argument("--plateau-lr-patience", type=int, default=5)
     parser.add_argument("--plateau-lr-factor", type=float, default=0.5)
     parser.add_argument("--plateau-min-lr", type=float, default=1e-6)
-    parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--state-file", type=Path, default=default_state)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def run_experiments(args, experiments=EXPERIMENTS):
     if not args.dry_run:
         if not (args.base_model_dir / "config.json").is_file():
             raise FileNotFoundError(f"base model not found: {args.base_model_dir}")
         if not args.exp_pool_path.is_file():
             raise FileNotFoundError(f"experience pool not found: {args.exp_pool_path}")
-    state = load_state(args.state_file, args.resume)
-    for experiment in EXPERIMENTS:
+    state = load_state(args.state_file, args.resume, experiments)
+    for experiment in experiments:
         name = experiment["name"]
         if name in state["runs"]:
             print(f"[{name}] already complete; skipping", flush=True)
@@ -170,6 +172,10 @@ def main(argv=None):
         print(f"[{name}] best checkpoint: {checkpoint}", flush=True)
     if not args.dry_run:
         print(f"Training state saved at: {args.state_file.resolve()}")
+
+
+def main(argv=None):
+    run_experiments(parse_args(argv), EXPERIMENTS)
 
 
 if __name__ == "__main__":
