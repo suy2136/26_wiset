@@ -2,9 +2,18 @@ import copy
 import math
 import unittest
 
-from adaptive_bitrate_streaming.plm_special.numeric_safety import (
-    classify_update,
-)
+try:
+    # Repository-root execution:
+    # python -m unittest adaptive_bitrate_streaming.tests....
+    from adaptive_bitrate_streaming.plm_special.numeric_safety import (
+        classify_update,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != 'adaptive_bitrate_streaming':
+        raise
+    # ABR-directory execution:
+    # cd adaptive_bitrate_streaming && python -m unittest tests....
+    from plm_special.numeric_safety import classify_update
 
 
 class NBSNumericSafetySimulationTest(unittest.TestCase):
