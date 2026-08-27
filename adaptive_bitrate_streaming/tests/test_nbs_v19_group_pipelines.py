@@ -5,6 +5,7 @@ from tempfile import TemporaryDirectory
 
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_ghij_pipeline as ghij
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_klmn_pipeline as klmn
+from adaptive_bitrate_streaming.analysis import run_nbs_v19_cpqr_pipeline as cpqr
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_group_pipeline as group
 
 
@@ -43,9 +44,29 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
             [2e-4, 1.5e-4, 2e-4, 1.5e-4],
         )
 
+    def test_cpqr_matrix(self):
+        self.assertEqual(
+            [row["name"] for row in cpqr.EXPERIMENTS],
+            ["C_REPRO", "P", "Q", "R"],
+        )
+        self.assertEqual(
+            [row["rank_budget"] for row in cpqr.EXPERIMENTS],
+            [1536, 1536, 1664, 1664],
+        )
+        self.assertEqual(
+            [row["lr"] for row in cpqr.EXPERIMENTS],
+            [2e-4, 1.75e-4, 2e-4, 1.75e-4],
+        )
+        self.assertEqual(
+            [row["physical_rank"] for row in cpqr.EXPERIMENTS],
+            [32, 32, 32, 32],
+        )
+
     def test_training_conditions_are_fixed(self):
         args = self.args(ghij)
-        for experiment in (*ghij.EXPERIMENTS, *klmn.EXPERIMENTS):
+        for experiment in (
+            *ghij.EXPERIMENTS, *klmn.EXPERIMENTS, *cpqr.EXPERIMENTS,
+        ):
             command = group.build_training_command(args, experiment)
             self.assertEqual(command[command.index("--seed") + 1], "1")
             self.assertEqual(command[command.index("--lr-schedule") + 1], "cosine")
@@ -71,7 +92,9 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
 
     def test_test_conditions_require_compaction(self):
         args = self.args(ghij)
-        for experiment in (*ghij.EXPERIMENTS, *klmn.EXPERIMENTS):
+        for experiment in (
+            *ghij.EXPERIMENTS, *klmn.EXPERIMENTS, *cpqr.EXPERIMENTS,
+        ):
             command = group.build_test_command(args, experiment, Path("checkpoint"))
             self.assertIn("--nbs-compact-inference", command)
             self.assertIn("--test", command)
