@@ -6,11 +6,13 @@ import copy
 import json
 import math
 import os
+import random
 
 from munch import Munch
 from torch.utils.data import DataLoader
 
 from plm_special.utils.utils import process_batch
+from plm_special.numeric_safety import classify_update
 
 
 def ensure_trainable_parameters_fp32(model):
@@ -80,6 +82,7 @@ class Trainer:
             args, 'nbs_max_consecutive_nonfinite', 3
         )
         self.optimizer_state_dtype_verified = False
+        self.pending_transaction = None
         self.rollback_count = 0
         self.consecutive_rollbacks = 0
         self.max_consecutive_rollbacks = getattr(
@@ -143,6 +146,39 @@ class Trainer:
             if parameter.requires_grad and parameter.grad is not None
         ]
 
+    @staticmethod
+    def _snapshot_rng_state():
+        return {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch_cpu': torch.get_rng_state().clone(),
+            'torch_cuda': (
+                [state.clone() for state in torch.cuda.get_rng_state_all()]
+                if torch.cuda.is_available() else None
+            ),
+        }
+
+    @staticmethod
+    def _restore_rng_state(state):
+        random.setstate(state['python'])
+        np.random.set_state(state['numpy'])
+        torch.set_rng_state(state['torch_cpu'])
+        if state['torch_cuda'] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state['torch_cuda'])
+
+    @staticmethod
+    def _nested_tensor_bytes(value):
+        if torch.is_tensor(value):
+            return value.numel() * value.element_size()
+        if isinstance(value, dict):
+            return sum(
+                Trainer._nested_tensor_bytes(item)
+                for item in value.values()
+            )
+        if isinstance(value, (list, tuple)):
+            return sum(Trainer._nested_tensor_bytes(item) for item in value)
+        return 0
+
     def _snapshot_optimizer_transaction(self):
         """Clone only trainable tensors participating in this optimizer step."""
         parameters = self._transaction_parameters()
@@ -151,6 +187,12 @@ class Trainer:
             parameter: name for name, parameter in self.model.named_parameters()
             if parameter in parameter_set
         }
+        allocator_state = copy.deepcopy(self.nbs_allocator.state_dict())
+        scheduler_state = (
+            copy.deepcopy(self.lr_scheduler.state_dict())
+            if self.lr_scheduler is not None else None
+        )
+        scaler_state = copy.deepcopy(self.grad_scaler.state_dict())
         estimated_bytes = sum(
             parameter.numel() * parameter.element_size()
             for parameter in parameters
@@ -161,6 +203,7 @@ class Trainer:
             for value in self.optimizer.state.get(parameter, {}).values()
             if torch.is_tensor(value)
         )
+        estimated_bytes += self._nested_tensor_bytes(allocator_state)
         estimated_mib = estimated_bytes / (1024 ** 2)
         if estimated_mib > self.max_rollback_backup_mib:
             raise MemoryError(
@@ -168,7 +211,7 @@ class Trainer:
                 f'{estimated_mib:.1f} MiB, above configured limit '
                 f'{self.max_rollback_backup_mib:.1f} MiB'
             )
-        backup_bytes = 0
+        backup_bytes = self._nested_tensor_bytes(allocator_state)
 
         def backup_tensor(value):
             nonlocal backup_bytes
@@ -204,6 +247,22 @@ class Trainer:
             'optimizer_states': optimizer_states,
             'missing_states': missing_states,
             'backup_bytes': backup_bytes,
+            'allocator_state': allocator_state,
+            'allocator_last_diagnostics': copy.deepcopy(
+                self.nbs_allocator.last_diagnostics
+            ),
+            'optimizer_step': self.optimizer_step,
+            'optimizer_state_dtype_verified': (
+                self.optimizer_state_dtype_verified
+            ),
+            'scheduler_state': scheduler_state,
+            'optimizer_lrs': [
+                group['lr'] for group in self.optimizer.param_groups
+            ],
+            'scaler_state': scaler_state,
+            'rng_state': self._snapshot_rng_state(),
+            'pending_rank_diagnostics': None,
+            'pending_rank_event': None,
         }
 
     def _restore_optimizer_transaction(self, snapshot):
@@ -234,6 +293,23 @@ class Trainer:
                         )
                 else:
                     current_state[key] = copy.deepcopy(value)
+        self.nbs_allocator.load_state_dict(snapshot['allocator_state'])
+        self.nbs_allocator.last_diagnostics = copy.deepcopy(
+            snapshot['allocator_last_diagnostics']
+        )
+        self.optimizer_step = snapshot['optimizer_step']
+        self.optimizer_state_dtype_verified = snapshot[
+            'optimizer_state_dtype_verified'
+        ]
+        if self.lr_scheduler is not None and snapshot['scheduler_state'] is not None:
+            self.lr_scheduler.load_state_dict(snapshot['scheduler_state'])
+        for group, learning_rate in zip(
+            self.optimizer.param_groups, snapshot['optimizer_lrs']
+        ):
+            group['lr'] = learning_rate
+        if self.grad_scaler.is_enabled():
+            self.grad_scaler.load_state_dict(snapshot['scaler_state'])
+        self._restore_rng_state(snapshot['rng_state'])
 
     def _update_ratio_diagnostics(self, snapshot):
         rows = []
@@ -249,24 +325,22 @@ class Trainer:
                     previous_local.float().square().mean().sqrt().item()
                 )
                 update_rms = float(delta.square().mean().sqrt().item())
-                ratio = update_rms / max(
-                    old_rms, self.update_ratio_floor
+                classification = classify_update(
+                    old_rms,
+                    update_rms,
+                    ratio_floor=self.update_ratio_floor,
+                    warning_ratio=self.update_ratio_warning,
+                    maximum_ratio=self.max_update_ratio,
+                    maximum_update_rms=self.max_update_rms,
                 )
                 row = {
                     'parameter': snapshot['parameter_names'].get(
                         parameter, '<unnamed>'
                     ),
-                    'old_rms': old_rms,
-                    'update_rms': update_rms,
-                    'update_ratio': ratio,
+                    **classification,
                 }
                 rows.append(row)
-                if (
-                    not math.isfinite(ratio)
-                    or not math.isfinite(update_rms)
-                    or ratio > self.max_update_ratio
-                    or update_rms > self.max_update_rms
-                ):
+                if classification['rollback']:
                     issues.append(row)
         rows.sort(key=lambda row: row['update_ratio'], reverse=True)
         return {
@@ -275,7 +349,7 @@ class Trainer:
                 (row['update_rms'] for row in rows), default=0.0
             ),
             'warning': bool(
-                rows and rows[0]['update_ratio'] > self.update_ratio_warning
+                any(row['warning'] for row in rows)
             ),
             'top_updates': rows[:5],
             'issues': issues[:20],
@@ -301,6 +375,71 @@ class Trainer:
                 f'{event} repeated {self.consecutive_rollbacks} times; '
                 f'see {self.nbs_numeric_log_path}'
             )
+
+    def _rollback_transaction(self, snapshot, event, **details):
+        self._restore_optimizer_transaction(snapshot)
+        if self.pending_transaction is snapshot:
+            self.pending_transaction = None
+        self._register_optimizer_rollback(
+            event,
+            transaction_backup_mib=(
+                snapshot['backup_bytes'] / (1024 ** 2)
+            ),
+            **details,
+        )
+
+    def _commit_pending_transaction(self, validating_batch_step, probe=False):
+        snapshot = self.pending_transaction
+        if snapshot is None:
+            return
+        diagnostics = snapshot.get('pending_rank_diagnostics')
+        if diagnostics:
+            self._write_nbs_diagnostics(diagnostics)
+        rank_event = snapshot.get('pending_rank_event')
+        if rank_event:
+            self._record_numeric_event('rank_allocation', **rank_event)
+        self._record_numeric_event(
+            'optimizer_update_committed',
+            validating_batch_step=validating_batch_step,
+            validated_by_epoch_end_probe=probe,
+            **snapshot.get('pending_update_event', {}),
+        )
+        self.pending_transaction = None
+        self.consecutive_nonfinite = 0
+        self.consecutive_rollbacks = 0
+
+    def _finalize_pending_at_epoch_end(self, batch, batch_step):
+        if self.pending_transaction is None or batch is None:
+            return
+        probe_rng = self._snapshot_rng_state()
+        try:
+            with torch.no_grad():
+                probe_loss = self.train_step(batch)
+            delta_issues = self._adalora_delta_issues()
+            probe_finite = bool(torch.isfinite(probe_loss.detach()).item())
+        except FloatingPointError as error:
+            snapshot = self.pending_transaction
+            self._rollback_transaction(
+                snapshot,
+                'epoch_end_forward_probe_rollback',
+                batch_step=batch_step,
+                error=str(error),
+                inference_details=getattr(error, 'details', None),
+            )
+            return
+        if delta_issues or not probe_finite:
+            snapshot = self.pending_transaction
+            self._rollback_transaction(
+                snapshot,
+                'epoch_end_forward_probe_rollback',
+                batch_step=batch_step,
+                loss=float(probe_loss.detach().item()),
+                adalora_delta_issues=delta_issues,
+            )
+            return
+        # A successful probe is observational and must not consume dropout RNG.
+        self._restore_rng_state(probe_rng)
+        self._commit_pending_transaction(batch_step, probe=True)
 
     def _optimizer_state_issues(self, check_dtype=False):
         issues = []
@@ -582,19 +721,63 @@ class Trainer:
         train_start = time.time()
         dataset_size = len(self.dataloader)
         accumulated_steps = 0
+        last_batch = None
+        last_batch_step = None
 
         self.model.train()
         for step, batch in enumerate(self.dataloader):
-            train_loss = self.train_step(batch)
-            delta_issues = self._adalora_delta_issues()
-            loss_is_finite = bool(torch.isfinite(train_loss.detach()).item())
-            if delta_issues or not loss_is_finite:
-                self._register_nonfinite(
-                    'forward_nonfinite', batch_step=step,
-                    loss=float(train_loss.detach().item()),
-                    adalora_delta_issues=delta_issues,
-                )
-                accumulated_steps = 0
+            last_batch = batch
+            last_batch_step = step
+            skip_batch = False
+            while True:
+                try:
+                    train_loss = self.train_step(batch)
+                    delta_issues = self._adalora_delta_issues()
+                    loss_is_finite = bool(
+                        torch.isfinite(train_loss.detach()).item()
+                    )
+                except FloatingPointError as error:
+                    if self.pending_transaction is None:
+                        self._record_numeric_event(
+                            'forward_nonfinite_without_transaction',
+                            batch_step=step,
+                            error=str(error),
+                            inference_details=getattr(error, 'details', None),
+                        )
+                        raise
+                    snapshot = self.pending_transaction
+                    self._rollback_transaction(
+                        snapshot,
+                        'next_forward_rollback',
+                        batch_step=step,
+                        error=str(error),
+                        inference_details=getattr(error, 'details', None),
+                    )
+                    accumulated_steps = 0
+                    # Retry the same numeric batch after exact restoration.
+                    continue
+                if delta_issues or not loss_is_finite:
+                    if self.pending_transaction is not None:
+                        snapshot = self.pending_transaction
+                        self._rollback_transaction(
+                            snapshot,
+                            'next_forward_rollback',
+                            batch_step=step,
+                            loss=float(train_loss.detach().item()),
+                            adalora_delta_issues=delta_issues,
+                        )
+                        accumulated_steps = 0
+                        continue
+                    self._register_nonfinite(
+                        'forward_nonfinite', batch_step=step,
+                        loss=float(train_loss.detach().item()),
+                        adalora_delta_issues=delta_issues,
+                    )
+                    accumulated_steps = 0
+                    skip_batch = True
+                    break
+                break
+            if skip_batch:
                 continue
             train_losses.append(train_loss.item())
 
@@ -613,6 +796,15 @@ class Trainer:
                 # Preserve the historical ABR training behavior for plain LoRA.
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), .25)
             if should_update:
+                # Every forward in this accumulation window has now succeeded
+                # under the previous tentative update. Commit it only here so
+                # a data-dependent overflow on batches 2..N can still roll it
+                # back exactly.
+                if (
+                    self.nbs_allocator is not None
+                    and self.pending_transaction is not None
+                ):
+                    self._commit_pending_transaction(step)
                 if self.nbs_allocator is not None:
                     if self.grad_scaler.is_enabled():
                         self.grad_scaler.unscale_(self.optimizer)
@@ -689,6 +881,15 @@ class Trainer:
                     self._snapshot_optimizer_transaction()
                     if self.nbs_allocator is not None else None
                 )
+                if transaction is not None:
+                    # Sensitivity was measured from the candidate update's
+                    # gradients. A rejected update must not retain that EMA.
+                    transaction['allocator_state']['sensitivity'] = dict(
+                        previous_sensitivity
+                    )
+                    transaction['allocator_state']['ema_step'] = (
+                        previous_ema_step
+                    )
                 transaction_backup_ms = (
                     (time.perf_counter() - transaction_started) * 1000.0
                     if transaction is not None else 0.0
@@ -714,12 +915,8 @@ class Trainer:
                         or optimizer_state_issues
                         or update_diagnostics['issues']
                     ):
-                        self._restore_optimizer_transaction(transaction)
-                        self.nbs_allocator.sensitivity.update(
-                            previous_sensitivity
-                        )
-                        self.nbs_allocator.ema_step = previous_ema_step
-                        self._register_optimizer_rollback(
+                        self._rollback_transaction(
+                            transaction,
                             'optimizer_transaction_rollback',
                             batch_step=step,
                             parameter_issues=parameter_issues,
@@ -735,9 +932,6 @@ class Trainer:
                             transaction_validation_ms=(
                                 transaction_validation_ms
                             ),
-                            transaction_backup_mib=(
-                                transaction['backup_bytes'] / (1024 ** 2)
-                            ),
                         )
                         accumulated_steps = 0
                         continue
@@ -747,25 +941,30 @@ class Trainer:
                             'optimizer_state_dtype_ready',
                             dtype='torch.float32',
                         )
-                    self._record_numeric_event(
-                        'optimizer_update_validated',
-                        batch_step=step,
-                        gradient_norm_before_clip=float(
+                    transaction['pending_update_event'] = {
+                        'batch_step': step,
+                        'gradient_norm_before_clip': float(
                             gradient_norm.item()
                         ),
-                        gradient_norm_after_clip=min(
+                        'gradient_norm_after_clip': min(
                             float(gradient_norm.item()), 0.25
                         ),
-                        update_diagnostics=update_diagnostics,
-                        transaction_backup_ms=transaction_backup_ms,
-                        transaction_validation_ms=transaction_validation_ms,
-                        transaction_backup_mib=(
+                        'update_diagnostics': update_diagnostics,
+                        'transaction_backup_ms': transaction_backup_ms,
+                        'transaction_validation_ms': (
+                            transaction_validation_ms
+                        ),
+                        'transaction_backup_mib': (
                             transaction['backup_bytes'] / (1024 ** 2)
                         ),
+                    }
+                    self._record_numeric_event(
+                        'optimizer_update_tentative',
+                        **transaction['pending_update_event'],
                     )
-                # Commit the logical step only after parameter and optimizer
-                # state validation. Allocation and scheduling must never see
-                # a rejected optimizer update.
+                # This step remains tentative until a real subsequent forward
+                # succeeds. The snapshot spans optimizer, allocator and
+                # scheduler mutations.
                 self.optimizer_step += 1
                 if self.nbs_allocator is not None:
                     should_allocate = self.nbs_allocator.should_allocate(
@@ -782,37 +981,38 @@ class Trainer:
                                 previous_masks
                             )
                         )
-                        self._write_nbs_diagnostics(
+                        transaction['pending_rank_diagnostics'] = copy.deepcopy(
                             self.nbs_allocator.last_diagnostics
                         )
-                        self._record_numeric_event(
-                            'rank_allocation',
-                            changed_slots=changed_slots,
-                            optimizer_moment_tensors_reset=reset_tensors,
-                            gradient_norm=float(gradient_norm.item()),
-                        )
+                        transaction['pending_rank_event'] = {
+                            'changed_slots': changed_slots,
+                            'optimizer_moment_tensors_reset': reset_tensors,
+                            'gradient_norm': float(gradient_norm.item()),
+                        }
                     else:
                         self.nbs_allocator.enforce_masks()
                     allocator_issues = self._allocator_numeric_issues()
                     if allocator_issues:
-                        self._record_numeric_event(
-                            'allocator_nonfinite_after_update',
-                            batch_step=step, allocator_issues=allocator_issues,
+                        self._rollback_transaction(
+                            transaction,
+                            'allocator_transaction_rollback',
+                            batch_step=step,
+                            allocator_issues=allocator_issues,
                         )
-                        raise FloatingPointError(
-                            'NBS allocator became non-finite after optimizer.step()'
-                        )
+                        accumulated_steps = 0
+                        continue
                 self.optimizer.zero_grad(set_to_none=True)
                 accumulated_steps = 0
-                self.consecutive_nonfinite = 0
-                self.consecutive_rollbacks = 0
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
+                if self.nbs_allocator is not None:
+                    self.pending_transaction = transaction
 
             if step % report_loss_per_steps == 0:                
                 mean_train_loss = np.mean(train_losses)
                 print(f'Step {step} - mean train loss {mean_train_loss:>9f}')
 
+        self._finalize_pending_at_epoch_end(last_batch, last_batch_step)
         logs['time/training'] = time.time() - train_start
         logs['training/train_loss_mean'] = np.mean(train_losses)
         logs['training/train_loss_std'] = np.std(train_losses)

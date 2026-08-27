@@ -147,8 +147,47 @@ class NBSV19WiringTest(unittest.TestCase):
             block.index('self.optimizer_step += 1'),
             block.index('self.nbs_allocator.allocate'),
         )
-        self.assertIn('_restore_optimizer_transaction', block)
+        self.assertIn('_rollback_transaction', block)
         self.assertIn('update_diagnostics', block)
+
+    def test_transaction_remains_pending_until_next_forward(self):
+        trainer_source = (
+            ABR_ROOT / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+        forward = trainer_source.index('train_loss = self.train_step(batch)')
+        catch = trainer_source.index('except FloatingPointError as error:', forward)
+        rollback = trainer_source.index("'next_forward_rollback'", catch)
+        commit = trainer_source.index(
+            'self._commit_pending_transaction(step)', rollback
+        )
+        tentative = trainer_source.index(
+            'self.pending_transaction = transaction', commit
+        )
+        self.assertLess(forward, catch)
+        self.assertLess(catch, rollback)
+        self.assertLess(rollback, commit)
+        self.assertLess(commit, tentative)
+        self.assertIn('_finalize_pending_at_epoch_end', trainer_source)
+        self.assertIn("snapshot['allocator_state']", trainer_source)
+
+    def test_pending_backup_is_committed_before_next_backup_allocation(self):
+        trainer_source = (
+            ABR_ROOT / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+        update_start = trainer_source.index('            if should_update:')
+        next_update = trainer_source.index(
+            'transaction = (\n                    '
+            'self._snapshot_optimizer_transaction()',
+            update_start,
+        )
+        commit = trainer_source.index(
+            'self._commit_pending_transaction(step)', update_start
+        )
+        pending = trainer_source.index(
+            'self.pending_transaction = transaction', next_update
+        )
+        self.assertLess(commit, next_update)
+        self.assertLess(next_update, pending)
 
     def test_rollback_controls_are_cli_configurable(self):
         source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')

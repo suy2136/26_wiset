@@ -5,6 +5,18 @@ import torch
 from plm_special.trainer import Trainer, ensure_trainable_parameters_fp32
 
 
+class FakeAllocator:
+    def __init__(self):
+        self.value = torch.tensor([1.0, 2.0])
+        self.last_diagnostics = [{'rank': 2}]
+
+    def state_dict(self):
+        return {'value': self.value.clone()}
+
+    def load_state_dict(self, state):
+        self.value.copy_(state['value'])
+
+
 class MixedDtypeModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -37,6 +49,13 @@ class NBSOptimizerTransactionTest(unittest.TestCase):
         trainer = Trainer.__new__(Trainer)
         trainer.model = model
         trainer.optimizer = optimizer
+        trainer.nbs_allocator = FakeAllocator()
+        trainer.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda _: 1.0
+        )
+        trainer.grad_scaler = torch.cuda.amp.GradScaler(enabled=False)
+        trainer.optimizer_step = 7
+        trainer.optimizer_state_dtype_verified = False
         trainer.rollback_backup_device = 'cpu'
         trainer.max_rollback_backup_mib = 2048.0
         trainer.update_ratio_warning = 0.01
@@ -71,6 +90,8 @@ class NBSOptimizerTransactionTest(unittest.TestCase):
         first_parameter = next(model.parameters())
         first_parameter.data.fill_(float('nan'))
         optimizer.state[first_parameter]['exp_avg'].fill_(float('inf'))
+        trainer.nbs_allocator.value.fill_(99.0)
+        trainer.optimizer_step = 8
 
         self.assertTrue(trainer._parameter_issues())
         self.assertTrue(trainer._optimizer_state_issues())
@@ -78,6 +99,11 @@ class NBSOptimizerTransactionTest(unittest.TestCase):
 
         self.assertFalse(trainer._parameter_issues())
         self.assertFalse(trainer._optimizer_state_issues(check_dtype=True))
+        self.assertTrue(torch.equal(
+            trainer.nbs_allocator.value,
+            snapshot['allocator_state']['value'],
+        ))
+        self.assertEqual(trainer.optimizer_step, 7)
         for parameter, previous in snapshot['parameters'].items():
             self.assertTrue(torch.equal(parameter, previous))
         for parameter, previous_state in snapshot['optimizer_states'].items():
