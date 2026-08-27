@@ -249,6 +249,22 @@ class OfflineRLPolicy(nn.Module):
                 'module': getattr(module, '_nbs_module_name', name),
                 'output_dtype': str(output_dtype),
                 'dtype_limit': dtype_limit,
+                'input_absmax': (
+                    None if not hasattr(module, '_nbs_last_input_absmax')
+                    else float(module._nbs_last_input_absmax.detach().item())
+                ),
+                'input_finite': (
+                    None if not hasattr(module, '_nbs_last_input_finite')
+                    else bool(module._nbs_last_input_finite.detach().item())
+                ),
+                'base_absmax': (
+                    None if not hasattr(module, '_nbs_last_base_absmax')
+                    else float(module._nbs_last_base_absmax.detach().item())
+                ),
+                'base_finite': (
+                    None if not hasattr(module, '_nbs_last_base_finite')
+                    else bool(module._nbs_last_base_finite.detach().item())
+                ),
                 'precast_absmax': (
                     None if precast_absmax is None
                     else float(precast_absmax.detach().item())
@@ -287,12 +303,33 @@ class OfflineRLPolicy(nn.Module):
         """Bridge FP32 ABR embeddings to the PLM dtype for every call path."""
         plm_inputs = inputs_embeds.to(self._plm_compute_dtype())
         self._require_finite(plm_inputs, 'plm_inputs')
+        # Some inference paths stop before the final Llama layer.  Clear stale
+        # adapter health from a previous call so only modules executed by this
+        # call can invalidate it.
+        health_attributes = (
+            '_nbs_last_input_absmax', '_nbs_last_input_finite',
+            '_nbs_last_base_absmax', '_nbs_last_base_finite',
+            '_nbs_last_delta_absmax', '_nbs_last_delta_finite',
+            '_nbs_last_precast_absmax', '_nbs_last_precast_finite',
+        )
+        for module in self.plm.modules():
+            for attribute in health_attributes:
+                if hasattr(module, attribute):
+                    delattr(module, attribute)
         outputs = self.plm(
             inputs_embeds=plm_inputs,
             attention_mask=attention_mask,
             output_hidden_states=True,
             stop_layer_idx=self.which_layer,
         )
+        adapter_issues = self._adalora_overflow_candidates()
+        if adapter_issues:
+            details = {
+                'stage': 'adalora_projection',
+                'adalora_overflow_candidates': adapter_issues,
+            }
+            self.last_nonfinite_inference = details
+            raise NonFiniteInferenceError(details)
         # The task-head boundary is inexpensive to keep in FP32 and avoids a
         # final FP16 residual addition overflowing otherwise-finite PLM output.
         hidden = outputs['last_hidden_state'].float()

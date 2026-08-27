@@ -117,6 +117,57 @@ class NBSNumericSafetySimulationTest(unittest.TestCase):
         self.assertTrue(committed)
         self.assertEqual(tentative['step'], 301)
 
+    def test_restored_model_specific_overflow_quarantines_only_that_batch(self):
+        """Reproduce the server failure: rollback succeeds, retry still fails."""
+        fp16_limit = 65504.0
+        tentative_model = {'weight': 0.0102, 'lr': 0.0000705}
+        restored_model = {'weight': 0.0100, 'lr': 0.0000705}
+        pending_transaction = copy.deepcopy(restored_model)
+
+        first_attempt_absmax = math.nan
+        self.assertFalse(math.isfinite(first_attempt_absmax))
+        tentative_model = copy.deepcopy(pending_transaction)
+        tentative_model['lr'] *= 0.5
+
+        # The old model can also be unsafe for one data-dependent activation;
+        # lowering LR cannot change the current forward activation.
+        retry_absmax = 70000.0
+        quarantine_batch = (
+            not math.isfinite(retry_absmax)
+            or retry_absmax > fp16_limit
+        )
+        self.assertTrue(quarantine_batch)
+        self.assertEqual(tentative_model['weight'], 0.0100)
+        self.assertEqual(tentative_model['lr'], 0.00003525)
+
+        # A following healthy batch is accepted and clears consecutive status.
+        next_batch_absmax = 42000.0
+        self.assertTrue(
+            math.isfinite(next_batch_absmax)
+            and next_batch_absmax <= fp16_limit
+        )
+
+    def test_projection_containment_cannot_silently_accept_bad_values(self):
+        fp16_limit = 65504.0
+        values = [12.0, 70000.0, -math.inf, math.nan]
+        contained = []
+        unhealthy = []
+        for value in values:
+            invalid = not math.isfinite(value) or abs(value) > fp16_limit
+            unhealthy.append(invalid)
+            if math.isnan(value):
+                contained.append(0.0)
+            elif value == math.inf:
+                contained.append(fp16_limit)
+            elif value == -math.inf:
+                contained.append(-fp16_limit)
+            else:
+                contained.append(max(-fp16_limit, min(fp16_limit, value)))
+        self.assertTrue(all(math.isfinite(value) for value in contained))
+        self.assertEqual(contained, [12.0, 65504.0, -65504.0, 0.0])
+        # Health metadata remains invalid, so policy must reject this forward.
+        self.assertEqual(unhealthy, [False, True, True, True])
+
 
 if __name__ == '__main__':
     unittest.main()

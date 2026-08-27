@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from plm_special.models.low_rank import _mixed_precision_adalora_forward
 from plm_special.trainer import Trainer, ensure_trainable_parameters_fp32
 
 
@@ -27,6 +28,36 @@ class MixedDtypeModel(torch.nn.Module):
 
 
 class NBSOptimizerTransactionTest(unittest.TestCase):
+    def test_fp16_projection_overflow_is_contained_and_flagged(self):
+        class Projection:
+            weight = torch.zeros((1, 1), dtype=torch.float16)
+            disable_adapters = False
+            merged = False
+            active_adapters = ['default']
+            lora_A = {'default': torch.ones((1, 1), dtype=torch.float32)}
+            lora_B = {'default': torch.tensor([[70000.0]])}
+            lora_E = {'default': torch.ones((1, 1), dtype=torch.float32)}
+            lora_dropout = {'default': torch.nn.Identity()}
+            ranknum = {'default': torch.tensor(1.0 - 1e-5)}
+            scaling = {'default': 1.0}
+
+            @staticmethod
+            def _linear(value):
+                return torch.zeros_like(value, dtype=torch.float16)
+
+        projection = Projection()
+        output = _mixed_precision_adalora_forward(
+            projection, torch.ones((1, 1), dtype=torch.float16)
+        )
+
+        self.assertEqual(output.dtype, torch.float16)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertEqual(float(output.abs().max()), 65504.0)
+        self.assertGreater(
+            float(projection._nbs_last_precast_absmax), 65504.0
+        )
+        self.assertTrue(bool(projection._nbs_last_precast_finite))
+
     def test_only_trainable_parameters_are_promoted_to_fp32(self):
         model = MixedDtypeModel()
 

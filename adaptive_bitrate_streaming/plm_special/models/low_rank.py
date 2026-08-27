@@ -50,7 +50,14 @@ def _mixed_precision_adalora_forward(self, x):
     if self.merged:
         return self._linear(base_input)
 
+    detached_input = base_input.detach().float()
+    self._nbs_last_input_absmax = detached_input.abs().amax().detach()
+    self._nbs_last_input_finite = torch.isfinite(detached_input).all().detach()
+
     base_result = self._linear(base_input)
+    detached_base = base_result.detach().float()
+    self._nbs_last_base_absmax = detached_base.abs().amax().detach()
+    self._nbs_last_base_finite = torch.isfinite(detached_base).all().detach()
     result_fp32 = base_result.float()
     delta_absmax = result_fp32.new_zeros(())
     delta_finite = torch.ones((), dtype=torch.bool, device=result_fp32.device)
@@ -78,7 +85,18 @@ def _mixed_precision_adalora_forward(self, x):
     self._nbs_last_precast_absmax = detached_result.abs().amax().detach()
     self._nbs_last_precast_finite = torch.isfinite(detached_result).all().detach()
     self._nbs_output_dtype = base_result.dtype
-    return result_fp32.to(base_result.dtype)
+    # Do not let one rejected FP16 projection turn every downstream layer into
+    # NaN.  The policy checks the health tensors after the PLM call and raises,
+    # so this bounded value is never accepted for loss/inference.  It merely
+    # contains the failure long enough to identify the first faulty modules.
+    dtype_limit = torch.finfo(base_result.dtype).max
+    contained_result = torch.nan_to_num(
+        result_fp32,
+        nan=0.0,
+        posinf=dtype_limit,
+        neginf=-dtype_limit,
+    ).clamp(min=-dtype_limit, max=dtype_limit)
+    return contained_result.to(base_result.dtype)
 
 
 def _patch_adalora_mixed_precision(model):

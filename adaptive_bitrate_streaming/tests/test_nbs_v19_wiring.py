@@ -189,6 +189,27 @@ class NBSV19WiringTest(unittest.TestCase):
         self.assertLess(commit, next_update)
         self.assertLess(next_update, pending)
 
+    def test_forward_overflow_is_contained_then_quarantined_after_retry(self):
+        trainer_source = (
+            ABR_ROOT / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+        low_rank_source = (
+            ABR_ROOT / 'plm_special' / 'models' / 'low_rank.py'
+        ).read_text(encoding='utf-8')
+        policy_source = (
+            ABR_ROOT / 'plm_special' / 'models' / 'rl_policy.py'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn("'forward_nonfinite_after_rollback'", trainer_source)
+        self.assertIn('skipped_nonfinite_batches_epoch += 1', trainer_source)
+        self.assertIn('self.consecutive_nonfinite = 0', trainer_source)
+        self.assertIn('torch.nan_to_num(', low_rank_source)
+        self.assertIn("'stage': 'adalora_projection'", policy_source)
+        self.assertLess(
+            policy_source.index('adapter_issues = '),
+            policy_source.index("hidden = outputs['last_hidden_state'].float()"),
+        )
+
     def test_rollback_controls_are_cli_configurable(self):
         source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')
         for option in (

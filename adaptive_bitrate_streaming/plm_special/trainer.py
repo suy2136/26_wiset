@@ -723,12 +723,12 @@ class Trainer:
         accumulated_steps = 0
         last_batch = None
         last_batch_step = None
+        skipped_nonfinite_batches_epoch = 0
 
         self.model.train()
         for step, batch in enumerate(self.dataloader):
-            last_batch = batch
-            last_batch_step = step
             skip_batch = False
+            retried_after_rollback = False
             while True:
                 try:
                     train_loss = self.train_step(batch)
@@ -738,13 +738,21 @@ class Trainer:
                     )
                 except FloatingPointError as error:
                     if self.pending_transaction is None:
-                        self._record_numeric_event(
-                            'forward_nonfinite_without_transaction',
+                        event = (
+                            'forward_nonfinite_after_rollback'
+                            if retried_after_rollback else
+                            'forward_nonfinite_without_transaction'
+                        )
+                        self._register_nonfinite(
+                            event,
                             batch_step=step,
                             error=str(error),
                             inference_details=getattr(error, 'details', None),
                         )
-                        raise
+                        accumulated_steps = 0
+                        skipped_nonfinite_batches_epoch += 1
+                        skip_batch = True
+                        break
                     snapshot = self.pending_transaction
                     self._rollback_transaction(
                         snapshot,
@@ -755,6 +763,7 @@ class Trainer:
                     )
                     accumulated_steps = 0
                     # Retry the same numeric batch after exact restoration.
+                    retried_after_rollback = True
                     continue
                 if delta_issues or not loss_is_finite:
                     if self.pending_transaction is not None:
@@ -767,18 +776,29 @@ class Trainer:
                             adalora_delta_issues=delta_issues,
                         )
                         accumulated_steps = 0
+                        retried_after_rollback = True
                         continue
+                    event = (
+                        'forward_nonfinite_after_rollback'
+                        if retried_after_rollback else 'forward_nonfinite'
+                    )
                     self._register_nonfinite(
-                        'forward_nonfinite', batch_step=step,
+                        event, batch_step=step,
                         loss=float(train_loss.detach().item()),
                         adalora_delta_issues=delta_issues,
                     )
                     accumulated_steps = 0
+                    skipped_nonfinite_batches_epoch += 1
                     skip_batch = True
                     break
+                # "Consecutive" means adjacent data batches, not failures
+                # separated by healthy forwards or optimizer commits.
+                self.consecutive_nonfinite = 0
                 break
             if skip_batch:
                 continue
+            last_batch = batch
+            last_batch_step = step
             train_losses.append(train_loss.item())
 
             # perform gradient accumulation update
@@ -1012,12 +1032,20 @@ class Trainer:
                 mean_train_loss = np.mean(train_losses)
                 print(f'Step {step} - mean train loss {mean_train_loss:>9f}')
 
+        if not train_losses:
+            raise FloatingPointError(
+                'every batch in the epoch was non-finite; refusing to report '
+                'a distorted empty training epoch'
+            )
         self._finalize_pending_at_epoch_end(last_batch, last_batch_step)
         logs['time/training'] = time.time() - train_start
         logs['training/train_loss_mean'] = np.mean(train_losses)
         logs['training/train_loss_std'] = np.std(train_losses)
         logs['training/skipped_nonfinite_updates'] = self.skipped_nonfinite_updates
         logs['training/optimizer_rollbacks'] = self.rollback_count
+        logs['training/skipped_nonfinite_batches_epoch'] = (
+            skipped_nonfinite_batches_epoch
+        )
         logs['training/invalid_nonfinite_validations'] = (
             self.invalid_nonfinite_validations
         )
