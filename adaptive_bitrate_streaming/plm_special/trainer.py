@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import time
 import csv
+import copy
 import json
 import math
 import os
@@ -12,10 +13,52 @@ from torch.utils.data import DataLoader
 from plm_special.utils.utils import process_batch
 
 
+def ensure_trainable_parameters_fp32(model):
+    """Keep the frozen PLM dtype intact while promoting trainable weights.
+
+    PEFT versions differ in whether newly-created adapter parameters inherit
+    the base model dtype.  NBS training relies on FP32 adapter/head updates,
+    so make that invariant explicit without touching frozen FP16 Llama
+    weights.
+    """
+    promoted = []
+    trainable = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad or not parameter.is_floating_point():
+            continue
+        previous_dtype = parameter.dtype
+        if previous_dtype != torch.float32:
+            parameter.data = parameter.data.float()
+            promoted.append({
+                'parameter': name,
+                'from_dtype': str(previous_dtype),
+                'to_dtype': str(parameter.dtype),
+            })
+        trainable.append((name, parameter))
+    invalid = [
+        {'parameter': name, 'dtype': str(parameter.dtype)}
+        for name, parameter in trainable
+        if parameter.dtype != torch.float32
+    ]
+    if invalid:
+        raise TypeError(
+            f'NBS trainable parameters must be FP32: {invalid[:8]}'
+        )
+    return {
+        'trainable_tensor_count': len(trainable),
+        'trainable_parameter_count': sum(
+            parameter.numel() for _, parameter in trainable
+        ),
+        'promoted_tensor_count': len(promoted),
+        'promoted': promoted,
+    }
+
+
 class Trainer:
     def __init__(self, args, model, optimizer, exp_dataset, loss_fn, device,
                  batch_size=1, grad_accum_steps=1, lr_scheduler=None,
-                 nbs_diagnostics_path=None, nbs_numeric_log_path=None):
+                 nbs_diagnostics_path=None, nbs_numeric_log_path=None,
+                 rollback_lr_callback=None):
         self.args = args
         self.model = model
         self.optimizer = optimizer
@@ -25,6 +68,7 @@ class Trainer:
         self.batch_size = batch_size
         self.grad_accum_steps = grad_accum_steps
         self.lr_scheduler = lr_scheduler
+        self.rollback_lr_callback = rollback_lr_callback
         self.optimizer_step = 0
         self.nbs_allocator = getattr(model.plm, 'nash_rank_allocator', None)
         self.nbs_diagnostics_path = nbs_diagnostics_path
@@ -34,6 +78,30 @@ class Trainer:
         self.invalid_nonfinite_validations = 0
         self.max_consecutive_nonfinite = getattr(
             args, 'nbs_max_consecutive_nonfinite', 3
+        )
+        self.optimizer_state_dtype_verified = False
+        self.rollback_count = 0
+        self.consecutive_rollbacks = 0
+        self.max_consecutive_rollbacks = getattr(
+            args, 'nbs_max_consecutive_rollbacks', 3
+        )
+        self.rollback_backup_device = getattr(
+            args, 'nbs_rollback_backup_device', 'cpu'
+        )
+        self.max_rollback_backup_mib = getattr(
+            args, 'nbs_max_rollback_backup_mib', 2048.0
+        )
+        self.update_ratio_warning = getattr(
+            args, 'nbs_update_ratio_warning', 0.01
+        )
+        self.max_update_ratio = getattr(
+            args, 'nbs_max_update_ratio', 0.05
+        )
+        self.update_ratio_floor = getattr(
+            args, 'nbs_update_ratio_floor', 0.01
+        )
+        self.max_update_rms = getattr(
+            args, 'nbs_max_update_rms', 0.01
         )
         scaler_enabled = bool(
             self.nbs_allocator is not None
@@ -55,7 +123,226 @@ class Trainer:
                 'training_start',
                 grad_scaler_enabled=self.grad_scaler.is_enabled(),
                 max_consecutive_nonfinite=self.max_consecutive_nonfinite,
+                max_consecutive_rollbacks=self.max_consecutive_rollbacks,
+                rollback_backup_device=self.rollback_backup_device,
+                max_rollback_backup_mib=self.max_rollback_backup_mib,
+                update_ratio_warning=self.update_ratio_warning,
+                max_update_ratio=self.max_update_ratio,
+                update_ratio_floor=self.update_ratio_floor,
+                max_update_rms=self.max_update_rms,
             )
+
+    def record_trainable_dtype_summary(self, summary):
+        if self.nbs_allocator is None:
+            return
+        self._record_numeric_event('trainable_dtype_ready', **summary)
+
+    def _transaction_parameters(self):
+        return [
+            parameter for parameter in self.model.parameters()
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+
+    def _snapshot_optimizer_transaction(self):
+        """Clone only trainable tensors participating in this optimizer step."""
+        parameters = self._transaction_parameters()
+        parameter_set = set(parameters)
+        parameter_names = {
+            parameter: name for name, parameter in self.model.named_parameters()
+            if parameter in parameter_set
+        }
+        estimated_bytes = sum(
+            parameter.numel() * parameter.element_size()
+            for parameter in parameters
+        )
+        estimated_bytes += sum(
+            value.numel() * value.element_size()
+            for parameter in parameters
+            for value in self.optimizer.state.get(parameter, {}).values()
+            if torch.is_tensor(value)
+        )
+        estimated_mib = estimated_bytes / (1024 ** 2)
+        if estimated_mib > self.max_rollback_backup_mib:
+            raise MemoryError(
+                'NBS rollback backup would require '
+                f'{estimated_mib:.1f} MiB, above configured limit '
+                f'{self.max_rollback_backup_mib:.1f} MiB'
+            )
+        backup_bytes = 0
+
+        def backup_tensor(value):
+            nonlocal backup_bytes
+            backup_bytes += value.numel() * value.element_size()
+            if self.rollback_backup_device == 'cpu':
+                return value.detach().to(device='cpu', copy=True)
+            return value.detach().clone()
+
+        parameter_values = {
+            parameter: backup_tensor(parameter) for parameter in parameters
+        }
+        optimizer_states = {}
+        missing_states = set()
+        for parameter in parameters:
+            state = self.optimizer.state.get(parameter)
+            if state is None:
+                missing_states.add(parameter)
+                continue
+            optimizer_states[parameter] = {
+                key: (
+                    {
+                        'tensor': backup_tensor(value),
+                        'device': value.device,
+                        'dtype': value.dtype,
+                    }
+                    if torch.is_tensor(value) else copy.deepcopy(value)
+                )
+                for key, value in state.items()
+            }
+        return {
+            'parameters': parameter_values,
+            'parameter_names': parameter_names,
+            'optimizer_states': optimizer_states,
+            'missing_states': missing_states,
+            'backup_bytes': backup_bytes,
+        }
+
+    def _restore_optimizer_transaction(self, snapshot):
+        with torch.no_grad():
+            for parameter, previous in snapshot['parameters'].items():
+                parameter.copy_(previous)
+        for parameter in snapshot['missing_states']:
+            self.optimizer.state.pop(parameter, None)
+        for parameter, state in snapshot['optimizer_states'].items():
+            current_state = self.optimizer.state.setdefault(parameter, {})
+            for key in list(current_state):
+                if key not in state:
+                    del current_state[key]
+            for key, value in state.items():
+                if isinstance(value, dict) and 'tensor' in value:
+                    current = current_state.get(key)
+                    if (
+                        torch.is_tensor(current)
+                        and current.device == value['device']
+                        and current.dtype == value['dtype']
+                        and current.shape == value['tensor'].shape
+                    ):
+                        current.copy_(value['tensor'])
+                    else:
+                        current_state[key] = value['tensor'].to(
+                            device=value['device'], dtype=value['dtype'],
+                            copy=True,
+                        )
+                else:
+                    current_state[key] = copy.deepcopy(value)
+
+    def _update_ratio_diagnostics(self, snapshot):
+        rows = []
+        issues = []
+        with torch.no_grad():
+            for parameter, previous in snapshot['parameters'].items():
+                previous_local = previous.to(
+                    device=parameter.device, dtype=parameter.dtype
+                )
+                current = parameter.detach()
+                delta = current.float() - previous_local.float()
+                old_rms = float(
+                    previous_local.float().square().mean().sqrt().item()
+                )
+                update_rms = float(delta.square().mean().sqrt().item())
+                ratio = update_rms / max(
+                    old_rms, self.update_ratio_floor
+                )
+                row = {
+                    'parameter': snapshot['parameter_names'].get(
+                        parameter, '<unnamed>'
+                    ),
+                    'old_rms': old_rms,
+                    'update_rms': update_rms,
+                    'update_ratio': ratio,
+                }
+                rows.append(row)
+                if (
+                    not math.isfinite(ratio)
+                    or not math.isfinite(update_rms)
+                    or ratio > self.max_update_ratio
+                    or update_rms > self.max_update_rms
+                ):
+                    issues.append(row)
+        rows.sort(key=lambda row: row['update_ratio'], reverse=True)
+        return {
+            'max_update_ratio': rows[0]['update_ratio'] if rows else 0.0,
+            'max_update_rms': max(
+                (row['update_rms'] for row in rows), default=0.0
+            ),
+            'warning': bool(
+                rows and rows[0]['update_ratio'] > self.update_ratio_warning
+            ),
+            'top_updates': rows[:5],
+            'issues': issues[:20],
+        }
+
+    def _register_optimizer_rollback(self, event, **details):
+        self.rollback_count += 1
+        self.consecutive_rollbacks += 1
+        self.skipped_nonfinite_updates += 1
+        lr_change = None
+        if self.rollback_lr_callback is not None:
+            lr_change = self.rollback_lr_callback(self.optimizer_step)
+        self._record_numeric_event(
+            event,
+            rollback_count=self.rollback_count,
+            consecutive_rollbacks=self.consecutive_rollbacks,
+            learning_rate_change=lr_change,
+            **details,
+        )
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.consecutive_rollbacks >= self.max_consecutive_rollbacks:
+            raise FloatingPointError(
+                f'{event} repeated {self.consecutive_rollbacks} times; '
+                f'see {self.nbs_numeric_log_path}'
+            )
+
+    def _optimizer_state_issues(self, check_dtype=False):
+        issues = []
+        tensor_states = []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            state = self.optimizer.state.get(parameter, {})
+            for state_name, value in state.items():
+                if not torch.is_tensor(value) or not value.is_floating_point():
+                    continue
+                tensor_states.append((name, state_name, value))
+                if check_dtype and value.dtype != torch.float32:
+                    issues.append({
+                        'parameter': name,
+                        'state': state_name,
+                        'reason': 'non_fp32',
+                        'dtype': str(value.dtype),
+                    })
+        # Avoid one GPU synchronization per Adam tensor on the healthy path.
+        # Scalar ``step`` states may live on CPU, so reduce health by device.
+        states_by_device = {}
+        for entry in tensor_states:
+            states_by_device.setdefault(entry[2].device, []).append(entry)
+        unhealthy_devices = set()
+        for device, entries in states_by_device.items():
+            health = torch.stack([
+                torch.isfinite(value).all() for _, _, value in entries
+            ])
+            if not bool(health.all().item()):
+                unhealthy_devices.add(device)
+        for name, state_name, value in tensor_states:
+            if value.device not in unhealthy_devices:
+                continue
+            if not bool(torch.isfinite(value).all().item()):
+                issues.append({
+                    'parameter': name,
+                    'state': state_name,
+                    'reason': 'nonfinite',
+                    'dtype': str(value.dtype),
+                })
+        return issues
 
     def _record_numeric_event(self, event, **details):
         if not self.nbs_numeric_log_path:
@@ -397,11 +684,88 @@ class Trainer:
                         continue
                 else:
                     gradient_norm = None
+                transaction_started = time.perf_counter()
+                transaction = (
+                    self._snapshot_optimizer_transaction()
+                    if self.nbs_allocator is not None else None
+                )
+                transaction_backup_ms = (
+                    (time.perf_counter() - transaction_started) * 1000.0
+                    if transaction is not None else 0.0
+                )
                 if self.grad_scaler.is_enabled():
                     self.grad_scaler.step(self.optimizer)
                     self.grad_scaler.update()
                 else:
                     self.optimizer.step()
+                if self.nbs_allocator is not None:
+                    parameter_issues = self._parameter_issues()
+                    optimizer_state_issues = self._optimizer_state_issues(
+                        check_dtype=True
+                    )
+                    update_diagnostics = self._update_ratio_diagnostics(
+                        transaction
+                    )
+                    transaction_validation_ms = (
+                        time.perf_counter() - transaction_started
+                    ) * 1000.0
+                    if (
+                        parameter_issues
+                        or optimizer_state_issues
+                        or update_diagnostics['issues']
+                    ):
+                        self._restore_optimizer_transaction(transaction)
+                        self.nbs_allocator.sensitivity.update(
+                            previous_sensitivity
+                        )
+                        self.nbs_allocator.ema_step = previous_ema_step
+                        self._register_optimizer_rollback(
+                            'optimizer_transaction_rollback',
+                            batch_step=step,
+                            parameter_issues=parameter_issues,
+                            optimizer_state_issues=optimizer_state_issues,
+                            update_diagnostics=update_diagnostics,
+                            gradient_norm_before_clip=float(
+                                gradient_norm.item()
+                            ),
+                            gradient_norm_after_clip=min(
+                                float(gradient_norm.item()), 0.25
+                            ),
+                            transaction_backup_ms=transaction_backup_ms,
+                            transaction_validation_ms=(
+                                transaction_validation_ms
+                            ),
+                            transaction_backup_mib=(
+                                transaction['backup_bytes'] / (1024 ** 2)
+                            ),
+                        )
+                        accumulated_steps = 0
+                        continue
+                    if not self.optimizer_state_dtype_verified:
+                        self.optimizer_state_dtype_verified = True
+                        self._record_numeric_event(
+                            'optimizer_state_dtype_ready',
+                            dtype='torch.float32',
+                        )
+                    self._record_numeric_event(
+                        'optimizer_update_validated',
+                        batch_step=step,
+                        gradient_norm_before_clip=float(
+                            gradient_norm.item()
+                        ),
+                        gradient_norm_after_clip=min(
+                            float(gradient_norm.item()), 0.25
+                        ),
+                        update_diagnostics=update_diagnostics,
+                        transaction_backup_ms=transaction_backup_ms,
+                        transaction_validation_ms=transaction_validation_ms,
+                        transaction_backup_mib=(
+                            transaction['backup_bytes'] / (1024 ** 2)
+                        ),
+                    )
+                # Commit the logical step only after parameter and optimizer
+                # state validation. Allocation and scheduling must never see
+                # a rejected optimizer update.
                 self.optimizer_step += 1
                 if self.nbs_allocator is not None:
                     should_allocate = self.nbs_allocator.should_allocate(
@@ -438,20 +802,10 @@ class Trainer:
                         raise FloatingPointError(
                             'NBS allocator became non-finite after optimizer.step()'
                         )
-                    parameter_issues = self._parameter_issues()
-                    if parameter_issues:
-                        self._record_numeric_event(
-                            'parameter_nonfinite_after_update',
-                            batch_step=step,
-                            parameter_issues=parameter_issues,
-                        )
-                        raise FloatingPointError(
-                            'trainable parameters became non-finite after '
-                            'optimizer.step()'
-                        )
                 self.optimizer.zero_grad(set_to_none=True)
                 accumulated_steps = 0
                 self.consecutive_nonfinite = 0
+                self.consecutive_rollbacks = 0
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
@@ -463,6 +817,7 @@ class Trainer:
         logs['training/train_loss_mean'] = np.mean(train_losses)
         logs['training/train_loss_std'] = np.std(train_losses)
         logs['training/skipped_nonfinite_updates'] = self.skipped_nonfinite_updates
+        logs['training/optimizer_rollbacks'] = self.rollback_count
         logs['training/invalid_nonfinite_validations'] = (
             self.invalid_nonfinite_validations
         )

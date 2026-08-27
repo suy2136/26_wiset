@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from config import cfg
 from baseline_special.utils.utils import load_traces
 from baseline_special.utils.constants import BITRATE_LEVELS
-from plm_special.trainer import Trainer
+from plm_special.trainer import Trainer, ensure_trainable_parameters_fp32
 from plm_special.evaluate import evaluate_on_env
 from plm_special.test import test_on_env
 from plm_special.data.dataset import ExperienceDataset
@@ -198,6 +198,17 @@ def load_model(args, model, model_dir, compact_for_inference=False):
 def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
           checkpoint_dir, best_model_dir, final_model_dir,
           eval_process_reward_fn):
+    trainable_dtype_summary = None
+    if args.nbs_v19:
+        trainable_dtype_summary = ensure_trainable_parameters_fp32(model)
+        print(
+            'NBS trainable dtype ready: FP32 tensors={} parameters={} '
+            'promoted={}'.format(
+                trainable_dtype_summary['trainable_tensor_count'],
+                trainable_dtype_summary['trainable_parameter_count'],
+                trainable_dtype_summary['promoted_tensor_count'],
+            )
+        )
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -230,6 +241,35 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         )
 
     lr_scheduler = LambdaLR(optimizer, learning_rate_multiplier)
+
+    def reduce_learning_rate_after_rollback(optimizer_step):
+        old_lrs = [group['lr'] for group in optimizer.param_groups]
+        old_scale = lr_scale['value']
+        new_scale = max(
+            old_scale * args.nbs_rollback_lr_factor,
+            minimum_lr_scale,
+        )
+        lr_scale['value'] = new_scale
+        current_factor = learning_rate_multiplier(optimizer_step)
+        new_lrs = []
+        for group, base_lr in zip(
+            optimizer.param_groups, lr_scheduler.base_lrs
+        ):
+            new_lr = base_lr * current_factor
+            group['lr'] = new_lr
+            new_lrs.append(new_lr)
+        lr_scheduler._last_lr = new_lrs
+        print(
+            'NBS optimizer rollback: learning rate reduced',
+            f'{old_lrs[0]:.8g} -> {new_lrs[0]:.8g}',
+        )
+        return {
+            'old_lrs': old_lrs,
+            'new_lrs': new_lrs,
+            'old_scale': old_scale,
+            'new_scale': new_scale,
+        }
+
     loss_fn = CrossEntropyLoss()
     trainer = Trainer(
         args, model=model, optimizer=optimizer, exp_dataset=exp_dataset,
@@ -243,7 +283,12 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             os.path.join(checkpoint_dir, 'nbs_numeric_events.jsonl')
             if args.nbs_v19 else None
         ),
+        rollback_lr_callback=(
+            reduce_learning_rate_after_rollback if args.nbs_v19 else None
+        ),
     )
+    if trainable_dtype_summary is not None:
+        trainer.record_trainable_dtype_summary(trainable_dtype_summary)
 
     target_return = exp_dataset_info.max_return * args.target_return_scale
     best_eval_return = args.initial_best_return
@@ -500,6 +545,21 @@ def run(args):
             raise ValueError('--nbs-allocation-interval must be positive')
         if args.nbs_max_consecutive_nonfinite <= 0:
             raise ValueError('--nbs-max-consecutive-nonfinite must be positive')
+        if args.nbs_max_consecutive_rollbacks <= 0:
+            raise ValueError('--nbs-max-consecutive-rollbacks must be positive')
+        if args.nbs_max_rollback_backup_mib <= 0:
+            raise ValueError('--nbs-max-rollback-backup-mib must be positive')
+        if not 0 <= args.nbs_update_ratio_warning < args.nbs_max_update_ratio:
+            raise ValueError(
+                '--nbs-update-ratio-warning must be non-negative and below '
+                '--nbs-max-update-ratio'
+            )
+        if args.nbs_update_ratio_floor <= 0:
+            raise ValueError('--nbs-update-ratio-floor must be positive')
+        if args.nbs_max_update_rms <= 0:
+            raise ValueError('--nbs-max-update-rms must be positive')
+        if not 0 < args.nbs_rollback_lr_factor < 1:
+            raise ValueError('--nbs-rollback-lr-factor must be between 0 and 1')
         if args.nbs_compaction_validation_trials <= 0:
             raise ValueError('--nbs-compaction-validation-trials must be positive')
         if args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0:
@@ -762,6 +822,23 @@ if __name__ == '__main__':
         '--nbs-max-consecutive-nonfinite', type=int, default=3,
         help='abort after this many consecutive skipped non-finite batches',
     )
+    parser.add_argument(
+        '--nbs-max-consecutive-rollbacks', type=int, default=3,
+        help='abort after this many consecutive rejected optimizer updates',
+    )
+    parser.add_argument(
+        '--nbs-rollback-backup-device', choices=('cpu', 'cuda'), default='cpu',
+        help='store optimizer transaction backups in CPU RAM or on their CUDA device',
+    )
+    parser.add_argument(
+        '--nbs-max-rollback-backup-mib', type=float, default=2048.0,
+        help='abort before a transaction backup exceeds this memory budget',
+    )
+    parser.add_argument('--nbs-update-ratio-warning', type=float, default=0.01)
+    parser.add_argument('--nbs-max-update-ratio', type=float, default=0.05)
+    parser.add_argument('--nbs-update-ratio-floor', type=float, default=0.01)
+    parser.add_argument('--nbs-max-update-rms', type=float, default=0.01)
+    parser.add_argument('--nbs-rollback-lr-factor', type=float, default=0.5)
     compaction_group = parser.add_mutually_exclusive_group()
     compaction_group.add_argument(
         '--nbs-compact-inference', dest='nbs_compact_inference',

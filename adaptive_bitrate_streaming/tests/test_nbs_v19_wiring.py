@@ -115,6 +115,8 @@ class NBSV19WiringTest(unittest.TestCase):
         for guard in (
             '_adalora_delta_issues', '_gradient_issues',
             '_parameter_issues', '_allocator_numeric_issues',
+            '_update_ratio_diagnostics',
+            '_register_optimizer_rollback',
             'error_if_nonfinite=True',
             'nbs_numeric_events.jsonl',
         ):
@@ -124,6 +126,44 @@ class NBSV19WiringTest(unittest.TestCase):
             self.assertIn(guard, source)
         self.assertIn('result_fp32 = base_result.float()', low_rank_source)
         self.assertIn('_nbs_last_precast_absmax', low_rank_source)
+
+    def test_optimizer_validation_precedes_logical_step_and_allocation(self):
+        trainer_source = (
+            ABR_ROOT / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+        start = trainer_source.index(
+            'transaction = (\n                    '
+            'self._snapshot_optimizer_transaction()'
+        )
+        end = trainer_source.index(
+            'self.optimizer.zero_grad(set_to_none=True)', start
+        )
+        block = trainer_source[start:end]
+        self.assertLess(
+            block.index('_optimizer_state_issues'),
+            block.index('self.optimizer_step += 1'),
+        )
+        self.assertLess(
+            block.index('self.optimizer_step += 1'),
+            block.index('self.nbs_allocator.allocate'),
+        )
+        self.assertIn('_restore_optimizer_transaction', block)
+        self.assertIn('update_diagnostics', block)
+
+    def test_rollback_controls_are_cli_configurable(self):
+        source = (ABR_ROOT / 'run_plm.py').read_text(encoding='utf-8')
+        for option in (
+            '--nbs-max-consecutive-rollbacks',
+            '--nbs-rollback-backup-device',
+            '--nbs-max-rollback-backup-mib',
+            '--nbs-update-ratio-warning',
+            '--nbs-max-update-ratio',
+            '--nbs-update-ratio-floor',
+            '--nbs-max-update-rms',
+            '--nbs-rollback-lr-factor',
+        ):
+            self.assertIn(option, source)
+        self.assertIn('reduce_learning_rate_after_rollback', source)
 
     def test_rank_reallocation_resets_adam_moments(self):
         source = (ABR_ROOT / 'plm_special' / 'trainer.py').read_text(

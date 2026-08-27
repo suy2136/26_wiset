@@ -1,5 +1,7 @@
 import unittest
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_ghij_pipeline as ghij
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_klmn_pipeline as klmn
@@ -54,6 +56,18 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
             self.assertEqual(command[command.index("--early-stopping-patience") + 1], "10")
             self.assertEqual(command[command.index("--early-stopping-min-epochs") + 1], "20")
             self.assertEqual(command[command.index("--early-stopping-min-delta") + 1], "0.003")
+            expected_safety = {
+                "--nbs-rollback-backup-device": "cpu",
+                "--nbs-max-rollback-backup-mib": "2048.0",
+                "--nbs-update-ratio-warning": "0.01",
+                "--nbs-max-update-ratio": "0.05",
+                "--nbs-update-ratio-floor": "0.01",
+                "--nbs-max-update-rms": "0.01",
+                "--nbs-rollback-lr-factor": "0.5",
+                "--nbs-max-consecutive-rollbacks": "3",
+            }
+            for option, value in expected_safety.items():
+                self.assertEqual(command[command.index(option) + 1], value)
 
     def test_test_conditions_require_compaction(self):
         args = self.args(ghij)
@@ -64,6 +78,21 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
             self.assertEqual(command[command.index("--temporal-selector") + 1], "none")
             self.assertEqual(command[command.index("--token-selector") + 1], "none")
             self.assertEqual(command[command.index("--speculative-draft-steps") + 1], "0")
+
+    def test_old_resume_state_accepts_new_numeric_safety_defaults(self):
+        args = self.args(ghij)
+        run_signature = group.signature(args, ghij.EXPERIMENTS)
+        old_signature = dict(run_signature)
+        old_signature.pop("numeric_safety")
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps({
+                "signature": old_signature,
+                "runs": {"G": {"status": "complete"}},
+            }), encoding="utf-8")
+            state = group.load_state(path, True, run_signature)
+        self.assertEqual(state["signature"], run_signature)
+        self.assertEqual(state["runs"]["G"]["status"], "complete")
 
 
 if __name__ == "__main__":

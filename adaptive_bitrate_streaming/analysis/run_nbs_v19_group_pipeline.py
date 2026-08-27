@@ -41,6 +41,16 @@ def build_training_command(args, experiment):
         "--plateau-lr-patience", str(args.plateau_lr_patience),
         "--plateau-lr-factor", str(args.plateau_lr_factor),
         "--plateau-min-lr", str(args.plateau_min_lr),
+        "--nbs-rollback-backup-device", args.nbs_rollback_backup_device,
+        "--nbs-max-rollback-backup-mib",
+        str(args.nbs_max_rollback_backup_mib),
+        "--nbs-update-ratio-warning", str(args.nbs_update_ratio_warning),
+        "--nbs-max-update-ratio", str(args.nbs_max_update_ratio),
+        "--nbs-update-ratio-floor", str(args.nbs_update_ratio_floor),
+        "--nbs-max-update-rms", str(args.nbs_max_update_rms),
+        "--nbs-rollback-lr-factor", str(args.nbs_rollback_lr_factor),
+        "--nbs-max-consecutive-rollbacks",
+        str(args.nbs_max_consecutive_rollbacks),
         "--trace", args.train_trace, "--trace-num", str(args.trace_num),
         "--video", args.video, "--fixed-order",
         "--device", args.device, "--device-out", args.device,
@@ -167,6 +177,16 @@ def signature(args, experiments):
             "min_epochs": args.early_stopping_min_epochs,
             "min_delta": args.early_stopping_min_delta,
         },
+        "numeric_safety": {
+            "rollback_backup_device": args.nbs_rollback_backup_device,
+            "max_rollback_backup_mib": args.nbs_max_rollback_backup_mib,
+            "update_ratio_warning": args.nbs_update_ratio_warning,
+            "max_update_ratio": args.nbs_max_update_ratio,
+            "update_ratio_floor": args.nbs_update_ratio_floor,
+            "max_update_rms": args.nbs_max_update_rms,
+            "rollback_lr_factor": args.nbs_rollback_lr_factor,
+            "max_consecutive_rollbacks": args.nbs_max_consecutive_rollbacks,
+        },
         "features": {
             "temporal_selector": "none", "token_selector": "none",
             "speculative_draft_steps": 0, "nbs_compact_inference": True,
@@ -178,8 +198,16 @@ def load_state(path, resume, run_signature):
     if not resume or not path.is_file():
         return {"signature": run_signature, "runs": {}}
     state = json.loads(path.read_text(encoding="utf-8"))
+    # States written before transactional optimizer guards did not record the
+    # safety configuration. Preserve completed runs and resume the first
+    # unfinished experiment with the newly requested guards.
+    if "numeric_safety" not in state.get("signature", {}):
+        state["signature"]["numeric_safety"] = run_signature[
+            "numeric_safety"
+        ]
     if state.get("signature") != run_signature:
         raise ValueError("saved group state does not match current experiment setup")
+    state["signature"] = run_signature
     return state
 
 
@@ -271,6 +299,21 @@ def parse_args(argv, state_file, output_file):
     parser.add_argument("--plateau-lr-patience", type=int, default=5)
     parser.add_argument("--plateau-lr-factor", type=float, default=0.5)
     parser.add_argument("--plateau-min-lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--nbs-rollback-backup-device", choices=("cpu", "cuda"),
+        default="cpu",
+    )
+    parser.add_argument(
+        "--nbs-max-rollback-backup-mib", type=float, default=2048.0,
+    )
+    parser.add_argument("--nbs-update-ratio-warning", type=float, default=0.01)
+    parser.add_argument("--nbs-max-update-ratio", type=float, default=0.05)
+    parser.add_argument("--nbs-update-ratio-floor", type=float, default=0.01)
+    parser.add_argument("--nbs-max-update-rms", type=float, default=0.01)
+    parser.add_argument("--nbs-rollback-lr-factor", type=float, default=0.5)
+    parser.add_argument(
+        "--nbs-max-consecutive-rollbacks", type=int, default=3,
+    )
     parser.add_argument("--state-file", type=Path, default=state_file)
     parser.add_argument("--output", type=Path, default=output_file)
     parser.add_argument("--resume", action="store_true")
