@@ -7,6 +7,8 @@ from adaptive_bitrate_streaming.analysis import run_nbs_v19_ghij_pipeline as ghi
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_klmn_pipeline as klmn
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_cpqr_pipeline as cpqr
 from adaptive_bitrate_streaming.analysis import run_nbs_v19_group_pipeline as group
+from adaptive_bitrate_streaming.analysis import run_abr_server1_cpq_pipeline as server1
+from adaptive_bitrate_streaming.analysis import run_abr_server2_r_seed_uniform_pipeline as server2
 
 
 class NBSV19GroupPipelineTest(unittest.TestCase):
@@ -61,6 +63,46 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
             [row["physical_rank"] for row in cpqr.EXPERIMENTS],
             [32, 32, 32, 32],
         )
+
+    def test_two_server_assignment(self):
+        self.assertEqual(
+            [row["name"] for row in server1.EXPERIMENTS],
+            ["C_REPRO", "P", "Q"],
+        )
+        self.assertEqual(
+            [row["name"] for row in server2.EXPERIMENTS],
+            ["R", "C_SEED2", "UNIFORM_R24"],
+        )
+        self.assertEqual(server2.EXPERIMENTS[1]["seed"], 2)
+        self.assertEqual(
+            server2.EXPERIMENTS[2]["method"], "uniform_lora"
+        )
+        self.assertEqual(server2.EXPERIMENTS[2]["rank_budget"], 1536)
+        self.assertEqual(server2.EXPERIMENTS[2]["physical_rank"], 24)
+
+    def test_uniform_training_and_test_commands(self):
+        args = self.args(server2)
+        uniform = server2.EXPERIMENTS[2]
+        train = group.build_training_command(args, uniform)
+        test = group.build_test_command(args, uniform, Path("checkpoint"))
+        self.assertNotIn("--nbs-v19", train)
+        self.assertNotIn("--nbs-rank-budget", train)
+        self.assertIn("--checkpoint-retention", train)
+        self.assertEqual(
+            train[train.index("--checkpoint-retention") + 1], "best-latest"
+        )
+        self.assertEqual(train[train.index("--rank") + 1], "24")
+        self.assertNotIn("--nbs-v19", test)
+        self.assertNotIn("--nbs-compact-inference", test)
+
+    def test_seed_two_replication_commands(self):
+        args = self.args(server2)
+        experiment = server2.EXPERIMENTS[1]
+        for command in (
+            group.build_training_command(args, experiment),
+            group.build_test_command(args, experiment, Path("checkpoint")),
+        ):
+            self.assertEqual(command[command.index("--seed") + 1], "2")
 
     def test_training_conditions_are_fixed(self):
         args = self.args(ghij)

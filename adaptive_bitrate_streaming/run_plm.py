@@ -35,7 +35,7 @@ from plm_special.utils.utils import set_random_seed
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
 from plm_special.utils.checkpoints import (
-    atomic_save_nbs_checkpoint,
+    atomic_save_adapter_checkpoint,
     prepare_best_latest_retention,
 )
 from models.nbs_compaction import (
@@ -71,15 +71,18 @@ def save_model(args, model, save_dir, role='checkpoint'):
         # save other modules except plm
         torch.save(model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
         allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        metadata = {
+            'variant': 'nbs_v19' if allocator is not None else 'uniform_lora',
+            'role': role,
+            'seed': args.seed,
+            'physical_rank': args.rank,
+        }
         if allocator is not None:
             torch.save(
                 allocator.state_dict(),
                 os.path.join(save_dir, 'nash_rank_allocator.pt'),
             )
-            metadata = {
-                'variant': 'nbs_v19',
-                'role': role,
-                'seed': args.seed,
+            metadata.update({
                 'rank_budget': allocator.rank_budget,
                 'effective_rank_budget': sum(allocator.ranks.values()),
                 'ema_beta': allocator.ema_beta,
@@ -87,12 +90,21 @@ def save_model(args, model, save_dir, role='checkpoint'):
                 'warmup_steps': allocator.warmup_steps,
                 'cooldown_start_step': allocator.cooldown_start_step,
                 'active_ranks': allocator.active_rank_summary(),
-            }
-            with open(
-                os.path.join(save_dir, 'checkpoint_metadata.json'),
-                'w', encoding='utf-8'
-            ) as stream:
-                json.dump(metadata, stream, indent=2, sort_keys=True)
+            })
+        else:
+            target_module_count = (
+                2 * PLM_LAYER_SIZES[args.plm_type][args.plm_size]
+            )
+            metadata.update({
+                'rank_budget': args.rank * target_module_count,
+                'effective_rank_budget': args.rank * target_module_count,
+                'active_ranks': {'uniform_rank': args.rank},
+            })
+        with open(
+            os.path.join(save_dir, 'checkpoint_metadata.json'),
+            'w', encoding='utf-8'
+        ) as stream:
+            json.dump(metadata, stream, indent=2, sort_keys=True)
     else:
         # lora is disabled, save whole model
         torch.save(model.state_dict(), os.path.join(save_dir, 'model.bin'))
@@ -301,23 +313,27 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
     )
 
     rotate_best_latest = (
-        args.nbs_v19 and args.checkpoint_retention == 'best-latest'
+        args.rank > 0 and args.checkpoint_retention == 'best-latest'
     )
     if rotate_best_latest:
-        removed = prepare_best_latest_retention(checkpoint_dir)
+        removed = prepare_best_latest_retention(
+            checkpoint_dir,
+            require_nbs_allocator=args.nbs_v19,
+        )
         if removed:
             print(
-                'Removed incomplete NBS epoch checkpoints:',
+                'Removed incomplete adapter epoch checkpoints:',
                 ', '.join(removed),
             )
 
     def save_training_checkpoint(path, role):
         if rotate_best_latest:
-            atomic_save_nbs_checkpoint(
+            atomic_save_adapter_checkpoint(
                 path,
                 lambda temporary: save_model(
                     args, model, temporary, role=role
                 ),
+                require_nbs_allocator=args.nbs_v19,
             )
         else:
             save_model(args, model, path, role=role)
@@ -889,7 +905,7 @@ if __name__ == '__main__':
     parser.add_argument('--save-checkpoint-per-epoch', type=int, help='saving checkpoint per iteration')
     parser.add_argument(
         '--checkpoint-retention', choices=('all', 'best-latest'), default='all',
-        help='retain all epoch checkpoints or rotate only NBS best/latest',
+        help='retain all epoch checkpoints or rotate only LoRA best/latest',
     )
     parser.add_argument(
         '--warm-start-model-dir',

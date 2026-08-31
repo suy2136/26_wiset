@@ -1,4 +1,4 @@
-"""Shared sequential train-and-compact-test pipeline for ABR NBS sweeps."""
+"""Shared sequential train/test pipeline for ABR NBS and LoRA sweeps."""
 
 from __future__ import annotations
 
@@ -21,15 +21,23 @@ DEFAULT_BASE_MODEL = ABR_ROOT.parent / "downloaded_plms" / "llama" / "base"
 DEFAULT_EXP_POOL = ABR_ROOT / "artifacts" / "exp_pools" / "exp_pool.pkl"
 
 
+def experiment_method(experiment):
+    return experiment.get("method", "nbs")
+
+
+def experiment_seed(experiment):
+    return int(experiment.get("seed", 1))
+
+
 def build_training_command(args, experiment):
-    return [
-        sys.executable, "run_plm.py", "--adapt", "--nbs-v19", "--fp16",
-        "--seed", "1", "--plm-type", "llama", "--plm-size", "base",
+    method = experiment_method(experiment)
+    command = [
+        sys.executable, "run_plm.py", "--adapt", "--fp16",
+        "--seed", str(experiment_seed(experiment)),
+        "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
         "--rank", str(experiment["physical_rank"]),
-        "--nbs-rank-budget", str(experiment["rank_budget"]),
-        "--nbs-rank-config", experiment["rank_config"],
         "--lr", str(experiment["lr"]),
         "--lr-schedule", "cosine",
         "--warmup-steps", str(experiment["warmup_steps"]),
@@ -41,16 +49,6 @@ def build_training_command(args, experiment):
         "--plateau-lr-patience", str(args.plateau_lr_patience),
         "--plateau-lr-factor", str(args.plateau_lr_factor),
         "--plateau-min-lr", str(args.plateau_min_lr),
-        "--nbs-rollback-backup-device", args.nbs_rollback_backup_device,
-        "--nbs-max-rollback-backup-mib",
-        str(args.nbs_max_rollback_backup_mib),
-        "--nbs-update-ratio-warning", str(args.nbs_update_ratio_warning),
-        "--nbs-max-update-ratio", str(args.nbs_max_update_ratio),
-        "--nbs-update-ratio-floor", str(args.nbs_update_ratio_floor),
-        "--nbs-max-update-rms", str(args.nbs_max_update_rms),
-        "--nbs-rollback-lr-factor", str(args.nbs_rollback_lr_factor),
-        "--nbs-max-consecutive-rollbacks",
-        str(args.nbs_max_consecutive_rollbacks),
         "--trace", args.train_trace, "--trace-num", str(args.trace_num),
         "--video", args.video, "--fixed-order",
         "--device", args.device, "--device-out", args.device,
@@ -60,18 +58,37 @@ def build_training_command(args, experiment):
         "--save-checkpoint-per-epoch", "10",
         "--checkpoint-retention", "best-latest",
     ]
+    if method == "nbs":
+        command[3:3] = [
+            "--nbs-v19",
+            "--nbs-rank-budget", str(experiment["rank_budget"]),
+            "--nbs-rank-config", experiment["rank_config"],
+            "--nbs-rollback-backup-device", args.nbs_rollback_backup_device,
+            "--nbs-max-rollback-backup-mib",
+            str(args.nbs_max_rollback_backup_mib),
+            "--nbs-update-ratio-warning", str(args.nbs_update_ratio_warning),
+            "--nbs-max-update-ratio", str(args.nbs_max_update_ratio),
+            "--nbs-update-ratio-floor", str(args.nbs_update_ratio_floor),
+            "--nbs-max-update-rms", str(args.nbs_max_update_rms),
+            "--nbs-rollback-lr-factor", str(args.nbs_rollback_lr_factor),
+            "--nbs-max-consecutive-rollbacks",
+            str(args.nbs_max_consecutive_rollbacks),
+        ]
+    elif method != "uniform_lora":
+        raise ValueError(f"unsupported experiment method: {method}")
+    return command
 
 
 def build_test_command(args, experiment, checkpoint):
-    return [
-        sys.executable, "run_plm.py", "--test", "--nbs-v19", "--fp16",
-        "--seed", "1", "--plm-type", "llama", "--plm-size", "base",
+    method = experiment_method(experiment)
+    command = [
+        sys.executable, "run_plm.py", "--test", "--fp16",
+        "--seed", str(experiment_seed(experiment)),
+        "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
         "--model-dir", str(checkpoint.resolve()),
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
         "--rank", str(experiment["physical_rank"]),
-        "--nbs-rank-budget", str(experiment["rank_budget"]),
-        "--nbs-rank-config", experiment["rank_config"],
         "--lr", str(experiment["lr"]),
         "--lr-schedule", "cosine",
         "--warmup-steps", str(experiment["warmup_steps"]),
@@ -81,28 +98,39 @@ def build_test_command(args, experiment, checkpoint):
         "--device", args.device, "--device-out", args.device,
         "--temporal-selector", "none", "--token-selector", "none",
         "--speculative-draft-steps", "0",
-        "--nbs-compact-inference",
     ]
+    if method == "nbs":
+        command[3:3] = [
+            "--nbs-v19",
+            "--nbs-rank-budget", str(experiment["rank_budget"]),
+            "--nbs-rank-config", experiment["rank_config"],
+        ]
+        command.append("--nbs-compact-inference")
+    elif method != "uniform_lora":
+        raise ValueError(f"unsupported experiment method: {method}")
+    return command
 
 
 def discover_best_checkpoint(experiment, started_at):
-    marker = (
-        f"rank_{experiment['physical_rank']}_nbs_v19_"
-        f"budget{experiment['rank_budget']}_"
-    )
     lr_marker = f"_lr_{experiment['lr']}_"
+    expected_variant = (
+        "nbs_v19" if experiment_method(experiment) == "nbs"
+        else "uniform_lora"
+    )
     candidates = []
     for metadata_path in MODEL_ROOT.rglob("checkpoint_metadata.json"):
         text = str(metadata_path)
         if (
-            marker not in text
-            or lr_marker not in text
+            lr_marker not in text
             or metadata_path.stat().st_mtime < started_at
         ):
             continue
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if (
             metadata.get("role") == "best"
+            and metadata.get("variant") == expected_variant
+            and metadata.get("seed") == experiment_seed(experiment)
+            and metadata.get("physical_rank") == experiment["physical_rank"]
             and metadata.get("effective_rank_budget")
             == experiment["rank_budget"]
         ):
@@ -115,10 +143,13 @@ def discover_best_checkpoint(experiment, started_at):
 
 
 def validate_checkpoint(path, experiment):
-    required = (
+    method = experiment_method(experiment)
+    required = [
         "adapter_config.json", "modules_except_plm.bin",
-        "nash_rank_allocator.pt", "checkpoint_metadata.json",
-    )
+        "checkpoint_metadata.json",
+    ]
+    if method == "nbs":
+        required.append("nash_rank_allocator.pt")
     missing = [name for name in required if not (path / name).is_file()]
     if not any((path / name).is_file() for name in (
         "adapter_model.bin", "adapter_model.safetensors"
@@ -131,8 +162,11 @@ def validate_checkpoint(path, experiment):
     metadata = json.loads(
         (path / "checkpoint_metadata.json").read_text(encoding="utf-8")
     )
-    if metadata.get("variant") != "nbs_v19" or metadata.get("seed") != 1:
-        raise ValueError(f"{experiment['name']} is not seed-1 NBS v19")
+    expected_variant = "nbs_v19" if method == "nbs" else "uniform_lora"
+    if metadata.get("variant") != expected_variant:
+        raise ValueError(f"{experiment['name']} checkpoint method mismatch")
+    if metadata.get("seed") != experiment_seed(experiment):
+        raise ValueError(f"{experiment['name']} checkpoint seed mismatch")
     if metadata.get("effective_rank_budget") != experiment["rank_budget"]:
         raise ValueError(f"{experiment['name']} rank budget mismatch")
     adapter = json.loads(
@@ -171,7 +205,9 @@ def signature(args, experiments):
         "trace_num": args.trace_num,
         "video": args.video,
         "device": args.device,
-        "seed": 1,
+        "seeds": {
+            item["name"]: experiment_seed(item) for item in experiments
+        },
         "early_stopping": {
             "patience": args.early_stopping_patience,
             "min_epochs": args.early_stopping_min_epochs,
@@ -189,7 +225,10 @@ def signature(args, experiments):
         },
         "features": {
             "temporal_selector": "none", "token_selector": "none",
-            "speculative_draft_steps": 0, "nbs_compact_inference": True,
+            "speculative_draft_steps": 0,
+            "nbs_compact_inference": any(
+                experiment_method(item) == "nbs" for item in experiments
+            ),
         },
     }
 
@@ -205,6 +244,13 @@ def load_state(path, resume, run_signature):
         state["signature"]["numeric_safety"] = run_signature[
             "numeric_safety"
         ]
+    # Migrate seed-1-only states produced before experiments could override
+    # the common seed (for example the new C_SEED2 replication).
+    if "seeds" not in state.get("signature", {}):
+        legacy_seed = state["signature"].pop("seed", 1)
+        state["signature"]["seeds"] = {
+            item["name"]: legacy_seed for item in run_signature["experiments"]
+        }
     if state.get("signature") != run_signature:
         raise ValueError("saved group state does not match current experiment setup")
     state["signature"] = run_signature
@@ -235,7 +281,8 @@ def result_rows(state, experiments):
             "learning_rate": experiment["lr"],
             "lr_schedule": "cosine",
             "warmup_steps": experiment["warmup_steps"],
-            "seed": 1,
+            "method": experiment_method(experiment),
+            "seed": experiment_seed(experiment),
             "checkpoint_dir": run["checkpoint_dir"],
             "metrics_path": run["metrics_path"],
             "compaction_equivalence_path": run.get(
@@ -368,10 +415,13 @@ def run_group(args, experiments):
         subprocess.run(test_command, cwd=ABR_ROOT, check=True)
         source_metrics = newest_metrics(started_at)
         metrics = json.loads(source_metrics.read_text(encoding="utf-8"))
-        if not metrics.get("nbs_compact_inference"):
-            raise RuntimeError(f"{name} inference did not use NBS compaction")
-        if not metrics.get("nbs_compaction_logits_equivalent"):
-            raise RuntimeError(f"{name} compact logits equivalence failed")
+        if experiment_method(experiment) == "nbs":
+            if not metrics.get("nbs_compact_inference"):
+                raise RuntimeError(f"{name} inference did not use NBS compaction")
+            if not metrics.get("nbs_compaction_logits_equivalent"):
+                raise RuntimeError(f"{name} compact logits equivalence failed")
+        elif metrics.get("nbs_compact_inference"):
+            raise RuntimeError(f"{name} unexpectedly used NBS compaction")
 
         metrics_dir.mkdir(parents=True, exist_ok=True)
         saved_metrics = metrics_dir / f"{name}_selector_metrics.json"
@@ -399,7 +449,7 @@ def run_group(args, experiments):
             args.output, result_rows(state, experiments), run_signature
         )
         print(
-            f"[{name}] compact test QoE={metrics['mean_reward']:.6f} "
+            f"[{name}] test QoE={metrics['mean_reward']:.6f} "
             f"latency={metrics['inference_latency_mean_ms']:.3f} ms",
             flush=True,
         )
