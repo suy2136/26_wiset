@@ -354,6 +354,30 @@ def load_state(path, resume, run_signature):
         state["signature"]["seeds"] = {
             item["name"]: legacy_seed for item in run_signature["experiments"]
         }
+    # Calibration caps do not alter a completed allocator checkpoint.  Allow
+    # an unfinished EVA run to adopt a larger convergence cap (and an
+    # explicitly recorded unconverged-at-cap fallback) without discarding
+    # already completed experiments in the same sequential server job.
+    saved_experiments = state.get("signature", {}).get("experiments", [])
+    requested_experiments = run_signature.get("experiments", [])
+    if len(saved_experiments) == len(requested_experiments):
+        calibration_fields = {
+            "eva_max_batches", "eva_allow_unconverged",
+        }
+        for saved, requested in zip(saved_experiments, requested_experiments):
+            if saved.get("name") != requested.get("name"):
+                continue
+            run = state.get("runs", {}).get(saved["name"], {})
+            if (
+                requested.get("method") == "eva"
+                and not run.get("checkpoint_dir")
+                and run.get("status") != "complete"
+            ):
+                for field in calibration_fields:
+                    if field in requested:
+                        saved[field] = requested[field]
+                    else:
+                        saved.pop(field, None)
     if state.get("signature") != run_signature:
         raise ValueError("saved group state does not match current experiment setup")
     state["signature"] = run_signature

@@ -38,7 +38,12 @@ EXPERIMENTS = (
         "eva_metric": "ratio",
         "eva_similarity_threshold": 0.99,
         "eva_min_batches": 2,
-        "eva_max_batches": 128,
+        # Match EVA's convergence-first behavior with a bounded ABR safety
+        # cap.  ``allow_unconverged`` only changes what happens at the cap;
+        # collection still exits early as soon as every selected component
+        # reaches the 0.99 similarity threshold.
+        "eva_max_batches": 512,
+        "eva_allow_unconverged": True,
     },
     {
         "name": "SHAPLEY_C1536",

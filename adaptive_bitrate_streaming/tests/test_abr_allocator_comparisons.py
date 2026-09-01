@@ -1,3 +1,5 @@
+import copy
+import json
 import tempfile
 import unittest
 from argparse import Namespace
@@ -15,6 +17,8 @@ from adaptive_bitrate_streaming.analysis.run_nbs_v19_group_pipeline import (
     build_training_command,
     expected_checkpoint_role,
     expected_variant,
+    load_state,
+    signature,
 )
 
 
@@ -87,6 +91,10 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
         test = build_test_command(self.args, experiment, checkpoint)
         self.assertIn('analysis/precompute_abr_eva.py', precompute)
         self.assertIn('--rank-budget', precompute)
+        self.assertEqual(
+            precompute[precompute.index('--max-batches') + 1], '512'
+        )
+        self.assertIn('--allow-unconverged', precompute)
         self.assertIn('--eva-state-path', train)
         self.assertIn(str((checkpoint / 'eva_state.pt').resolve()), test)
         self.assertEqual(expected_checkpoint_role(experiment), 'best')
@@ -99,6 +107,34 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
         ).read_text(encoding='utf-8')
         self.assertIn('"resume"', script)
         self.assertIn('ARGS+=(--resume)', script)
+
+    def test_resume_migrates_only_unfinished_eva_calibration_cap(self):
+        previous = copy.deepcopy(EXPERIMENTS)
+        previous[1].pop('eva_allow_unconverged', None)
+        previous[1]['eva_max_batches'] = 128
+        previous_signature = signature(self.args, previous)
+        state_path = Path(self.temporary.name) / 'state.json'
+        state_path.write_text(
+            json.dumps({
+                'signature': previous_signature,
+                'runs': {
+                    'ADALORA_C1536': {
+                        'status': 'complete',
+                        'checkpoint_dir': '/saved/adalora',
+                    }
+                },
+            }),
+            encoding='utf-8',
+        )
+
+        requested_signature = signature(self.args, EXPERIMENTS)
+        restored = load_state(state_path, True, requested_signature)
+
+        self.assertEqual(restored['signature'], requested_signature)
+        self.assertEqual(
+            restored['runs']['ADALORA_C1536']['checkpoint_dir'],
+            '/saved/adalora',
+        )
 
 
 if __name__ == '__main__':
