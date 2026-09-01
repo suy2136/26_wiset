@@ -14,7 +14,18 @@ def process_batch(batch, device='cpu'):
     """
     states, actions, returns, timesteps = batch
 
-    states = torch.cat(states, dim=0).unsqueeze(0).float().to(device)
+    # DataLoader collates dataset samples into tensors during ordinary
+    # training, while fixed Shapley validation samples are read directly
+    # from the dataset and therefore remain NumPy arrays.  Normalize both
+    # representations before concatenation so every allocator shares the
+    # same batch-processing path.
+    state_tensors = [
+        torch.as_tensor(state.tolist())
+        if isinstance(state, np.ndarray)
+        else torch.as_tensor(state)
+        for state in states
+    ]
+    states = torch.cat(state_tensors, dim=0).unsqueeze(0).float().to(device)
     actions = torch.as_tensor(actions, dtype=torch.float32, device=device).reshape(1, -1)
     labels = actions.long()
     actions = ((actions + 1) / BITRATE_LEVELS).unsqueeze(2)
