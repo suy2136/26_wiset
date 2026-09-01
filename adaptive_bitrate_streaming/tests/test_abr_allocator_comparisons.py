@@ -92,6 +92,14 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
         self.assertEqual(expected_checkpoint_role(experiment), 'best')
         self.assertEqual(expected_variant(experiment), 'eva')
 
+    def test_server1_shell_supports_checkpoint_resume(self):
+        script = (
+            Path(__file__).resolve().parents[1]
+            / 'scripts' / 'run_abr_c_matched_server1.sh'
+        ).read_text(encoding='utf-8')
+        self.assertIn('"resume"', script)
+        self.assertIn('ARGS+=(--resume)', script)
+
 
 if __name__ == '__main__':
     unittest.main()

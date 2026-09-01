@@ -33,6 +33,9 @@ from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
 from plm_special.training_control import ValidationPlateauController
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.utils import process_batch
+from plm_special.utils.adalora_checkpoint import (
+    load_resized_adalora_adapter,
+)
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
 from plm_special.utils.checkpoints import (
@@ -237,7 +240,22 @@ def _validate_and_compact_nbs_for_inference(args, model):
 def load_model(args, model, model_dir, compact_for_inference=False):
     if args.rank > 0:
         # load lora weights
-        model.plm.load_adapter(model_dir, adapter_name='default')
+        if args.lora_method in ('adalora', 'shapley'):
+            restored = load_resized_adalora_adapter(
+                model.plm,
+                model_dir,
+                adapter_name='default',
+                device=args.device or 'cpu',
+            )
+            print(
+                'Restored {} rank pattern: modules={} physical budget={}'.format(
+                    args.lora_method,
+                    restored['module_count'],
+                    restored['rank_budget'],
+                )
+            )
+        else:
+            model.plm.load_adapter(model_dir, adapter_name='default')
         # load other modules except plm
         modules_state = torch.load(
             os.path.join(model_dir, 'modules_except_plm.bin'),
