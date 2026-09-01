@@ -29,6 +29,56 @@ def experiment_seed(experiment):
     return int(experiment.get("seed", 1))
 
 
+def expected_variant(experiment):
+    return {
+        "nbs": "nbs_v19",
+        "uniform_lora": "uniform_lora",
+        "adalora": "adalora",
+        "shapley": "shapley",
+        "eva": "eva",
+    }[experiment_method(experiment)]
+
+
+def expected_checkpoint_role(experiment):
+    # An early AdaLoRA best can precede the target-budget phase.  Its final
+    # checkpoint is used for an exact capacity-matched comparison.
+    return (
+        "final"
+        if experiment_method(experiment) in ("adalora", "shapley")
+        else "best"
+    )
+
+
+def eva_state_dir(args, experiment):
+    configured = experiment.get("eva_state_path")
+    if configured:
+        path = Path(configured)
+        return path.parent if path.suffix else path
+    return args.output.parent / f"{args.output.stem}_eva" / experiment["name"]
+
+
+def build_eva_precompute_command(args, experiment):
+    command = [
+        sys.executable, "analysis/precompute_abr_eva.py", "--fp16",
+        "--plm-dir", str(args.base_model_dir.resolve()),
+        "--exp-pool-path", str(args.exp_pool_path.resolve()),
+        "--output-dir", str(eva_state_dir(args, experiment).resolve()),
+        "--device", args.device,
+        "--seed", str(experiment_seed(experiment)),
+        "--rank-budget", str(experiment["rank_budget"]),
+        "--min-rank", str(experiment.get("min_rank", 2)),
+        "--max-rank", str(experiment.get("max_rank", 32)),
+        "--metric", experiment.get("eva_metric", "ratio"),
+        "--similarity-threshold",
+        str(experiment.get("eva_similarity_threshold", 0.99)),
+        "--min-batches", str(experiment.get("eva_min_batches", 2)),
+        "--max-batches", str(experiment.get("eva_max_batches", 128)),
+    ]
+    if experiment.get("eva_allow_unconverged", False):
+        command.append("--allow-unconverged")
+    return command
+
+
 def build_training_command(args, experiment):
     method = experiment_method(experiment)
     command = [
@@ -74,6 +124,34 @@ def build_training_command(args, experiment):
             "--nbs-max-consecutive-rollbacks",
             str(args.nbs_max_consecutive_rollbacks),
         ]
+    elif method in ("adalora", "shapley"):
+        command[3:3] = [
+            "--lora-method", method,
+            "--adalora-rank-budget", str(experiment["rank_budget"]),
+            "--adalora-allocation-interval",
+            str(experiment.get("allocation_interval", 10)),
+            "--adalora-schedule-epochs",
+            str(experiment.get(
+                "adalora_schedule_epochs", args.early_stopping_min_epochs
+            )),
+        ]
+        if method == "shapley":
+            command[3:3] = [
+                "--shapley-permutations",
+                str(experiment.get("shapley_permutations", 1)),
+                "--shapley-validation-batches",
+                str(experiment.get("shapley_validation_batches", 1)),
+                "--shapley-truncate-fraction",
+                str(experiment.get("shapley_truncate_fraction", 0.05)),
+            ]
+            if not experiment.get("shapley_antithetic", True):
+                command.insert(3, "--no-shapley-antithetic")
+    elif method == "eva":
+        command[3:3] = [
+            "--lora-method", "eva",
+            "--eva-state-path",
+            str(eva_state_dir(args, experiment).resolve()),
+        ]
     elif method != "uniform_lora":
         raise ValueError(f"unsupported experiment method: {method}")
     return command
@@ -106,6 +184,30 @@ def build_test_command(args, experiment, checkpoint):
             "--nbs-rank-config", experiment["rank_config"],
         ]
         command.append("--nbs-compact-inference")
+    elif method in ("adalora", "shapley"):
+        command[3:3] = [
+            "--lora-method", method,
+            "--adalora-rank-budget", str(experiment["rank_budget"]),
+            "--adalora-allocation-interval",
+            str(experiment.get("allocation_interval", 10)),
+        ]
+        if method == "shapley":
+            command[3:3] = [
+                "--shapley-permutations",
+                str(experiment.get("shapley_permutations", 1)),
+                "--shapley-validation-batches",
+                str(experiment.get("shapley_validation_batches", 1)),
+                "--shapley-truncate-fraction",
+                str(experiment.get("shapley_truncate_fraction", 0.05)),
+            ]
+            if not experiment.get("shapley_antithetic", True):
+                command.insert(3, "--no-shapley-antithetic")
+    elif method == "eva":
+        state_path = checkpoint / "eva_state.pt"
+        command[3:3] = [
+            "--lora-method", "eva",
+            "--eva-state-path", str(state_path.resolve()),
+        ]
     elif method != "uniform_lora":
         raise ValueError(f"unsupported experiment method: {method}")
     return command
@@ -113,10 +215,7 @@ def build_test_command(args, experiment, checkpoint):
 
 def discover_best_checkpoint(experiment, started_at):
     lr_marker = f"_lr_{experiment['lr']}_"
-    expected_variant = (
-        "nbs_v19" if experiment_method(experiment) == "nbs"
-        else "uniform_lora"
-    )
+    variant = expected_variant(experiment)
     candidates = []
     for metadata_path in MODEL_ROOT.rglob("checkpoint_metadata.json"):
         text = str(metadata_path)
@@ -127,8 +226,8 @@ def discover_best_checkpoint(experiment, started_at):
             continue
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         if (
-            metadata.get("role") == "best"
-            and metadata.get("variant") == expected_variant
+            metadata.get("role") == expected_checkpoint_role(experiment)
+            and metadata.get("variant") == variant
             and metadata.get("seed") == experiment_seed(experiment)
             and metadata.get("physical_rank") == experiment["physical_rank"]
             and metadata.get("effective_rank_budget")
@@ -137,7 +236,8 @@ def discover_best_checkpoint(experiment, started_at):
             candidates.append(metadata_path.parent)
     if not candidates:
         raise RuntimeError(
-            f"{experiment['name']} produced no new matching best checkpoint"
+            f"{experiment['name']} produced no new matching "
+            f"{expected_checkpoint_role(experiment)} checkpoint"
         )
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
@@ -150,6 +250,8 @@ def validate_checkpoint(path, experiment):
     ]
     if method == "nbs":
         required.append("nash_rank_allocator.pt")
+    if method == "eva":
+        required.append("eva_state.pt")
     missing = [name for name in required if not (path / name).is_file()]
     if not any((path / name).is_file() for name in (
         "adapter_model.bin", "adapter_model.safetensors"
@@ -162,9 +264,10 @@ def validate_checkpoint(path, experiment):
     metadata = json.loads(
         (path / "checkpoint_metadata.json").read_text(encoding="utf-8")
     )
-    expected_variant = "nbs_v19" if method == "nbs" else "uniform_lora"
-    if metadata.get("variant") != expected_variant:
+    if metadata.get("variant") != expected_variant(experiment):
         raise ValueError(f"{experiment['name']} checkpoint method mismatch")
+    if metadata.get("role") != expected_checkpoint_role(experiment):
+        raise ValueError(f"{experiment['name']} checkpoint role mismatch")
     if metadata.get("seed") != experiment_seed(experiment):
         raise ValueError(f"{experiment['name']} checkpoint seed mismatch")
     if metadata.get("effective_rank_budget") != experiment["rank_budget"]:
@@ -284,6 +387,10 @@ def result_rows(state, experiments):
             "method": experiment_method(experiment),
             "seed": experiment_seed(experiment),
             "checkpoint_dir": run["checkpoint_dir"],
+            "checkpoint_metadata_path": run.get("checkpoint_metadata_path"),
+            "allocator_artifacts": ";".join(
+                run.get("allocator_artifacts", [])
+            ),
             "metrics_path": run["metrics_path"],
             "compaction_equivalence_path": run.get(
                 "compaction_equivalence_path"
@@ -381,6 +488,25 @@ def run_group(args, experiments):
     for experiment in experiments:
         name = experiment["name"]
         run = state["runs"].setdefault(name, {})
+        if experiment_method(experiment) == "eva":
+            state_path = eva_state_dir(args, experiment) / "eva_state.pt"
+            if not state_path.is_file():
+                precompute_command = build_eva_precompute_command(
+                    args, experiment
+                )
+                print(
+                    f"[{name}:eva] {shlex.join(precompute_command)}",
+                    flush=True,
+                )
+                if not args.dry_run:
+                    subprocess.run(
+                        precompute_command, cwd=ABR_ROOT, check=True
+                    )
+            elif not args.dry_run:
+                print(
+                    f"[{name}:eva] state already available: {state_path}",
+                    flush=True,
+                )
         checkpoint_text = run.get("checkpoint_dir")
         if checkpoint_text is None:
             train_command = build_training_command(args, experiment)
@@ -426,6 +552,34 @@ def run_group(args, experiments):
         metrics_dir.mkdir(parents=True, exist_ok=True)
         saved_metrics = metrics_dir / f"{name}_selector_metrics.json"
         shutil.copy2(source_metrics, saved_metrics)
+        saved_metadata = metrics_dir / f"{name}_checkpoint_metadata.json"
+        shutil.copy2(checkpoint / "checkpoint_metadata.json", saved_metadata)
+        auxiliary_artifacts = []
+        if experiment_method(experiment) in ("adalora", "shapley"):
+            diagnostic_name = (
+                f"{experiment_method(experiment)}_rank_diagnostics.jsonl"
+            )
+            diagnostic_source = checkpoint.parent / diagnostic_name
+            if diagnostic_source.is_file():
+                diagnostic_destination = metrics_dir / (
+                    f"{name}_{diagnostic_name}"
+                )
+                shutil.copy2(
+                    diagnostic_source, diagnostic_destination
+                )
+                auxiliary_artifacts.append(
+                    str(diagnostic_destination.resolve())
+                )
+        if experiment_method(experiment) == "eva":
+            source_dir = eva_state_dir(args, experiment)
+            for artifact_name in (
+                "rank_pattern.json", "explained_variance.csv", "metadata.json"
+            ):
+                source = source_dir / artifact_name
+                if source.is_file():
+                    destination = metrics_dir / f"{name}_{artifact_name}"
+                    shutil.copy2(source, destination)
+                    auxiliary_artifacts.append(str(destination.resolve()))
         equivalence_source = (
             source_metrics.parent / "nbs_compaction_equivalence.json"
         )
@@ -438,6 +592,8 @@ def run_group(args, experiments):
             "checkpoint_role": metadata.get("role"),
             "metrics": scalar_metrics(metrics),
             "metrics_path": str(saved_metrics.resolve()),
+            "checkpoint_metadata_path": str(saved_metadata.resolve()),
+            "allocator_artifacts": auxiliary_artifacts,
             "compaction_equivalence_path": (
                 None if equivalence_path is None
                 else str(equivalence_path.resolve())

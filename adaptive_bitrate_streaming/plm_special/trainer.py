@@ -60,7 +60,8 @@ class Trainer:
     def __init__(self, args, model, optimizer, exp_dataset, loss_fn, device,
                  batch_size=1, grad_accum_steps=1, lr_scheduler=None,
                  nbs_diagnostics_path=None, nbs_numeric_log_path=None,
-                 rollback_lr_callback=None):
+                 rollback_lr_callback=None,
+                 peft_allocator_diagnostics_path=None):
         self.args = args
         self.model = model
         self.optimizer = optimizer
@@ -73,8 +74,16 @@ class Trainer:
         self.rollback_lr_callback = rollback_lr_callback
         self.optimizer_step = 0
         self.nbs_allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        self.lora_method = getattr(
+            model.plm, 'abr_lora_method',
+            'nbs' if self.nbs_allocator is not None else 'uniform',
+        )
+        self.peft_adalora = self.lora_method in ('adalora', 'shapley')
         self.nbs_diagnostics_path = nbs_diagnostics_path
         self.nbs_numeric_log_path = nbs_numeric_log_path
+        self.peft_allocator_diagnostics_path = (
+            peft_allocator_diagnostics_path
+        )
         self.skipped_nonfinite_updates = 0
         self.consecutive_nonfinite = 0
         self.invalid_nonfinite_validations = 0
@@ -134,6 +143,8 @@ class Trainer:
                 update_ratio_floor=self.update_ratio_floor,
                 max_update_rms=self.max_update_rms,
             )
+        elif self.peft_adalora:
+            self.snapshot_peft_allocator(event='initialization')
 
     def record_trainable_dtype_summary(self, summary):
         if self.nbs_allocator is None:
@@ -714,6 +725,41 @@ class Trainer:
             )
         )
 
+    def snapshot_peft_allocator(self, event='snapshot'):
+        """Append model-free stock/Shapley AdaLoRA rank diagnostics."""
+        if not self.peft_adalora or not self.peft_allocator_diagnostics_path:
+            return None
+        ranks = {}
+        for name, module in self.model.plm.named_modules():
+            lora_e = getattr(module, 'lora_E', None)
+            if lora_e is None or 'default' not in lora_e:
+                continue
+            values = lora_e['default'].detach().reshape(-1)
+            ranks[name] = int((values.abs() > 1e-12).sum().item())
+        allocator = getattr(
+            self.model.plm, 'shapley_rank_allocator', None
+        )
+        payload = {
+            'event': event,
+            'optimizer_step': int(self.optimizer_step),
+            'method': self.lora_method,
+            'effective_rank_budget': int(sum(ranks.values())),
+            'active_ranks': ranks,
+        }
+        if allocator is not None:
+            payload.update({
+                'shapley_budget': allocator.last_budget,
+                'shapley_values': dict(allocator.last_module_shapley),
+            })
+        directory = os.path.dirname(self.peft_allocator_diagnostics_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(
+            self.peft_allocator_diagnostics_path, 'a', encoding='utf-8'
+        ) as stream:
+            stream.write(json.dumps(payload, sort_keys=True) + '\n')
+        return payload
+
     def train_epoch(self, report_loss_per_steps=100):
         train_losses = []
         logs = dict()
@@ -812,7 +858,7 @@ class Trainer:
                 accumulated_steps >= self.grad_accum_steps
                 or (step + 1 == dataset_size)
             )
-            if self.nbs_allocator is None:
+            if self.nbs_allocator is None and not self.peft_adalora:
                 # Preserve the historical ABR training behavior for plain LoRA.
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), .25)
             if should_update:
@@ -894,6 +940,16 @@ class Trainer:
                         )
                         accumulated_steps = 0
                         continue
+                elif self.peft_adalora:
+                    # Match the existing VP stock-AdaLoRA lifecycle: clip the
+                    # complete accumulated gradient once, then let PEFT read
+                    # that gradient after optimizer.step().
+                    if self.grad_scaler.is_enabled():
+                        self.grad_scaler.unscale_(self.optimizer)
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), .25,
+                        error_if_nonfinite=True,
+                    )
                 else:
                     gradient_norm = None
                 transaction_started = time.perf_counter()
@@ -1021,6 +1077,27 @@ class Trainer:
                         )
                         accumulated_steps = 0
                         continue
+                elif self.peft_adalora:
+                    update_and_allocate = getattr(
+                        self.model.plm.base_model,
+                        'update_and_allocate',
+                        None,
+                    )
+                    if update_and_allocate is None:
+                        raise RuntimeError(
+                            f'{self.lora_method} requires PEFT '
+                            'base_model.update_and_allocate()'
+                        )
+                    # PEFT reads the still-available A/B/E gradients, updates
+                    # its importance statistics, and applies the current
+                    # global budget before zero_grad().  Shapley replaces only
+                    # PEFT's rankallocator, so it follows this same lifecycle.
+                    update_and_allocate(self.optimizer_step)
+                    interval = int(getattr(
+                        self.args, 'adalora_allocation_interval', 10
+                    ))
+                    if self.optimizer_step % interval == 0:
+                        self.snapshot_peft_allocator(event='allocation')
                 self.optimizer.zero_grad(set_to_none=True)
                 accumulated_steps = 0
                 if self.lr_scheduler is not None:

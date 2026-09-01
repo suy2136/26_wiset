@@ -32,6 +32,7 @@ from plm_special.models.low_rank import peft_model
 from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
 from plm_special.training_control import ValidationPlateauController
 from plm_special.utils.utils import set_random_seed
+from plm_special.utils.utils import process_batch
 from plm_special.utils.plm_utils import load_plm
 from plm_special.utils.console_logger import ConsoleLogger
 from plm_special.utils.checkpoints import (
@@ -43,6 +44,7 @@ from models.nbs_compaction import (
     extract_nbs_compaction_specs,
     validate_nbs_compaction_factors,
 )
+from models.eva_initializer import validate_eva_state
 
 
 PLM_LAYER_SIZES = {
@@ -64,6 +66,18 @@ PLM_LAYER_SIZES = {
 }
 
 
+def _active_adalora_ranks(plm, adapter_name='default'):
+    """Return model-free active-rank metadata from AdaLoRA singular values."""
+    ranks = {}
+    for name, module in plm.named_modules():
+        lora_e = getattr(module, 'lora_E', None)
+        if lora_e is None or adapter_name not in lora_e:
+            continue
+        values = lora_e[adapter_name].detach().reshape(-1)
+        ranks[name] = int((values.abs() > 1e-12).sum().item())
+    return ranks
+
+
 def save_model(args, model, save_dir, role='checkpoint'):
     if args.rank > 0:
         # save lora weights
@@ -71,8 +85,17 @@ def save_model(args, model, save_dir, role='checkpoint'):
         # save other modules except plm
         torch.save(model.modules_except_plm.state_dict(), os.path.join(save_dir, 'modules_except_plm.bin'))
         allocator = getattr(model.plm, 'nash_rank_allocator', None)
+        lora_method = getattr(
+            model.plm, 'abr_lora_method',
+            'nbs' if allocator is not None else 'uniform',
+        )
         metadata = {
-            'variant': 'nbs_v19' if allocator is not None else 'uniform_lora',
+            'variant': (
+                'nbs_v19' if lora_method == 'nbs'
+                else 'uniform_lora' if lora_method == 'uniform'
+                else lora_method
+            ),
+            'lora_method': lora_method,
             'role': role,
             'seed': args.seed,
             'physical_rank': args.rank,
@@ -90,6 +113,44 @@ def save_model(args, model, save_dir, role='checkpoint'):
                 'warmup_steps': allocator.warmup_steps,
                 'cooldown_start_step': allocator.cooldown_start_step,
                 'active_ranks': allocator.active_rank_summary(),
+            })
+        elif lora_method in ('adalora', 'shapley'):
+            active_ranks = _active_adalora_ranks(model.plm)
+            metadata.update({
+                'rank_budget': getattr(
+                    model.plm, 'abr_effective_rank_budget',
+                    getattr(args, 'adalora_rank_budget', None),
+                ),
+                'effective_rank_budget': sum(active_ranks.values()),
+                'active_ranks': active_ranks,
+                'allocation_interval': getattr(
+                    args, 'adalora_allocation_interval', None,
+                ),
+            })
+            shapley = getattr(model.plm, 'shapley_rank_allocator', None)
+            if shapley is not None:
+                metadata.update({
+                    'shapley_permutations': shapley.n_permutations,
+                    'shapley_truncate_fraction': shapley.truncate_fraction,
+                    'shapley_last_budget': shapley.last_budget,
+                    'shapley_values': shapley.last_module_shapley,
+                })
+        elif lora_method == 'eva':
+            eva_state = getattr(model.plm, 'eva_state', None)
+            if eva_state is None:
+                raise RuntimeError('EVA checkpoint has no attached EVA state')
+            torch.save(eva_state, os.path.join(save_dir, 'eva_state.pt'))
+            rank_pattern = {
+                str(name): int(value)
+                for name, value in eva_state['rank_pattern'].items()
+            }
+            metadata.update({
+                'rank_budget': int(eva_state['total_rank_budget']),
+                'effective_rank_budget': int(eva_state['total_rank_budget']),
+                'active_ranks': rank_pattern,
+                'eva_metric': eva_state.get('metric'),
+                'eva_processed_batches': eva_state.get('processed_batches'),
+                'eva_converged': eva_state.get('converged'),
             })
         else:
             target_module_count = (
@@ -211,11 +272,12 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
           checkpoint_dir, best_model_dir, final_model_dir,
           eval_process_reward_fn):
     trainable_dtype_summary = None
-    if args.nbs_v19:
+    if args.lora_method in ('nbs', 'adalora', 'shapley'):
         trainable_dtype_summary = ensure_trainable_parameters_fp32(model)
         print(
-            'NBS trainable dtype ready: FP32 tensors={} parameters={} '
+            '{} trainable dtype ready: FP32 tensors={} parameters={} '
             'promoted={}'.format(
+                args.lora_method,
                 trainable_dtype_summary['trainable_tensor_count'],
                 trainable_dtype_summary['trainable_parameter_count'],
                 trainable_dtype_summary['promoted_tensor_count'],
@@ -283,6 +345,49 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         }
 
     loss_fn = CrossEntropyLoss()
+
+    if args.lora_method == 'shapley':
+        shapley_allocator = getattr(
+            model.plm, 'shapley_rank_allocator', None
+        )
+        if shapley_allocator is None:
+            raise RuntimeError(
+                'Shapley was selected but no Shapley allocator is attached'
+            )
+        batch_count = min(
+            args.shapley_validation_batches, len(exp_dataset)
+        )
+        if batch_count <= 0:
+            raise RuntimeError('Shapley requires at least one ABR batch')
+        indices = np.linspace(
+            0, len(exp_dataset) - 1, num=batch_count, dtype=int
+        ).tolist()
+        fixed_batches = [exp_dataset[index] for index in indices]
+
+        def shapley_validation_loss():
+            was_training = model.training
+            model.eval()
+            losses = []
+            try:
+                with torch.no_grad():
+                    for batch in fixed_batches:
+                        states, actions, returns, timesteps, labels = (
+                            process_batch(batch, device=args.device)
+                        )
+                        logits = model(
+                            states, actions, returns, timesteps
+                        ).permute(0, 2, 1)
+                        losses.append(loss_fn(logits, labels).float())
+                return float(torch.stack(losses).mean().item())
+            finally:
+                model.train(was_training)
+
+        shapley_allocator.set_loss_fn(shapley_validation_loss)
+        print(
+            'Shapley fixed ABR allocation batches:', indices,
+            '(deterministic cross-entropy proxy)',
+        )
+
     trainer = Trainer(
         args, model=model, optimizer=optimizer, exp_dataset=exp_dataset,
         loss_fn=loss_fn, device=args.device, lr_scheduler=lr_scheduler,
@@ -297,6 +402,13 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         ),
         rollback_lr_callback=(
             reduce_learning_rate_after_rollback if args.nbs_v19 else None
+        ),
+        peft_allocator_diagnostics_path=(
+            os.path.join(
+                checkpoint_dir,
+                f'{args.lora_method}_rank_diagnostics.jsonl',
+            )
+            if args.lora_method in ('adalora', 'shapley') else None
         ),
     )
     if trainable_dtype_summary is not None:
@@ -463,6 +575,9 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
     trainer.snapshot_nbs(
         event='early_stopping' if early_stopped else 'training_end'
     )
+    trainer.snapshot_peft_allocator(
+        event='early_stopping' if early_stopped else 'training_end'
+    )
     if rotate_best_latest:
         latest_model_dir = os.path.join(checkpoint_dir, 'latest')
         save_training_checkpoint(latest_model_dir, role='final')
@@ -497,6 +612,25 @@ def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, tes
 
 
 def run(args):
+    # Preserve programmatic callers created before --lora-method existed.
+    if getattr(args, 'lora_method', None) is None:
+        args.lora_method = (
+            'nbs' if getattr(args, 'nbs_v19', False) else 'uniform'
+        )
+    args.nbs_v19 = args.lora_method == 'nbs'
+    comparison_defaults = {
+        'adalora_rank_budget': None,
+        'adalora_allocation_interval': 10,
+        'adalora_schedule_epochs': None,
+        'shapley_permutations': 1,
+        'shapley_validation_batches': 1,
+        'shapley_truncate_fraction': 0.05,
+        'shapley_antithetic': True,
+        'eva_state_path': None,
+    }
+    for name, value in comparison_defaults.items():
+        if not hasattr(args, name):
+            setattr(args, name, value)
     assert args.plm_type in cfg.plm_types
     assert args.plm_size in cfg.plm_sizes
     assert args.exp_pool_path is not None, 'please specify a experience pool path for training'
@@ -550,11 +684,68 @@ def run(args):
         raise ValueError('--plateau-lr-factor must be between 0 and 1')
     if not 0 <= args.plateau_min_lr <= args.lr:
         raise ValueError('--plateau-min-lr must be between 0 and --lr')
-    if args.nbs_v19:
+    if args.lora_method in ('nbs', 'adalora', 'shapley', 'eva'):
         if args.plm_type != 'llama':
-            raise ValueError('NBS v19 currently supports --plm-type llama only')
+            raise ValueError(
+                f'{args.lora_method} currently supports --plm-type llama only'
+            )
         if args.rank <= 0:
-            raise ValueError('NBS v19 requires a positive physical --rank')
+            raise ValueError(
+                f'{args.lora_method} requires a positive physical --rank'
+            )
+    if args.lora_method in ('adalora', 'shapley'):
+        module_count = 2 * PLM_LAYER_SIZES[args.plm_type][args.plm_size]
+        if args.adalora_rank_budget is None:
+            raise ValueError(
+                '--adalora-rank-budget is required for AdaLoRA/Shapley'
+            )
+        target_rank, remainder = divmod(
+            args.adalora_rank_budget, module_count
+        )
+        if remainder:
+            raise ValueError(
+                '--adalora-rank-budget must be divisible by the number of '
+                f'target modules ({module_count})'
+            )
+        if not 1 <= target_rank <= args.rank:
+            raise ValueError(
+                f'AdaLoRA target rank {target_rank} must be in [1, {args.rank}]'
+            )
+        if args.adalora_allocation_interval <= 0:
+            raise ValueError('--adalora-allocation-interval must be positive')
+        if (
+            args.adalora_schedule_epochs is not None
+            and args.adalora_schedule_epochs <= 0
+        ):
+            raise ValueError('--adalora-schedule-epochs must be positive')
+    if args.lora_method == 'shapley':
+        if args.shapley_permutations <= 0:
+            raise ValueError('--shapley-permutations must be positive')
+        if args.shapley_validation_batches <= 0:
+            raise ValueError('--shapley-validation-batches must be positive')
+        if not 0 <= args.shapley_truncate_fraction <= 1:
+            raise ValueError(
+                '--shapley-truncate-fraction must be in [0, 1]'
+            )
+    eva_state = None
+    if args.lora_method == 'eva':
+        if not args.eva_state_path:
+            raise ValueError('--lora-method eva requires --eva-state-path')
+        eva_state_path = args.eva_state_path
+        if os.path.isdir(eva_state_path):
+            eva_state_path = os.path.join(eva_state_path, 'eva_state.pt')
+        if not os.path.isfile(eva_state_path):
+            raise FileNotFoundError(f'EVA state not found: {eva_state_path}')
+        eva_state = torch.load(eva_state_path, map_location='cpu')
+        validate_eva_state(eva_state)
+        if int(eva_state['total_rank_budget']) <= 0:
+            raise ValueError('EVA state rank budget must be positive')
+        print(
+            'ABR EVA state loaded:', eva_state_path,
+            'budget=', eva_state['total_rank_budget'],
+            'modules=', len(eva_state['rank_pattern']),
+        )
+    if args.nbs_v19:
         if args.nbs_rank_budget <= 0:
             raise ValueError('--nbs-rank-budget must be positive')
         if args.nbs_allocation_interval <= 0:
@@ -645,6 +836,16 @@ def run(args):
             1,
             math.ceil(len(exp_dataset) / args.grad_accum_steps) * args.num_epochs,
         )
+        allocation_total_steps = total_optimizer_steps
+        if (
+            args.lora_method in ('adalora', 'shapley')
+            and args.adalora_schedule_epochs is not None
+        ):
+            allocation_total_steps = max(
+                1,
+                math.ceil(len(exp_dataset) / args.grad_accum_steps)
+                * min(args.num_epochs, args.adalora_schedule_epochs),
+            )
         rank_config = None
         if args.nbs_v19:
             rank_config_path = args.nbs_rank_config
@@ -657,11 +858,19 @@ def run(args):
         plm = peft_model(
             plm, args.plm_type, rank=args.rank,
             nbs_v19=args.nbs_v19,
-            total_step=total_optimizer_steps,
+            lora_method=args.lora_method,
+            total_step=allocation_total_steps,
             nbs_rank_budget=args.nbs_rank_budget,
             nbs_ema_beta=args.nbs_ema_beta,
             nbs_allocation_interval=args.nbs_allocation_interval,
             nbs_rank_config=rank_config,
+            adalora_rank_budget=args.adalora_rank_budget,
+            adalora_allocation_interval=args.adalora_allocation_interval,
+            shapley_permutations=args.shapley_permutations,
+            shapley_truncate_fraction=args.shapley_truncate_fraction,
+            shapley_seed=args.seed,
+            shapley_antithetic=args.shapley_antithetic,
+            eva_state=eva_state,
         )
 
     # 4.2 create state encoder
@@ -713,10 +922,17 @@ def run(args):
     # extract training experience pool information
     train_exp_pool_info = args.exp_pool_path.split('/')[-4:-1]
     train_exp_pool_info = '_'.join(train_exp_pool_info)
-    nbs_tag = (
-        f'_nbs_v19_budget{args.nbs_rank_budget}' if args.nbs_v19 else ''
-    )
-    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
+    if args.lora_method == 'nbs':
+        method_tag = f'_nbs_v19_budget{args.nbs_rank_budget}'
+    elif args.lora_method in ('adalora', 'shapley'):
+        method_tag = (
+            f'_{args.lora_method}_budget{args.adalora_rank_budget}'
+        )
+    elif args.lora_method == 'eva':
+        method_tag = f'_eva_budget{eva_state["total_rank_budget"]}'
+    else:
+        method_tag = ''
+    models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
     if args.temporal_selector == 'event-aware':
         selector_tag = (
@@ -750,7 +966,7 @@ def run(args):
         f'{args.trace}_{args.video}',
         f'trace_num_{args.trace_num}_fixed_{args.fixed_order}',
         f'{args.plm_type}_{args.plm_size}',
-        f'early_stop_{args.which_layer}_rank_{args.rank}{nbs_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}',
+        f'early_stop_{args.which_layer}_rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}',
         selector_tag,
         speculative_tag,
     ]
@@ -821,8 +1037,53 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true',
                         help='load base PLM weights directly in FP16')
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
+    parser.add_argument(
+        '--lora-method',
+        choices=('uniform', 'nbs', 'adalora', 'shapley', 'eva'),
+        default=None,
+        help=(
+            'LoRA allocation method. Omit to preserve the historical '
+            '--nbs-v19/uniform behavior.'
+        ),
+    )
     parser.add_argument('--nbs-v19', action='store_true',
                         help='enable the fixed-budget NBS allocation v19 recipe')
+    parser.add_argument(
+        '--adalora-rank-budget', type=int,
+        help='exact final global rank budget for stock/Shapley AdaLoRA',
+    )
+    parser.add_argument(
+        '--adalora-allocation-interval', type=int, default=10,
+        help='optimizer-step interval used by PEFT AdaLoRA scheduling',
+    )
+    parser.add_argument(
+        '--adalora-schedule-epochs', type=int,
+        help=(
+            'optional number of epochs over which stock/Shapley AdaLoRA '
+            'reaches its target budget; training may continue afterward'
+        ),
+    )
+    parser.add_argument(
+        '--shapley-permutations', type=int, default=1,
+        help='Monte Carlo permutations per Shapley allocation event',
+    )
+    parser.add_argument(
+        '--shapley-validation-batches', type=int, default=1,
+        help='deterministic fixed ABR batches used by the Shapley loss proxy',
+    )
+    parser.add_argument(
+        '--shapley-truncate-fraction', type=float, default=0.05,
+        help='early truncation tolerance for Shapley coalition evaluation',
+    )
+    parser.add_argument(
+        '--no-shapley-antithetic', action='store_false',
+        dest='shapley_antithetic', default=True,
+        help='disable reversed antithetic Shapley permutations',
+    )
+    parser.add_argument(
+        '--eva-state-path',
+        help='precomputed ABR EVA state file or its containing directory',
+    )
     parser.add_argument('--nbs-rank-budget', type=int, default=512,
                         help='global active-rank budget for NBS v19')
     parser.add_argument('--nbs-ema-beta', type=float, default=0.9,
@@ -953,6 +1214,12 @@ if __name__ == '__main__':
     parser.add_argument('--device-mid', action='store', dest='device_mid', help='device (cuda or cpu) to place the split of model between the input and output')
     
     args = parser.parse_args()
+
+    if args.lora_method is None:
+        args.lora_method = 'nbs' if args.nbs_v19 else 'uniform'
+    elif args.nbs_v19 and args.lora_method != 'nbs':
+        parser.error('--nbs-v19 cannot be combined with a non-NBS --lora-method')
+    args.nbs_v19 = args.lora_method == 'nbs'
 
     if args.nbs_compact_inference is None:
         args.nbs_compact_inference = bool(args.test and args.nbs_v19)
