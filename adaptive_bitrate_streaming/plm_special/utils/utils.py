@@ -19,13 +19,37 @@ def process_batch(batch, device='cpu'):
     # from the dataset and therefore remain NumPy arrays.  Normalize both
     # representations before concatenation so every allocator shares the
     # same batch-processing path.
-    state_tensors = [
-        torch.as_tensor(state.tolist())
-        if isinstance(state, np.ndarray)
-        else torch.as_tensor(state)
-        for state in states
-    ]
-    states = torch.cat(state_tensors, dim=0).unsqueeze(0).float().to(device)
+    if isinstance(states, np.ndarray):
+        states = torch.as_tensor(states.tolist())
+    elif not torch.is_tensor(states):
+        state_tensors = [
+            torch.as_tensor(state.tolist())
+            if isinstance(state, np.ndarray)
+            else torch.as_tensor(state)
+            for state in states
+        ]
+        if not state_tensors:
+            raise ValueError('states must contain at least one timestep')
+        if state_tensors[0].ndim == 2:
+            # A sample read directly from ExperienceDataset: one (6, 6)
+            # array per timestep.
+            states = torch.stack(state_tensors, dim=0)
+        elif state_tensors[0].ndim == 3:
+            # DataLoader(batch_size=1): one (1, 6, 6) tensor per timestep.
+            states = torch.cat(state_tensors, dim=0)
+        else:
+            raise ValueError(
+                'unsupported ABR state timestep shape: '
+                f'{tuple(state_tensors[0].shape)}'
+            )
+    if states.ndim == 3:
+        states = states.unsqueeze(0)
+    if states.ndim != 4:
+        raise ValueError(
+            'ABR states must have shape (batch, sequence, 6, 6), got '
+            f'{tuple(states.shape)}'
+        )
+    states = states.float().to(device)
     actions = torch.as_tensor(actions, dtype=torch.float32, device=device).reshape(1, -1)
     labels = actions.long()
     actions = ((actions + 1) / BITRATE_LEVELS).unsqueeze(2)
