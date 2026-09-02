@@ -39,7 +39,9 @@ def parse_args() -> argparse.Namespace:
                  "nbs_v19_data2", "nbs_budget256_seed1",
                  "nbs_adaptive_tau015",
                  "uniform_r12", "uniform_b736", "adalora_peft_r12",
-                 "shapley_v19", "eva", "plain"),
+                 "shapley_v19", "eva", "plain",
+                 "uniform_r8_data2", "adalora_b512_data2",
+                 "eva_b512_data2", "shapley_b512_data2"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
@@ -338,6 +340,10 @@ def main() -> None:
         "adalora_peft_r12": "Stock PEFT AdaLoRA r12 + Selector + Speculative",
         "shapley_v19": "Shapley AdaLoRA (v19 training conditions)",
         "eva": "EVA-NetLLM (activation-PCA rank allocation)",
+        "uniform_r8_data2": "Uniform LoRA (rank8, budget512, data seed2)",
+        "adalora_b512_data2": "Stock AdaLoRA (init32-target8, data seed2)",
+        "eva_b512_data2": "EVA (min2-max32-budget512, data seed2)",
+        "shapley_b512_data2": "Shapley AdaLoRA (init32-target8, data seed2)",
         "plain": "NetLLM",
     }
     display_name = args.display_name or display_names[args.variant]
@@ -461,9 +467,9 @@ def main() -> None:
     if allocator and allocator.get("histogram"):
         rank_items = sorted((int(rank), count) for rank, count in allocator["histogram"].items())
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
-        if args.variant == "eva":
+        if args.variant in ("eva", "eva_b512_data2"):
             allocation_name = "EVA"
-        elif args.variant == "shapley_v19":
+        elif args.variant in ("shapley_v19", "shapley_b512_data2"):
             allocation_name = "Shapley"
         else:
             allocation_name = "NBS"
@@ -476,7 +482,10 @@ def main() -> None:
         if args.variant == "uniform_b736":
             rank_text = "Fixed ranks: 32 x 11 + 32 x 12\nTotal budget = 736"
         else:
-            uniform_rank = 12 if args.variant == "uniform_r12" else 32
+            uniform_rank = {
+                "uniform_r12": 12,
+                "uniform_r8_data2": 8,
+            }.get(args.variant, 32)
             rank_text = f"Uniform rank = {uniform_rank}"
         axes[1, 2].text(0.5, 0.5, rank_text, ha="center", va="center")
         axes[1, 2].set_title("LoRA rank allocation")

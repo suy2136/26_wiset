@@ -133,6 +133,7 @@ def print_trainable_parameters(model):
 
 def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 use_adalora=False, total_step=None, adalora_min_rank=None,
+                adalora_init_rank=None,
                 adalora_ema_beta=0.9, adalora_eps=1e-8,
                 adalora_allocation_interval=10, adalora_rank_budget=None,
                 adalora_rank_config=None, adalora_missing_grad_policy="zero",
@@ -204,8 +205,16 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
         physical_rank = (
             _adalora_physical_rank(rank, adalora_rank_config)
             if adalora_allocator == "nbs"
-            else int(rank) * 2
+            else (
+                int(adalora_init_rank)
+                if adalora_init_rank is not None else int(rank) * 2
+            )
         )
+        if physical_rank < int(rank):
+            raise ValueError(
+                "AdaLoRA physical init rank must be at least target rank: "
+                f"init={physical_rank}, target={rank}"
+            )
         config = AdaLoraConfig(
             init_r=physical_rank,
             target_r=rank,

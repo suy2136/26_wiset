@@ -1542,6 +1542,7 @@ def run(args):
                 use_adalora=args.use_adalora,
                 total_step=total_step,
                 adalora_min_rank=args.adalora_min_rank,
+                adalora_init_rank=args.adalora_init_rank,
                 adalora_ema_beta=args.adalora_ema_beta,
                 adalora_eps=args.adalora_eps,
                 adalora_allocation_interval=args.adalora_allocation_interval,
@@ -1834,6 +1835,14 @@ if __name__ == '__main__':
                         help='Path to EVA eva_state.pt, or to its containing directory.')
     parser.add_argument('--adalora-min-rank', type=int, default=None,
                         help='Minimum rank per LoRA layer for Nash allocation (default: rank//2).')
+    parser.add_argument(
+        '--adalora-init-rank', type=int, default=None,
+        help=(
+            'Optional physical AdaLoRA rank for stock PEFT/Shapley runs. '
+            'The target rank remains --rank; omission preserves the historical '
+            '2x target-rank initialization.'
+        ),
+    )
     parser.add_argument('--adalora-ema-beta', type=float, default=0.9,
                         help='EMA coefficient for layer gradient sensitivity.')
     parser.add_argument('--adalora-eps', type=float, default=1e-8,
@@ -1917,7 +1926,9 @@ if __name__ == '__main__':
                                  'nbs_v19_data2', 'nbs_budget256_seed1',
                                  'nbs_adaptive_tau015',
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
-                                 'adalora_shapley', 'shapley_v19', 'eva'],
+                                 'adalora_shapley', 'shapley_v19', 'eva',
+                                 'uniform_r8_data2', 'adalora_b512_data2',
+                                 'eva_b512_data2', 'shapley_b512_data2'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
@@ -1954,6 +1965,13 @@ if __name__ == '__main__':
                 '--adalora-budget-mode adaptive requires '
                 '--adalora-shadow-update-policy active-only'
             )
+    if args.adalora_init_rank is not None:
+        if not args.use_adalora:
+            parser.error('--adalora-init-rank requires --use-adalora')
+        if args.adalora_init_rank <= 0:
+            parser.error('--adalora-init-rank must be positive')
+        if args.rank != -1 and args.adalora_init_rank < args.rank:
+            parser.error('--adalora-init-rank must be at least --rank')
     if args.adalora_allocator == 'shapley':
         if not args.use_adalora or args.rank == -1:
             parser.error(
