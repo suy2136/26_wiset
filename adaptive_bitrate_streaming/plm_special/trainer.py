@@ -79,6 +79,12 @@ class Trainer:
             'nbs' if self.nbs_allocator is not None else 'uniform',
         )
         self.peft_adalora = self.lora_method in ('adalora', 'shapley')
+        # EVA keeps fixed ranks, but still needs the same parameter/optimizer
+        # transaction safety used by NBS. NBS-specific allocation behavior is
+        # deliberately not enabled for EVA.
+        self.transactional_numeric_safety = (
+            self.nbs_allocator is not None or self.lora_method == 'eva'
+        )
         self.nbs_diagnostics_path = nbs_diagnostics_path
         self.nbs_numeric_log_path = nbs_numeric_log_path
         self.peft_allocator_diagnostics_path = (
@@ -145,9 +151,18 @@ class Trainer:
             )
         elif self.peft_adalora:
             self.snapshot_peft_allocator(event='initialization')
+        elif self.lora_method == 'eva':
+            self._record_numeric_event(
+                'training_start',
+                transactional_numeric_safety=True,
+                max_consecutive_nonfinite=self.max_consecutive_nonfinite,
+                max_consecutive_rollbacks=self.max_consecutive_rollbacks,
+                rollback_backup_device=self.rollback_backup_device,
+                max_rollback_backup_mib=self.max_rollback_backup_mib,
+            )
 
     def record_trainable_dtype_summary(self, summary):
-        if self.nbs_allocator is None:
+        if not self.nbs_numeric_log_path:
             return
         self._record_numeric_event('trainable_dtype_ready', **summary)
 
@@ -198,7 +213,10 @@ class Trainer:
             parameter: name for name, parameter in self.model.named_parameters()
             if parameter in parameter_set
         }
-        allocator_state = copy.deepcopy(self.nbs_allocator.state_dict())
+        allocator_state = (
+            copy.deepcopy(self.nbs_allocator.state_dict())
+            if self.nbs_allocator is not None else None
+        )
         scheduler_state = (
             copy.deepcopy(self.lr_scheduler.state_dict())
             if self.lr_scheduler is not None else None
@@ -259,8 +277,9 @@ class Trainer:
             'missing_states': missing_states,
             'backup_bytes': backup_bytes,
             'allocator_state': allocator_state,
-            'allocator_last_diagnostics': copy.deepcopy(
-                self.nbs_allocator.last_diagnostics
+            'allocator_last_diagnostics': (
+                copy.deepcopy(self.nbs_allocator.last_diagnostics)
+                if self.nbs_allocator is not None else None
             ),
             'optimizer_step': self.optimizer_step,
             'optimizer_state_dtype_verified': (
@@ -304,10 +323,11 @@ class Trainer:
                         )
                 else:
                     current_state[key] = copy.deepcopy(value)
-        self.nbs_allocator.load_state_dict(snapshot['allocator_state'])
-        self.nbs_allocator.last_diagnostics = copy.deepcopy(
-            snapshot['allocator_last_diagnostics']
-        )
+        if self.nbs_allocator is not None:
+            self.nbs_allocator.load_state_dict(snapshot['allocator_state'])
+            self.nbs_allocator.last_diagnostics = copy.deepcopy(
+                snapshot['allocator_last_diagnostics']
+            )
         self.optimizer_step = snapshot['optimizer_step']
         self.optimizer_state_dtype_verified = snapshot[
             'optimizer_state_dtype_verified'
@@ -511,6 +531,13 @@ class Trainer:
     def _register_nonfinite(self, event, **details):
         self.skipped_nonfinite_updates += 1
         self.consecutive_nonfinite += 1
+        if self.lora_method == 'eva' and self.rollback_lr_callback is not None:
+            details = {
+                **details,
+                'learning_rate_change': self.rollback_lr_callback(
+                    self.optimizer_step
+                ),
+            }
         self._record_numeric_event(event, **details)
         self.optimizer.zero_grad(set_to_none=True)
         if self.consecutive_nonfinite >= self.max_consecutive_nonfinite:
@@ -867,7 +894,7 @@ class Trainer:
                 # a data-dependent overflow on batches 2..N can still roll it
                 # back exactly.
                 if (
-                    self.nbs_allocator is not None
+                    self.transactional_numeric_safety
                     and self.pending_transaction is not None
                 ):
                     self._commit_pending_transaction(step)
@@ -950,12 +977,28 @@ class Trainer:
                         self.model.parameters(), .25,
                         error_if_nonfinite=True,
                     )
+                elif self.lora_method == 'eva':
+                    try:
+                        gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), .25,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        if 'non-finite' not in str(exc).lower():
+                            raise
+                        self._register_nonfinite(
+                            'eva_gradient_norm_nonfinite',
+                            batch_step=step,
+                            error=str(exc),
+                        )
+                        accumulated_steps = 0
+                        continue
                 else:
                     gradient_norm = None
                 transaction_started = time.perf_counter()
                 transaction = (
                     self._snapshot_optimizer_transaction()
-                    if self.nbs_allocator is not None else None
+                    if self.transactional_numeric_safety else None
                 )
                 if transaction is not None:
                     # Sensitivity was measured from the candidate update's
@@ -975,7 +1018,7 @@ class Trainer:
                     self.grad_scaler.update()
                 else:
                     self.optimizer.step()
-                if self.nbs_allocator is not None:
+                if transaction is not None:
                     parameter_issues = self._parameter_issues()
                     optimizer_state_issues = self._optimizer_state_issues(
                         check_dtype=True
@@ -989,7 +1032,10 @@ class Trainer:
                     if (
                         parameter_issues
                         or optimizer_state_issues
-                        or update_diagnostics['issues']
+                        or (
+                            self.nbs_allocator is not None
+                            and update_diagnostics['issues']
+                        )
                     ):
                         self._rollback_transaction(
                             transaction,
@@ -1102,7 +1148,7 @@ class Trainer:
                 accumulated_steps = 0
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
-                if self.nbs_allocator is not None:
+                if self.transactional_numeric_safety:
                     self.pending_transaction = transaction
 
             if step % report_loss_per_steps == 0:                

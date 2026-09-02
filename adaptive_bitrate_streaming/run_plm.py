@@ -290,7 +290,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
           checkpoint_dir, best_model_dir, final_model_dir,
           eval_process_reward_fn):
     trainable_dtype_summary = None
-    if args.lora_method in ('nbs', 'adalora', 'shapley'):
+    if args.lora_method in ('nbs', 'adalora', 'shapley', 'eva'):
         trainable_dtype_summary = ensure_trainable_parameters_fp32(model)
         print(
             '{} trainable dtype ready: FP32 tensors={} parameters={} '
@@ -352,7 +352,7 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             new_lrs.append(new_lr)
         lr_scheduler._last_lr = new_lrs
         print(
-            'NBS optimizer rollback: learning rate reduced',
+            f'{args.lora_method.upper()} optimizer rollback: learning rate reduced',
             f'{old_lrs[0]:.8g} -> {new_lrs[0]:.8g}',
         )
         return {
@@ -416,10 +416,14 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         ),
         nbs_numeric_log_path=(
             os.path.join(checkpoint_dir, 'nbs_numeric_events.jsonl')
-            if args.nbs_v19 else None
+            if args.lora_method == 'nbs'
+            else os.path.join(checkpoint_dir, 'eva_numeric_events.jsonl')
+            if args.lora_method == 'eva'
+            else None
         ),
         rollback_lr_callback=(
-            reduce_learning_rate_after_rollback if args.nbs_v19 else None
+            reduce_learning_rate_after_rollback
+            if args.lora_method in ('nbs', 'eva') else None
         ),
         peft_allocator_diagnostics_path=(
             os.path.join(

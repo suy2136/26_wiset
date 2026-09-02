@@ -150,6 +150,31 @@ class NBSOptimizerTransactionTest(unittest.TestCase):
                 else:
                     self.assertEqual(current, previous)
 
+    def test_eva_transaction_restores_without_nbs_allocator(self):
+        trainer, model, optimizer = self._make_transaction_trainer()
+        trainer.nbs_allocator = None
+        trainer.lora_method = 'eva'
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        for parameter in model.parameters():
+            parameter.grad = torch.full_like(parameter, 2.0)
+        snapshot = trainer._snapshot_optimizer_transaction()
+        optimizer.step()
+        first_parameter = next(model.parameters())
+        first_parameter.data.fill_(float('nan'))
+        optimizer.state[first_parameter]['exp_avg'].fill_(float('inf'))
+
+        trainer._restore_optimizer_transaction(snapshot)
+
+        self.assertIsNone(snapshot['allocator_state'])
+        self.assertFalse(trainer._parameter_issues())
+        self.assertFalse(trainer._optimizer_state_issues(check_dtype=True))
+        for parameter, previous in snapshot['parameters'].items():
+            self.assertTrue(torch.equal(parameter, previous))
+
     def test_update_ratio_rejects_large_finite_update(self):
         trainer, model, optimizer = self._make_transaction_trainer()
         with torch.no_grad():

@@ -100,6 +100,22 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
         self.assertEqual(expected_checkpoint_role(experiment), 'best')
         self.assertEqual(expected_variant(experiment), 'eva')
 
+    def test_eva_training_has_transaction_log_and_lr_rollback(self):
+        run_source = (
+            Path(__file__).resolve().parents[1] / 'run_plm.py'
+        ).read_text(encoding='utf-8')
+        trainer_source = (
+            Path(__file__).resolve().parents[1]
+            / 'plm_special' / 'trainer.py'
+        ).read_text(encoding='utf-8')
+
+        self.assertIn("('nbs', 'adalora', 'shapley', 'eva')", run_source)
+        self.assertIn("'eva_numeric_events.jsonl'", run_source)
+        self.assertIn("args.lora_method in ('nbs', 'eva')", run_source)
+        self.assertIn("self.lora_method == 'eva'", trainer_source)
+        self.assertIn('self.transactional_numeric_safety', trainer_source)
+        self.assertIn("'eva_gradient_norm_nonfinite'", trainer_source)
+
     def test_server1_shell_supports_checkpoint_resume(self):
         script = (
             Path(__file__).resolve().parents[1]
