@@ -1000,7 +1000,7 @@ class Trainer:
                     self._snapshot_optimizer_transaction()
                     if self.transactional_numeric_safety else None
                 )
-                if transaction is not None:
+                if transaction is not None and self.nbs_allocator is not None:
                     # Sensitivity was measured from the candidate update's
                     # gradients. A rejected update must not retain that EMA.
                     transaction['allocator_state']['sensitivity'] = dict(

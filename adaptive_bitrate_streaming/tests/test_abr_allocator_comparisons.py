@@ -115,6 +115,10 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
         self.assertIn("self.lora_method == 'eva'", trainer_source)
         self.assertIn('self.transactional_numeric_safety', trainer_source)
         self.assertIn("'eva_gradient_norm_nonfinite'", trainer_source)
+        self.assertIn(
+            'if transaction is not None and self.nbs_allocator is not None:',
+            trainer_source,
+        )
 
     def test_server1_shell_supports_checkpoint_resume(self):
         script = (
