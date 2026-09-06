@@ -51,6 +51,8 @@ class AllocatorComparisonCommandsTest(unittest.TestCase):
             nbs_update_ratio_floor=0.01,
             nbs_max_update_rms=0.01,
             nbs_rollback_lr_factor=0.5,
+            nbs_rollback_min_lr=1e-6,
+            nbs_skip_batch_at_rollback_lr_floor=False,
             nbs_max_consecutive_rollbacks=3,
         )
 

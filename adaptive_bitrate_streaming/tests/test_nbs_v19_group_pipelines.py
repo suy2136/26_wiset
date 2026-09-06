@@ -1,5 +1,6 @@
 import unittest
 import json
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -158,6 +159,24 @@ class NBSV19GroupPipelineTest(unittest.TestCase):
             state = group.load_state(path, True, run_signature)
         self.assertEqual(state["signature"], run_signature)
         self.assertEqual(state["runs"]["G"]["status"], "complete")
+
+    def test_continue_on_error_runs_later_experiments(self):
+        args = group.parse_args(
+            ["--dry-run", "--continue-on-error"],
+            state_file=group.RESULTS_ROOT / "state.json",
+            output_file=group.RESULTS_ROOT / "results.csv",
+        )
+        visited = []
+
+        def execute(_args, experiment, *_rest):
+            visited.append(experiment["name"])
+            if len(visited) == 1:
+                raise RuntimeError("expected test failure")
+
+        with mock.patch.object(group, "_run_experiment", side_effect=execute):
+            group.run_group(args, ghij.EXPERIMENTS[:2])
+
+        self.assertEqual(visited, ["G", "H"])
 
 
 if __name__ == "__main__":

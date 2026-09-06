@@ -104,6 +104,10 @@ class Trainer:
         self.max_consecutive_rollbacks = getattr(
             args, 'nbs_max_consecutive_rollbacks', 3
         )
+        self.skip_batch_at_rollback_lr_floor = getattr(
+            args, 'nbs_skip_batch_at_rollback_lr_floor', False
+        )
+        self.rollback_min_lr = getattr(args, 'nbs_rollback_min_lr', 1e-6)
         self.rollback_backup_device = getattr(
             args, 'nbs_rollback_backup_device', 'cpu'
         )
@@ -149,6 +153,10 @@ class Trainer:
                 grad_scaler_enabled=self.grad_scaler.is_enabled(),
                 max_consecutive_nonfinite=self.max_consecutive_nonfinite,
                 max_consecutive_rollbacks=self.max_consecutive_rollbacks,
+                skip_batch_at_rollback_lr_floor=(
+                    self.skip_batch_at_rollback_lr_floor
+                ),
+                rollback_min_lr=self.rollback_min_lr,
                 rollback_backup_device=self.rollback_backup_device,
                 max_rollback_backup_mib=self.max_rollback_backup_mib,
                 update_ratio_warning=self.update_ratio_warning,
@@ -408,17 +416,31 @@ class Trainer:
             **details,
         )
         self.optimizer.zero_grad(set_to_none=True)
-        if self.consecutive_rollbacks >= self.max_consecutive_rollbacks:
+        at_lr_floor = bool(
+            lr_change is not None and lr_change.get('at_floor', False)
+        )
+        skip_batch = bool(
+            self.skip_batch_at_rollback_lr_floor and at_lr_floor
+        )
+        if (
+            self.consecutive_rollbacks >= self.max_consecutive_rollbacks
+            and not skip_batch
+        ):
             raise FloatingPointError(
                 f'{event} repeated {self.consecutive_rollbacks} times; '
                 f'see {self.nbs_numeric_log_path}'
             )
+        return {
+            'learning_rate_change': lr_change,
+            'at_lr_floor': at_lr_floor,
+            'skip_batch': skip_batch,
+        }
 
     def _rollback_transaction(self, snapshot, event, **details):
         self._restore_optimizer_transaction(snapshot)
         if self.pending_transaction is snapshot:
             self.pending_transaction = None
-        self._register_optimizer_rollback(
+        return self._register_optimizer_rollback(
             event,
             transaction_backup_mib=(
                 snapshot['backup_bytes'] / (1024 ** 2)
@@ -834,7 +856,7 @@ class Trainer:
                         skip_batch = True
                         break
                     snapshot = self.pending_transaction
-                    self._rollback_transaction(
+                    rollback = self._rollback_transaction(
                         snapshot,
                         'next_forward_rollback',
                         batch_step=step,
@@ -842,13 +864,23 @@ class Trainer:
                         inference_details=getattr(error, 'details', None),
                     )
                     accumulated_steps = 0
+                    if rollback['skip_batch']:
+                        skipped_nonfinite_batches_epoch += 1
+                        self._record_numeric_event(
+                            'batch_skipped_at_rollback_lr_floor',
+                            batch_step=step,
+                            rollback_event='next_forward_rollback',
+                        )
+                        self.consecutive_rollbacks = 0
+                        skip_batch = True
+                        break
                     # Retry the same numeric batch after exact restoration.
                     retried_after_rollback = True
                     continue
                 if delta_issues or not loss_is_finite:
                     if self.pending_transaction is not None:
                         snapshot = self.pending_transaction
-                        self._rollback_transaction(
+                        rollback = self._rollback_transaction(
                             snapshot,
                             'next_forward_rollback',
                             batch_step=step,
@@ -856,6 +888,16 @@ class Trainer:
                             adalora_delta_issues=delta_issues,
                         )
                         accumulated_steps = 0
+                        if rollback['skip_batch']:
+                            skipped_nonfinite_batches_epoch += 1
+                            self._record_numeric_event(
+                                'batch_skipped_at_rollback_lr_floor',
+                                batch_step=step,
+                                rollback_event='next_forward_rollback',
+                            )
+                            self.consecutive_rollbacks = 0
+                            skip_batch = True
+                            break
                         retried_after_rollback = True
                         continue
                     event = (

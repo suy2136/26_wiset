@@ -46,6 +46,8 @@ class AbrSeedSeparationTest(unittest.TestCase):
             nbs_update_ratio_floor=0.01,
             nbs_max_update_rms=0.01,
             nbs_rollback_lr_factor=0.5,
+            nbs_rollback_min_lr=1e-5,
+            nbs_skip_batch_at_rollback_lr_floor=True,
             nbs_max_consecutive_rollbacks=3,
         )
 
@@ -77,6 +79,13 @@ class AbrSeedSeparationTest(unittest.TestCase):
     def test_eva_calibration_uses_data_seed(self):
         command = build_eva_precompute_command(self.args, EXPERIMENTS[3])
         self.assertEqual(command[command.index("--seed") + 1], "2")
+
+    def test_nbs_training_enables_rollback_floor_and_batch_skip(self):
+        command = build_training_command(self.args, EXPERIMENTS[0])
+        self.assertEqual(
+            command[command.index("--nbs-rollback-min-lr") + 1], "1e-05"
+        )
+        self.assertIn("--nbs-skip-batch-at-rollback-lr-floor", command)
 
     def test_signature_records_component_seeds(self):
         seeds = signature(self.args, EXPERIMENTS)["seeds"]

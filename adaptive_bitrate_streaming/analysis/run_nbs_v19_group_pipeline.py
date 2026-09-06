@@ -137,9 +137,12 @@ def build_training_command(args, experiment):
             "--nbs-update-ratio-floor", str(args.nbs_update_ratio_floor),
             "--nbs-max-update-rms", str(args.nbs_max_update_rms),
             "--nbs-rollback-lr-factor", str(args.nbs_rollback_lr_factor),
+            "--nbs-rollback-min-lr", str(args.nbs_rollback_min_lr),
             "--nbs-max-consecutive-rollbacks",
             str(args.nbs_max_consecutive_rollbacks),
         ]
+        if args.nbs_skip_batch_at_rollback_lr_floor:
+            command.insert(3, "--nbs-skip-batch-at-rollback-lr-floor")
     elif method in ("adalora", "shapley"):
         command[3:3] = [
             "--lora-method", method,
@@ -353,6 +356,10 @@ def signature(args, experiments):
             "update_ratio_floor": args.nbs_update_ratio_floor,
             "max_update_rms": args.nbs_max_update_rms,
             "rollback_lr_factor": args.nbs_rollback_lr_factor,
+            "rollback_min_lr": args.nbs_rollback_min_lr,
+            "skip_batch_at_rollback_lr_floor": (
+                args.nbs_skip_batch_at_rollback_lr_floor
+            ),
             "max_consecutive_rollbacks": args.nbs_max_consecutive_rollbacks,
         },
         "features": {
@@ -376,6 +383,14 @@ def load_state(path, resume, run_signature):
         state["signature"]["numeric_safety"] = run_signature[
             "numeric_safety"
         ]
+    else:
+        saved_safety = state["signature"]["numeric_safety"]
+        requested_safety = run_signature["numeric_safety"]
+        for field in (
+            "rollback_min_lr", "skip_batch_at_rollback_lr_floor",
+        ):
+            if field not in saved_safety:
+                saved_safety[field] = requested_safety[field]
     # Migrate seed-1-only states produced before experiments could override
     # the common seed (for example the new C_SEED2 replication).
     if "seeds" not in state.get("signature", {}):
@@ -536,14 +551,125 @@ def parse_args(argv, state_file, output_file):
     parser.add_argument("--nbs-update-ratio-floor", type=float, default=0.01)
     parser.add_argument("--nbs-max-update-rms", type=float, default=0.01)
     parser.add_argument("--nbs-rollback-lr-factor", type=float, default=0.5)
+    parser.add_argument("--nbs-rollback-min-lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--nbs-skip-batch-at-rollback-lr-floor", action="store_true",
+    )
     parser.add_argument(
         "--nbs-max-consecutive-rollbacks", type=int, default=3,
     )
     parser.add_argument("--state-file", type=Path, default=state_file)
     parser.add_argument("--output", type=Path, default=output_file)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
+
+
+def _run_experiment(
+    args, experiment, state, experiments, run_signature, metrics_dir,
+):
+    name = experiment["name"]
+    run = state["runs"].setdefault(name, {})
+    if experiment_method(experiment) == "eva":
+        state_path = eva_state_dir(args, experiment) / "eva_state.pt"
+        if not state_path.is_file():
+            command = build_eva_precompute_command(args, experiment)
+            print(f"[{name}:eva] {shlex.join(command)}", flush=True)
+            if not args.dry_run:
+                subprocess.run(command, cwd=ABR_ROOT, check=True)
+        elif not args.dry_run:
+            print(f"[{name}:eva] state already available: {state_path}", flush=True)
+
+    checkpoint_text = run.get("checkpoint_dir")
+    if checkpoint_text is None:
+        command = build_training_command(args, experiment)
+        print(f"[{name}:train] {shlex.join(command)}", flush=True)
+        if args.dry_run:
+            checkpoint = Path(f"/best_checkpoint/{name}")
+        else:
+            started_at = time.time() - 1.0
+            subprocess.run(command, cwd=ABR_ROOT, check=True)
+            checkpoint = discover_best_checkpoint(experiment, started_at)
+            run.update({
+                "status": "trained",
+                "checkpoint_dir": str(checkpoint.resolve()),
+                "trained_at": time.time(),
+            })
+            atomic_json(args.state_file, state)
+            print(f"[{name}] best checkpoint: {checkpoint}", flush=True)
+    else:
+        checkpoint = Path(checkpoint_text)
+        print(f"[{name}:train] checkpoint already available; skipping", flush=True)
+
+    if run.get("status") == "complete":
+        print(f"[{name}:test] already complete; skipping", flush=True)
+        return
+    command = build_test_command(args, experiment, checkpoint)
+    print(f"[{name}:test] {shlex.join(command)}", flush=True)
+    if args.dry_run:
+        return
+
+    metadata = validate_checkpoint(checkpoint, experiment)
+    started_at = time.time() - 1.0
+    subprocess.run(command, cwd=ABR_ROOT, check=True)
+    source_metrics = newest_metrics(started_at)
+    metrics = json.loads(source_metrics.read_text(encoding="utf-8"))
+    if experiment_method(experiment) == "nbs":
+        if not metrics.get("nbs_compact_inference"):
+            raise RuntimeError(f"{name} inference did not use NBS compaction")
+        if not metrics.get("nbs_compaction_logits_equivalent"):
+            raise RuntimeError(f"{name} compact logits equivalence failed")
+    elif metrics.get("nbs_compact_inference"):
+        raise RuntimeError(f"{name} unexpectedly used NBS compaction")
+
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    saved_metrics = metrics_dir / f"{name}_selector_metrics.json"
+    shutil.copy2(source_metrics, saved_metrics)
+    saved_metadata = metrics_dir / f"{name}_checkpoint_metadata.json"
+    shutil.copy2(checkpoint / "checkpoint_metadata.json", saved_metadata)
+    auxiliary_artifacts = []
+    if experiment_method(experiment) in ("adalora", "shapley"):
+        diagnostic_name = f"{experiment_method(experiment)}_rank_diagnostics.jsonl"
+        diagnostic_source = checkpoint.parent / diagnostic_name
+        if diagnostic_source.is_file():
+            destination = metrics_dir / f"{name}_{diagnostic_name}"
+            shutil.copy2(diagnostic_source, destination)
+            auxiliary_artifacts.append(str(destination.resolve()))
+    if experiment_method(experiment) == "eva":
+        source_dir = eva_state_dir(args, experiment)
+        for artifact_name in (
+            "rank_pattern.json", "explained_variance.csv", "metadata.json"
+        ):
+            source = source_dir / artifact_name
+            if source.is_file():
+                destination = metrics_dir / f"{name}_{artifact_name}"
+                shutil.copy2(source, destination)
+                auxiliary_artifacts.append(str(destination.resolve()))
+    equivalence_source = source_metrics.parent / "nbs_compaction_equivalence.json"
+    equivalence_path = None
+    if equivalence_source.is_file():
+        equivalence_path = metrics_dir / f"{name}_compaction_equivalence.json"
+        shutil.copy2(equivalence_source, equivalence_path)
+    run.update({
+        "status": "complete",
+        "checkpoint_role": metadata.get("role"),
+        "metrics": scalar_metrics(metrics),
+        "metrics_path": str(saved_metrics.resolve()),
+        "checkpoint_metadata_path": str(saved_metadata.resolve()),
+        "allocator_artifacts": auxiliary_artifacts,
+        "compaction_equivalence_path": (
+            None if equivalence_path is None else str(equivalence_path.resolve())
+        ),
+        "completed_at": time.time(),
+    })
+    atomic_json(args.state_file, state)
+    write_results(args.output, result_rows(state, experiments), run_signature)
+    print(
+        f"[{name}] test QoE={metrics['mean_reward']:.6f} "
+        f"latency={metrics['inference_latency_mean_ms']:.3f} ms",
+        flush=True,
+    )
 
 
 def run_group(args, experiments):
@@ -558,128 +684,29 @@ def run_group(args, experiments):
 
     for experiment in experiments:
         name = experiment["name"]
-        run = state["runs"].setdefault(name, {})
-        if experiment_method(experiment) == "eva":
-            state_path = eva_state_dir(args, experiment) / "eva_state.pt"
-            if not state_path.is_file():
-                precompute_command = build_eva_precompute_command(
-                    args, experiment
-                )
-                print(
-                    f"[{name}:eva] {shlex.join(precompute_command)}",
-                    flush=True,
-                )
-                if not args.dry_run:
-                    subprocess.run(
-                        precompute_command, cwd=ABR_ROOT, check=True
-                    )
-            elif not args.dry_run:
-                print(
-                    f"[{name}:eva] state already available: {state_path}",
-                    flush=True,
-                )
-        checkpoint_text = run.get("checkpoint_dir")
-        if checkpoint_text is None:
-            train_command = build_training_command(args, experiment)
-            print(f"[{name}:train] {shlex.join(train_command)}", flush=True)
-            if args.dry_run:
-                checkpoint = Path(f"/best_checkpoint/{name}")
-            else:
-                started_at = time.time() - 1.0
-                subprocess.run(train_command, cwd=ABR_ROOT, check=True)
-                checkpoint = discover_best_checkpoint(experiment, started_at)
-                run.update({
-                    "status": "trained",
-                    "checkpoint_dir": str(checkpoint.resolve()),
-                    "trained_at": time.time(),
-                })
-                atomic_json(args.state_file, state)
-                print(f"[{name}] best checkpoint: {checkpoint}", flush=True)
-        else:
-            checkpoint = Path(checkpoint_text)
-            print(f"[{name}:train] checkpoint already available; skipping", flush=True)
-
-        if run.get("status") == "complete":
-            print(f"[{name}:test] already complete; skipping", flush=True)
-            continue
-        test_command = build_test_command(args, experiment, checkpoint)
-        print(f"[{name}:test] {shlex.join(test_command)}", flush=True)
-        if args.dry_run:
-            continue
-
-        metadata = validate_checkpoint(checkpoint, experiment)
-        started_at = time.time() - 1.0
-        subprocess.run(test_command, cwd=ABR_ROOT, check=True)
-        source_metrics = newest_metrics(started_at)
-        metrics = json.loads(source_metrics.read_text(encoding="utf-8"))
-        if experiment_method(experiment) == "nbs":
-            if not metrics.get("nbs_compact_inference"):
-                raise RuntimeError(f"{name} inference did not use NBS compaction")
-            if not metrics.get("nbs_compaction_logits_equivalent"):
-                raise RuntimeError(f"{name} compact logits equivalence failed")
-        elif metrics.get("nbs_compact_inference"):
-            raise RuntimeError(f"{name} unexpectedly used NBS compaction")
-
-        metrics_dir.mkdir(parents=True, exist_ok=True)
-        saved_metrics = metrics_dir / f"{name}_selector_metrics.json"
-        shutil.copy2(source_metrics, saved_metrics)
-        saved_metadata = metrics_dir / f"{name}_checkpoint_metadata.json"
-        shutil.copy2(checkpoint / "checkpoint_metadata.json", saved_metadata)
-        auxiliary_artifacts = []
-        if experiment_method(experiment) in ("adalora", "shapley"):
-            diagnostic_name = (
-                f"{experiment_method(experiment)}_rank_diagnostics.jsonl"
+        try:
+            _run_experiment(
+                args, experiment, state, experiments, run_signature, metrics_dir
             )
-            diagnostic_source = checkpoint.parent / diagnostic_name
-            if diagnostic_source.is_file():
-                diagnostic_destination = metrics_dir / (
-                    f"{name}_{diagnostic_name}"
+        except Exception as error:
+            run = state["runs"].setdefault(name, {})
+            run.update({
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "failed_at": time.time(),
+            })
+            if not args.dry_run:
+                atomic_json(args.state_file, state)
+                write_results(
+                    args.output, result_rows(state, experiments), run_signature
                 )
-                shutil.copy2(
-                    diagnostic_source, diagnostic_destination
-                )
-                auxiliary_artifacts.append(
-                    str(diagnostic_destination.resolve())
-                )
-        if experiment_method(experiment) == "eva":
-            source_dir = eva_state_dir(args, experiment)
-            for artifact_name in (
-                "rank_pattern.json", "explained_variance.csv", "metadata.json"
-            ):
-                source = source_dir / artifact_name
-                if source.is_file():
-                    destination = metrics_dir / f"{name}_{artifact_name}"
-                    shutil.copy2(source, destination)
-                    auxiliary_artifacts.append(str(destination.resolve()))
-        equivalence_source = (
-            source_metrics.parent / "nbs_compaction_equivalence.json"
-        )
-        equivalence_path = None
-        if equivalence_source.is_file():
-            equivalence_path = metrics_dir / f"{name}_compaction_equivalence.json"
-            shutil.copy2(equivalence_source, equivalence_path)
-        run.update({
-            "status": "complete",
-            "checkpoint_role": metadata.get("role"),
-            "metrics": scalar_metrics(metrics),
-            "metrics_path": str(saved_metrics.resolve()),
-            "checkpoint_metadata_path": str(saved_metadata.resolve()),
-            "allocator_artifacts": auxiliary_artifacts,
-            "compaction_equivalence_path": (
-                None if equivalence_path is None
-                else str(equivalence_path.resolve())
-            ),
-            "completed_at": time.time(),
-        })
-        atomic_json(args.state_file, state)
-        write_results(
-            args.output, result_rows(state, experiments), run_signature
-        )
-        print(
-            f"[{name}] test QoE={metrics['mean_reward']:.6f} "
-            f"latency={metrics['inference_latency_mean_ms']:.3f} ms",
-            flush=True,
-        )
+            print(
+                f"[{name}] FAILED: {type(error).__name__}: {error}",
+                file=sys.stderr, flush=True,
+            )
+            if not args.continue_on_error:
+                raise
 
     if not args.dry_run:
         rows = result_rows(state, experiments)

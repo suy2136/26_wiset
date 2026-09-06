@@ -328,17 +328,23 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    lr_scale = {'value': 1.0}
+    lr_scale = {'value': 1.0, 'rollback_active': False}
     updates_per_epoch = max(
         1, math.ceil(len(exp_dataset) / args.grad_accum_steps)
     )
     total_optimizer_steps = max(1, updates_per_epoch * args.num_epochs)
     minimum_lr_scale = args.plateau_min_lr / args.lr
+    rollback_minimum_lr_scale = args.nbs_rollback_min_lr / args.lr
 
     def learning_rate_multiplier(steps):
         completed_steps = steps + 1
         if completed_steps <= args.warmup_steps:
-            return (completed_steps / args.warmup_steps) * lr_scale['value']
+            factor = (
+                completed_steps / args.warmup_steps
+            ) * lr_scale['value']
+            if lr_scale['rollback_active']:
+                factor = max(factor, rollback_minimum_lr_scale)
+            return factor
         schedule_scale = 1.0
         if args.lr_schedule == 'cosine':
             decay_steps = max(1, total_optimizer_steps - args.warmup_steps)
@@ -350,9 +356,11 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             schedule_scale = minimum_lr_scale + (
                 1.0 - minimum_lr_scale
             ) * cosine
-        return max(
-            schedule_scale * lr_scale['value'], minimum_lr_scale
+        active_floor = (
+            max(minimum_lr_scale, rollback_minimum_lr_scale)
+            if lr_scale['rollback_active'] else minimum_lr_scale
         )
+        return max(schedule_scale * lr_scale['value'], active_floor)
 
     lr_scheduler = LambdaLR(optimizer, learning_rate_multiplier)
 
@@ -361,9 +369,10 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
         old_scale = lr_scale['value']
         new_scale = max(
             old_scale * args.nbs_rollback_lr_factor,
-            minimum_lr_scale,
+            rollback_minimum_lr_scale,
         )
         lr_scale['value'] = new_scale
+        lr_scale['rollback_active'] = True
         current_factor = learning_rate_multiplier(optimizer_step)
         new_lrs = []
         for group, base_lr in zip(
@@ -382,6 +391,11 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             'new_lrs': new_lrs,
             'old_scale': old_scale,
             'new_scale': new_scale,
+            'minimum_lr': args.nbs_rollback_min_lr,
+            'at_floor': bool(all(
+                learning_rate <= args.nbs_rollback_min_lr * (1.0 + 1e-7)
+                for learning_rate in new_lrs
+            )),
         }
 
     loss_fn = CrossEntropyLoss()
@@ -820,6 +834,10 @@ def run(args):
             raise ValueError('--nbs-max-update-rms must be positive')
         if not 0 < args.nbs_rollback_lr_factor < 1:
             raise ValueError('--nbs-rollback-lr-factor must be between 0 and 1')
+        if not 0 < args.nbs_rollback_min_lr <= args.lr:
+            raise ValueError(
+                '--nbs-rollback-min-lr must be positive and no greater than --lr'
+            )
         if args.nbs_compaction_validation_trials <= 0:
             raise ValueError('--nbs-compaction-validation-trials must be positive')
         if args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0:
@@ -1171,6 +1189,17 @@ if __name__ == '__main__':
     parser.add_argument('--nbs-update-ratio-floor', type=float, default=0.01)
     parser.add_argument('--nbs-max-update-rms', type=float, default=0.01)
     parser.add_argument('--nbs-rollback-lr-factor', type=float, default=0.5)
+    parser.add_argument(
+        '--nbs-rollback-min-lr', type=float, default=1e-6,
+        help='minimum learning rate after the first numeric rollback',
+    )
+    parser.add_argument(
+        '--nbs-skip-batch-at-rollback-lr-floor', action='store_true',
+        help=(
+            'after rollback reaches its LR floor, skip the failing batch '
+            'instead of aborting on repeated rollback'
+        ),
+    )
     compaction_group = parser.add_mutually_exclusive_group()
     compaction_group.add_argument(
         '--nbs-compact-inference', dest='nbs_compact_inference',

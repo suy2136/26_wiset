@@ -15,7 +15,11 @@ if [[ "$MODE" != "dry-run" ]]; then
   python -c "import torch, peft, torch_incremental_pca; print('ABR allocator dependencies OK')"
 fi
 
-ARGS=()
+ARGS=(
+  --nbs-rollback-min-lr 1e-5
+  --nbs-skip-batch-at-rollback-lr-floor
+  --continue-on-error
+)
 if [[ "$MODE" == "dry-run" ]]; then
   ARGS+=(--dry-run)
 elif [[ "$MODE" == "resume" ]]; then

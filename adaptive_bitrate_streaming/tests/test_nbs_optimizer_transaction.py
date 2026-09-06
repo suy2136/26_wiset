@@ -93,7 +93,27 @@ class NBSOptimizerTransactionTest(unittest.TestCase):
         trainer.max_update_ratio = 0.05
         trainer.update_ratio_floor = 0.01
         trainer.max_update_rms = 0.01
+        trainer.rollback_count = 0
+        trainer.consecutive_rollbacks = 0
+        trainer.skipped_nonfinite_updates = 0
+        trainer.max_consecutive_rollbacks = 3
+        trainer.skip_batch_at_rollback_lr_floor = False
+        trainer.rollback_lr_callback = None
+        trainer.nbs_numeric_log_path = None
         return trainer, model, optimizer
+
+    def test_lr_floor_converts_repeated_rollback_to_batch_skip(self):
+        trainer, _, _ = self._make_transaction_trainer()
+        trainer.consecutive_rollbacks = 2
+        trainer.skip_batch_at_rollback_lr_floor = True
+        trainer.rollback_lr_callback = lambda _: {
+            'new_lrs': [1e-5], 'minimum_lr': 1e-5, 'at_floor': True,
+        }
+
+        result = trainer._register_optimizer_rollback('test_rollback')
+
+        self.assertTrue(result['skip_batch'])
+        self.assertEqual(trainer.consecutive_rollbacks, 3)
 
     def test_transaction_memory_limit_fails_before_backup(self):
         trainer, model, _ = self._make_transaction_trainer()
