@@ -40,6 +40,7 @@ CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-500}"
 VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-500}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
+SKIP_VISUALIZATION="${SKIP_VISUALIZATION:-0}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-32}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
@@ -80,6 +81,10 @@ if ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
 fi
 if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1" ]]; then
   echo "SAVE_PERIODIC_CHECKPOINTS must be 0 or 1."
+  exit 2
+fi
+if [[ "$SKIP_VISUALIZATION" != "0" && "$SKIP_VISUALIZATION" != "1" ]]; then
+  echo "SKIP_VISUALIZATION must be 0 or 1."
   exit 2
 fi
 
@@ -920,9 +925,13 @@ set -e
 if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
   write_status "eva_precompute" "running" 0
   if prepare_eva_state; then
-    python analysis/plot_eva_diagnostics.py \
-      --state "$EVA_STATE_ARTIFACT" \
-      --output-dir "$RUN_DIR/figures"
+    if [[ "$SKIP_VISUALIZATION" == "0" ]]; then
+      python analysis/plot_eva_diagnostics.py \
+        --state "$EVA_STATE_ARTIFACT" \
+        --output-dir "$RUN_DIR/figures"
+    else
+      echo "[EVA] server-side diagnostic visualization skipped"
+    fi
   else
     code=$?
     write_status "eva_precompute" "failed" "$code"
@@ -1187,35 +1196,41 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
     exit 6
   fi
 
-  PLOT_CMD=(
-    python analysis/plot_netllm_experiment.py
-    --variant "$VARIANT"
-    --train-log "$RUN_DIR/train.log"
-    --result-csv "$ROLE_DIR/results.csv"
-    --output-dir "$ROLE_DIR/figures"
-    --checkpoint-role "$ROLE"
-    --latency-json "$ROLE_DIR/latency.json"
-  )
-  if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
-    PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
-    PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
-  fi
-  if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
-    PLOT_CMD+=(--eva-state "$EVA_STATE_ARTIFACT")
-  fi
-  if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" || \
-        "$ADALORA_ALLOCATOR_MODE" == "peft" ]]; then
-    PLOT_CMD+=(--adapter-config "$CANONICAL_MODEL_PATH/adapter_config.json")
-  fi
-
-  write_status "visualization_${ROLE}" "running" 0
-  if run_logged "$ROLE_DIR/plot.log" "${PLOT_CMD[@]}"; then
-    :
+  if [[ "$SKIP_VISUALIZATION" == "1" ]]; then
+    printf 'Server-side visualization skipped; generate plots from downloaded artifacts.\n' \
+      > "$ROLE_DIR/plot.skipped.txt"
+    echo "[$DISPLAY_NAME] $ROLE server-side visualization skipped"
   else
-    code=$?
-    write_status "visualization_${ROLE}" "failed" "$code"
-    echo "$ROLE visualization failed, but training/evaluation outputs were preserved."
-    exit "$code"
+    PLOT_CMD=(
+      python analysis/plot_netllm_experiment.py
+      --variant "$VARIANT"
+      --train-log "$RUN_DIR/train.log"
+      --result-csv "$ROLE_DIR/results.csv"
+      --output-dir "$ROLE_DIR/figures"
+      --checkpoint-role "$ROLE"
+      --latency-json "$ROLE_DIR/latency.json"
+    )
+    if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
+      PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
+      PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
+    fi
+    if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
+      PLOT_CMD+=(--eva-state "$EVA_STATE_ARTIFACT")
+    fi
+    if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" || \
+          "$ADALORA_ALLOCATOR_MODE" == "peft" ]]; then
+      PLOT_CMD+=(--adapter-config "$CANONICAL_MODEL_PATH/adapter_config.json")
+    fi
+
+    write_status "visualization_${ROLE}" "running" 0
+    if run_logged "$ROLE_DIR/plot.log" "${PLOT_CMD[@]}"; then
+      :
+    else
+      code=$?
+      write_status "visualization_${ROLE}" "failed" "$code"
+      echo "$ROLE visualization failed, but training/evaluation outputs were preserved."
+      exit "$code"
+    fi
   fi
 
   # Preserve the historical top-level files as aliases of the primary result.
@@ -1229,7 +1244,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
   fi
 done
 
-if [[ "$ADALORA_BUDGET_MODE" == "adaptive" && -n "${NBS_DIAGNOSTICS:-}" ]]; then
+if [[ "$SKIP_VISUALIZATION" == "0" && "$ADALORA_BUDGET_MODE" == "adaptive" && \
+      -n "${NBS_DIAGNOSTICS:-}" ]]; then
   write_status "adaptive_visualization" "running" 0
   if run_logged "$RUN_DIR/adaptive_plot.log" \
       python analysis/plot_nbs_adaptive_budget.py \

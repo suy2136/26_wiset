@@ -115,13 +115,18 @@ recover_stock_evaluation() {
     echo "[Stock AdaLoRA] existing evaluation found; inference skipped"
   fi
 
-  python analysis/plot_netllm_experiment.py \
-    --variant adalora_b512_data2 --train-log "$STOCK_RUN_DIR/train.log" \
-    --result-csv "$role_dir/results.csv" --output-dir "$role_dir/figures" \
-    --checkpoint-role best_ar --latency-json "$role_dir/latency.json" \
-    --adapter-config "$model_path/adapter_config.json" \
-    --display-name "Stock AdaLoRA (budget512, data seed2)" \
-    2>&1 | tee "$role_dir/plot.log"
+  if [[ "${SKIP_VISUALIZATION:-1}" == "1" ]]; then
+    printf 'Server-side visualization skipped; generate plots from downloaded artifacts.\n' \
+      > "$role_dir/plot.skipped.txt"
+  else
+    python analysis/plot_netllm_experiment.py \
+      --variant adalora_b512_data2 --train-log "$STOCK_RUN_DIR/train.log" \
+      --result-csv "$role_dir/results.csv" --output-dir "$role_dir/figures" \
+      --checkpoint-role best_ar --latency-json "$role_dir/latency.json" \
+      --adapter-config "$model_path/adapter_config.json" \
+      --display-name "Stock AdaLoRA (budget512, data seed2)" \
+      2>&1 | tee "$role_dir/plot.log"
+  fi
 
   cp "$role_dir/results.csv" "$STOCK_RUN_DIR/results.csv"
   cp "$role_dir/latency.json" "$STOCK_RUN_DIR/latency.json"
@@ -144,6 +149,7 @@ export LEARNING_RATE=0.0002
 export SEED=1
 export LORA_SEED=1
 export DATA_SEED=2
+export SKIP_VISUALIZATION="${SKIP_VISUALIZATION:-1}"
 export SHAPLEY_PERMUTATIONS="${SHAPLEY_PERMUTATIONS:-1}"
 export SHAPLEY_VALIDATION_BATCHES="${SHAPLEY_VALIDATION_BATCHES:-1}"
 export SHAPLEY_TRUNCATE_FRACTION="${SHAPLEY_TRUNCATE_FRACTION:-0.05}"

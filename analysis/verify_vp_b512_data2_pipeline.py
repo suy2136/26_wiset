@@ -55,6 +55,9 @@ require('--adalora-init-rank 32', RECOVERY)
 require('--results-output-dir "$generated_dir"', RECOVERY)
 require('run_netllm_experiment.sh eva_b512_data2', RECOVERY)
 require('run_netllm_experiment.sh shapley_b512_data2', RECOVERY)
+require('export SKIP_VISUALIZATION="${SKIP_VISUALIZATION:-1}"', RECOVERY)
+require('SKIP_VISUALIZATION="${SKIP_VISUALIZATION:-0}"', RUNNER)
+require('server-side visualization skipped', RUNNER)
 require('resume-after-stock', SEQUENCE)
 
 positions = [
