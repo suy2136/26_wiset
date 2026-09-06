@@ -10,6 +10,9 @@ RUNNER = (ROOT / "scripts" / "run_netllm_experiment.sh").read_text(
 SEQUENCE = (ROOT / "scripts" / "run_vp_b512_data2_allocators.sh").read_text(
     encoding="utf-8"
 )
+RECOVERY = (
+    ROOT / "scripts" / "resume_vp_b512_data2_after_stock.sh"
+).read_text(encoding="utf-8")
 LOW_RANK = (ROOT / "models" / "low_rank.py").read_text(encoding="utf-8")
 
 
@@ -40,9 +43,19 @@ for setting in (
 require('RANK=8\n  RANK_BUDGET=512', RUNNER)
 require('--adalora-init-rank "$ADALORA_INIT_RANK"', RUNNER)
 require('ADALORA_INIT_RANK=32', RUNNER)
+require('MODEL_TAG="llama_base_low_rank_adalora_adalora_b512_data2"', RUNNER)
+require('MODEL_TAG="llama_base_low_rank_eva_b512_data2"', RUNNER)
+require('MODEL_TAG="llama_base_low_rank_adalora_shapley_b512_data2"', RUNNER)
 require('EVA_MIN_RANK=2', RUNNER)
 require('EVA_MAX_RANK=32', RUNNER)
 require('physical_rank < int(rank)', LOW_RANK)
+require('find viewport_prediction/data/ft_plms -type d', RECOVERY)
+require('-name best_ar_model', RECOVERY)
+require('--adalora-init-rank 32', RECOVERY)
+require('--results-output-dir "$generated_dir"', RECOVERY)
+require('run_netllm_experiment.sh eva_b512_data2', RECOVERY)
+require('run_netllm_experiment.sh shapley_b512_data2', RECOVERY)
+require('resume-after-stock', SEQUENCE)
 
 positions = [
     SEQUENCE.index(f"run_netllm_experiment.sh {variant}")

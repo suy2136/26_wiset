@@ -681,7 +681,9 @@ elif [[ "$VARIANT" == "adalora_peft_r12" ]]; then
   )
 elif [[ "$VARIANT" == "adalora_b512_data2" ]]; then
   use_v19_schedule
-  MODEL_TAG="llama_base_low_rank_adalora_b512_data2"
+  # run_plm.py always inserts its own `_adalora` segment before the
+  # experiment tag when --use-adalora is enabled.
+  MODEL_TAG="llama_base_low_rank_adalora_adalora_b512_data2"
   ADALORA_ALLOCATOR_MODE="peft"
   DISPLAY_NAME="Stock PEFT AdaLoRA (init32-target8-budget512, LoRA seed1, data seed2)"
   RANK=8

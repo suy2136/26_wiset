@@ -2,14 +2,19 @@
 set -euo pipefail
 
 MODE="${1:-full}"
-if [[ "$MODE" != "smoke" && "$MODE" != "full" ]]; then
-  echo "Usage: bash scripts/run_vp_b512_data2_allocators.sh {smoke|full}"
+if [[ "$MODE" != "smoke" && "$MODE" != "full" && \
+      "$MODE" != "resume-after-stock" ]]; then
+  echo "Usage: bash scripts/run_vp_b512_data2_allocators.sh {smoke|full|resume-after-stock}"
   exit 2
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
+
+if [[ "$MODE" == "resume-after-stock" ]]; then
+  exec bash scripts/resume_vp_b512_data2_after_stock.sh all "${2:-}"
+fi
 
 # Capacity-matched VP comparison against the existing NBS v19 data-seed
 # ablation. Only the data seed changes; model/LoRA initialization stays at 1.
