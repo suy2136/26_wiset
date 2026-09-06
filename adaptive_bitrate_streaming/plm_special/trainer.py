@@ -12,6 +12,7 @@ from munch import Munch
 from torch.utils.data import DataLoader
 
 from plm_special.utils.utils import process_batch
+from plm_special.utils.seed_utils import make_data_generator
 from plm_special.numeric_safety import classify_update
 
 
@@ -130,7 +131,13 @@ class Trainer:
         self.grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
         
         self.exp_dataset_info = Munch(exp_dataset.exp_dataset_info)
-        self.dataloader = DataLoader(exp_dataset, batch_size, shuffle=True, pin_memory=True)
+        self.dataloader = DataLoader(
+            exp_dataset,
+            batch_size,
+            shuffle=True,
+            pin_memory=True,
+            generator=make_data_generator(args.data_seed),
+        )
         if self.nbs_allocator is not None:
             self._write_nbs_diagnostics(
                 self.nbs_allocator.snapshot_diagnostics(

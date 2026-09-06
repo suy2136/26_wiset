@@ -33,6 +33,10 @@ from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
 from plm_special.training_control import ValidationPlateauController
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.utils import process_batch
+from plm_special.utils.seed_utils import (
+    isolated_seed,
+    resolve_experiment_seeds,
+)
 from plm_special.utils.adalora_checkpoint import (
     load_resized_adalora_adapter,
 )
@@ -69,6 +73,24 @@ PLM_LAYER_SIZES = {
 }
 
 
+def _seed_metadata(args):
+    return {
+        'seed': int(args.seed),
+        'lora_seed': int(args.lora_seed),
+        'data_seed': int(args.data_seed),
+    }
+
+
+def _seed_path_fragment(args):
+    """Keep historical paths unchanged unless component seeds differ."""
+    fragment = f'seed_{args.seed}'
+    if args.lora_seed != args.seed or args.data_seed != args.seed:
+        fragment += (
+            f'_lora_seed_{args.lora_seed}_data_seed_{args.data_seed}'
+        )
+    return fragment
+
+
 def _active_adalora_ranks(plm, adapter_name='default'):
     """Return model-free active-rank metadata from AdaLoRA singular values."""
     ranks = {}
@@ -100,7 +122,7 @@ def save_model(args, model, save_dir, role='checkpoint'):
             ),
             'lora_method': lora_method,
             'role': role,
-            'seed': args.seed,
+            **_seed_metadata(args),
             'physical_rank': args.rank,
         }
         if allocator is not None:
@@ -653,6 +675,15 @@ def run(args):
     for name, value in comparison_defaults.items():
         if not hasattr(args, name):
             setattr(args, name, value)
+    args.seed, args.lora_seed, args.data_seed = resolve_experiment_seeds(
+        args.seed,
+        getattr(args, 'lora_seed', None),
+        getattr(args, 'data_seed', None),
+    )
+    print(
+        f'Experiment seeds: master={args.seed}, LoRA={args.lora_seed}, '
+        f'data={args.data_seed}'
+    )
     assert args.plm_type in cfg.plm_types
     assert args.plm_size in cfg.plm_sizes
     assert args.exp_pool_path is not None, 'please specify a experience pool path for training'
@@ -877,23 +908,24 @@ def run(args):
                 )
             with open(rank_config_path, encoding='utf-8') as stream:
                 rank_config = json.load(stream)
-        plm = peft_model(
-            plm, args.plm_type, rank=args.rank,
-            nbs_v19=args.nbs_v19,
-            lora_method=args.lora_method,
-            total_step=allocation_total_steps,
-            nbs_rank_budget=args.nbs_rank_budget,
-            nbs_ema_beta=args.nbs_ema_beta,
-            nbs_allocation_interval=args.nbs_allocation_interval,
-            nbs_rank_config=rank_config,
-            adalora_rank_budget=args.adalora_rank_budget,
-            adalora_allocation_interval=args.adalora_allocation_interval,
-            shapley_permutations=args.shapley_permutations,
-            shapley_truncate_fraction=args.shapley_truncate_fraction,
-            shapley_seed=args.seed,
-            shapley_antithetic=args.shapley_antithetic,
-            eva_state=eva_state,
-        )
+        with isolated_seed(args.lora_seed, include_cuda=True):
+            plm = peft_model(
+                plm, args.plm_type, rank=args.rank,
+                nbs_v19=args.nbs_v19,
+                lora_method=args.lora_method,
+                total_step=allocation_total_steps,
+                nbs_rank_budget=args.nbs_rank_budget,
+                nbs_ema_beta=args.nbs_ema_beta,
+                nbs_allocation_interval=args.nbs_allocation_interval,
+                nbs_rank_config=rank_config,
+                adalora_rank_budget=args.adalora_rank_budget,
+                adalora_allocation_interval=args.adalora_allocation_interval,
+                shapley_permutations=args.shapley_permutations,
+                shapley_truncate_fraction=args.shapley_truncate_fraction,
+                shapley_seed=args.lora_seed,
+                shapley_antithetic=args.shapley_antithetic,
+                eva_state=eva_state,
+            )
 
     # 4.2 create state encoder
     assert args.state_feature_dim is not None, 'please specify state feature dim to create state encoder'
@@ -954,8 +986,9 @@ def run(args):
         method_tag = f'_eva_budget{eva_state["total_rank_budget"]}'
     else:
         method_tag = ''
+    seed_path_fragment = _seed_path_fragment(args)
     models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
-                              f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_seed_{args.seed}')
+                              f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_{seed_path_fragment}')
     if args.temporal_selector == 'event-aware':
         selector_tag = (
             f'temporal_event_aware_k{args.event_max_events}'
@@ -988,7 +1021,7 @@ def run(args):
         f'{args.trace}_{args.video}',
         f'trace_num_{args.trace_num}_fixed_{args.fixed_order}',
         f'{args.plm_type}_{args.plm_size}',
-        f'early_stop_{args.which_layer}_rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_seed_{args.seed}',
+        f'early_stop_{args.which_layer}_rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_tgt_scale_{args.target_return_scale}_{seed_path_fragment}',
         selector_tag,
         speculative_tag,
     ]
@@ -1229,6 +1262,14 @@ if __name__ == '__main__':
     parser.add_argument('--test', action="store_true", help='test model')
     parser.add_argument('--grad-accum-steps', dest='grad_accum_steps', type=int, default=32)
     parser.add_argument('--seed', help='random seed', type=int, default=100003)
+    parser.add_argument(
+        '--lora-seed', type=int,
+        help='LoRA/AdaLoRA allocator initialization seed; defaults to --seed',
+    )
+    parser.add_argument(
+        '--data-seed', type=int,
+        help='training DataLoader shuffle seed; defaults to --seed',
+    )
     parser.add_argument('--scale', help='scale reward/return', type=int, default=1000)
     parser.add_argument('--model-dir', help='model weight dir for testing')
     parser.add_argument('--device', action='store', dest='device', help='device (cuda or cpu) to run experiment')

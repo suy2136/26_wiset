@@ -29,6 +29,22 @@ def experiment_seed(experiment):
     return int(experiment.get("seed", 1))
 
 
+def experiment_lora_seed(experiment):
+    return int(experiment.get("lora_seed", experiment_seed(experiment)))
+
+
+def experiment_data_seed(experiment):
+    return int(experiment.get("data_seed", experiment_seed(experiment)))
+
+
+def experiment_seed_args(experiment):
+    return [
+        "--seed", str(experiment_seed(experiment)),
+        "--lora-seed", str(experiment_lora_seed(experiment)),
+        "--data-seed", str(experiment_data_seed(experiment)),
+    ]
+
+
 def expected_variant(experiment):
     return {
         "nbs": "nbs_v19",
@@ -64,7 +80,7 @@ def build_eva_precompute_command(args, experiment):
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
         "--output-dir", str(eva_state_dir(args, experiment).resolve()),
         "--device", args.device,
-        "--seed", str(experiment_seed(experiment)),
+        "--seed", str(experiment_data_seed(experiment)),
         "--rank-budget", str(experiment["rank_budget"]),
         "--min-rank", str(experiment.get("min_rank", 2)),
         "--max-rank", str(experiment.get("max_rank", 32)),
@@ -83,7 +99,6 @@ def build_training_command(args, experiment):
     method = experiment_method(experiment)
     command = [
         sys.executable, "run_plm.py", "--adapt", "--fp16",
-        "--seed", str(experiment_seed(experiment)),
         "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
@@ -108,6 +123,7 @@ def build_training_command(args, experiment):
         "--save-checkpoint-per-epoch", "10",
         "--checkpoint-retention", "best-latest",
     ]
+    command[3:3] = experiment_seed_args(experiment)
     if method == "nbs":
         command[3:3] = [
             "--nbs-v19",
@@ -161,7 +177,6 @@ def build_test_command(args, experiment, checkpoint):
     method = experiment_method(experiment)
     command = [
         sys.executable, "run_plm.py", "--test", "--fp16",
-        "--seed", str(experiment_seed(experiment)),
         "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
         "--model-dir", str(checkpoint.resolve()),
@@ -177,6 +192,7 @@ def build_test_command(args, experiment, checkpoint):
         "--temporal-selector", "none", "--token-selector", "none",
         "--speculative-draft-steps", "0",
     ]
+    command[3:3] = experiment_seed_args(experiment)
     if method == "nbs":
         command[3:3] = [
             "--nbs-v19",
@@ -229,6 +245,10 @@ def discover_best_checkpoint(experiment, started_at):
             metadata.get("role") == expected_checkpoint_role(experiment)
             and metadata.get("variant") == variant
             and metadata.get("seed") == experiment_seed(experiment)
+            and metadata.get("lora_seed", metadata.get("seed"))
+            == experiment_lora_seed(experiment)
+            and metadata.get("data_seed", metadata.get("seed"))
+            == experiment_data_seed(experiment)
             and metadata.get("physical_rank") == experiment["physical_rank"]
             and metadata.get("effective_rank_budget")
             == experiment["rank_budget"]
@@ -270,6 +290,10 @@ def validate_checkpoint(path, experiment):
         raise ValueError(f"{experiment['name']} checkpoint role mismatch")
     if metadata.get("seed") != experiment_seed(experiment):
         raise ValueError(f"{experiment['name']} checkpoint seed mismatch")
+    if metadata.get("lora_seed", metadata.get("seed")) != experiment_lora_seed(experiment):
+        raise ValueError(f"{experiment['name']} checkpoint LoRA seed mismatch")
+    if metadata.get("data_seed", metadata.get("seed")) != experiment_data_seed(experiment):
+        raise ValueError(f"{experiment['name']} checkpoint data seed mismatch")
     if metadata.get("effective_rank_budget") != experiment["rank_budget"]:
         raise ValueError(f"{experiment['name']} rank budget mismatch")
     adapter = json.loads(
@@ -309,7 +333,12 @@ def signature(args, experiments):
         "video": args.video,
         "device": args.device,
         "seeds": {
-            item["name"]: experiment_seed(item) for item in experiments
+            item["name"]: {
+                "master": experiment_seed(item),
+                "lora": experiment_lora_seed(item),
+                "data": experiment_data_seed(item),
+            }
+            for item in experiments
         },
         "early_stopping": {
             "patience": args.early_stopping_patience,
@@ -352,8 +381,23 @@ def load_state(path, resume, run_signature):
     if "seeds" not in state.get("signature", {}):
         legacy_seed = state["signature"].pop("seed", 1)
         state["signature"]["seeds"] = {
-            item["name"]: legacy_seed for item in run_signature["experiments"]
+            item["name"]: {
+                "master": legacy_seed,
+                "lora": legacy_seed,
+                "data": legacy_seed,
+            }
+            for item in run_signature["experiments"]
         }
+    else:
+        # Migrate states written while each experiment recorded one shared
+        # integer seed instead of independently resolved component seeds.
+        for name, saved_seed in list(state["signature"]["seeds"].items()):
+            if isinstance(saved_seed, int):
+                state["signature"]["seeds"][name] = {
+                    "master": saved_seed,
+                    "lora": saved_seed,
+                    "data": saved_seed,
+                }
     # Calibration caps do not alter a completed allocator checkpoint.  Allow
     # an unfinished EVA run to adopt a larger convergence cap (and an
     # explicitly recorded unconverged-at-cap fallback) without discarding
@@ -410,6 +454,8 @@ def result_rows(state, experiments):
             "warmup_steps": experiment["warmup_steps"],
             "method": experiment_method(experiment),
             "seed": experiment_seed(experiment),
+            "lora_seed": experiment_lora_seed(experiment),
+            "data_seed": experiment_data_seed(experiment),
             "checkpoint_dir": run["checkpoint_dir"],
             "checkpoint_metadata_path": run.get("checkpoint_metadata_path"),
             "allocator_artifacts": ";".join(
@@ -442,6 +488,7 @@ def write_results(path, rows, run_signature):
         preferred = [
             "experiment", "rank_budget", "mean_active_rank",
             "physical_rank", "learning_rate", "lr_schedule", "warmup_steps",
+            "seed", "lora_seed", "data_seed",
             "mean_reward", "mean_reward_delta_vs_first",
             "inference_latency_mean_ms", "latency_reduction_vs_first",
             "nbs_compact_inference", "nbs_compaction_logits_equivalent",
