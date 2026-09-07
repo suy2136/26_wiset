@@ -18,6 +18,13 @@ DEFAULT_CHECKPOINT = ABR_ROOT / (
     "rank_32_nbs_v19_budget1536_w_20_gamma_1.0_sfd_256_lr_0.0002_"
     "wd_0.0001_warm_500_epochs_80_seed_1/early_stop_-1_best_model"
 )
+ADAPTER_WEIGHTS = ("adapter_model.safetensors", "adapter_model.bin")
+REQUIRED_CHECKPOINT_FILES = (
+    "adapter_config.json",
+    "modules_except_plm.bin",
+    "nash_rank_allocator.pt",
+    "checkpoint_metadata.json",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,7 +52,48 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def command(args: argparse.Namespace) -> list[str]:
+def checkpoint_missing(path: Path) -> list[str]:
+    missing = [name for name in REQUIRED_CHECKPOINT_FILES if not (path / name).is_file()]
+    if not any((path / name).is_file() for name in ADAPTER_WEIGHTS):
+        missing.append("adapter_model.safetensors or adapter_model.bin")
+    return missing
+
+
+def resolve_checkpoint(requested: Path) -> tuple[Path, bool]:
+    """Prefer the requested best model, then a complete sibling snapshot."""
+    requested = requested.resolve()
+    candidates = [requested]
+    run_root = requested.parent
+    candidates.extend((
+        run_root / "early_stop_-1_checkpoint/latest",
+        run_root / "early_stop_-1_final_model",
+    ))
+    checkpoint_root = run_root / "early_stop_-1_checkpoint"
+    if checkpoint_root.is_dir():
+        candidates.extend(sorted(
+            (path for path in checkpoint_root.iterdir() if path.is_dir()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        ))
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not checkpoint_missing(candidate):
+            return candidate, candidate != requested
+    details = "; ".join(
+        f"{candidate}: {', '.join(checkpoint_missing(candidate))}"
+        for candidate in candidates[:3]
+    )
+    raise FileNotFoundError(
+        "No complete seed-1 C1536 checkpoint was found. " + details
+    )
+
+
+def command(args: argparse.Namespace, checkpoint: Path | None = None) -> list[str]:
+    checkpoint = checkpoint or args.checkpoint
     return [
         sys.executable,
         "run_plm.py",
@@ -60,7 +108,7 @@ def command(args: argparse.Namespace) -> list[str]:
         "--plm-type", "llama",
         "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
-        "--model-dir", str(args.checkpoint.resolve()),
+        "--model-dir", str(checkpoint.resolve()),
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
         "--rank", "32",
         "--lr", "0.0002",
@@ -81,13 +129,17 @@ def command(args: argparse.Namespace) -> list[str]:
 
 def main() -> None:
     args = parse_args()
-    cmd = command(args)
     print("Range audit mode: detect-only (checkpoint weights are not modified)")
-    print("Command:", " ".join(cmd))
     if args.dry_run:
+        print("Command:", " ".join(command(args)))
         return
+    checkpoint, used_fallback = resolve_checkpoint(args.checkpoint)
+    cmd = command(args, checkpoint)
+    print("Selected checkpoint:", checkpoint)
+    if used_fallback:
+        print("WARNING: requested best checkpoint was incomplete; using a complete sibling checkpoint")
+    print("Command:", " ".join(cmd))
     for path, label in (
-        (args.checkpoint, "checkpoint"),
         (args.base_model_dir / "config.json", "base model"),
         (args.exp_pool_path, "experience pool"),
     ):
@@ -99,7 +151,16 @@ def main() -> None:
     env["ABR_LORA_RANGE_AUDIT_PATH"] = str(args.output.resolve())
     env["ABR_LORA_RANGE_AUDIT_THRESHOLD"] = str(args.threshold)
     subprocess.run(cmd, cwd=ABR_ROOT, env=env, check=True)
-    summary = json.loads(args.output.read_text(encoding="utf-8"))["summary"]
+    payload = json.loads(args.output.read_text(encoding="utf-8"))
+    payload["checkpoint"] = {
+        "requested": str(args.checkpoint.resolve()),
+        "selected": str(checkpoint),
+        "used_fallback": used_fallback,
+    }
+    args.output.write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    summary = payload["summary"]
     print(f"Range audit saved at: {args.output.resolve()}")
     print(
         "Audit summary: "
