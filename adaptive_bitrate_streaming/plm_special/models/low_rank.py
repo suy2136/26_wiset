@@ -1,3 +1,6 @@
+import atexit
+import json
+import os
 from pathlib import Path
 import sys
 from types import MethodType
@@ -27,6 +30,102 @@ TARGET_MODULES = {
 }
 
 LORA_METHODS = ('uniform', 'nbs', 'adalora', 'shapley', 'eva')
+
+
+_RANGE_AUDIT_PATH = os.environ.get('ABR_LORA_RANGE_AUDIT_PATH')
+_RANGE_AUDIT_THRESHOLD = float(
+    os.environ.get('ABR_LORA_RANGE_AUDIT_THRESHOLD', '60000')
+)
+_RANGE_AUDIT = {
+    'schema_version': 1,
+    'mode': 'detect-only',
+    'threshold': _RANGE_AUDIT_THRESHOLD,
+    'modules': {},
+}
+
+
+def _record_range_audit(module, *, input_absmax, input_finite, base_absmax,
+                        base_finite, delta_absmax, delta_finite,
+                        precast_absmax, precast_finite, dtype_limit):
+    """Record projection health without changing the forward result."""
+    if not _RANGE_AUDIT_PATH:
+        return
+    name = getattr(module, '_nbs_module_name', module.__class__.__name__)
+    stats = _RANGE_AUDIT['modules'].setdefault(name, {
+        'calls': 0,
+        'would_clamp_calls': 0,
+        'input_nonfinite_calls': 0,
+        'base_nonfinite_calls': 0,
+        'delta_nonfinite_calls': 0,
+        'precast_nonfinite_calls': 0,
+        'max_input_absmax': 0.0,
+        'max_base_absmax': 0.0,
+        'max_delta_absmax': 0.0,
+        'max_precast_absmax': 0.0,
+        'output_dtype_limit': float(dtype_limit),
+    })
+    values = {
+        'input': (input_absmax, input_finite),
+        'base': (base_absmax, base_finite),
+        'delta': (delta_absmax, delta_finite),
+        'precast': (precast_absmax, precast_finite),
+    }
+    stats['calls'] += 1
+    for label, (absmax, finite) in values.items():
+        is_finite = bool(finite.detach().item())
+        if not is_finite:
+            stats[f'{label}_nonfinite_calls'] += 1
+            continue
+        value = float(absmax.detach().item())
+        stats[f'max_{label}_absmax'] = max(
+            stats[f'max_{label}_absmax'], value
+        )
+    if (
+        bool(precast_finite.detach().item())
+        and float(precast_absmax.detach().item()) > _RANGE_AUDIT_THRESHOLD
+    ):
+        stats['would_clamp_calls'] += 1
+
+
+def _write_range_audit():
+    if not _RANGE_AUDIT_PATH:
+        return
+    modules = _RANGE_AUDIT['modules']
+    summary = {
+        'module_count': len(modules),
+        'projection_calls': sum(item['calls'] for item in modules.values()),
+        'would_clamp_calls': sum(
+            item['would_clamp_calls'] for item in modules.values()
+        ),
+        'input_nonfinite_calls': sum(
+            item['input_nonfinite_calls'] for item in modules.values()
+        ),
+        'base_nonfinite_calls': sum(
+            item['base_nonfinite_calls'] for item in modules.values()
+        ),
+        'delta_nonfinite_calls': sum(
+            item['delta_nonfinite_calls'] for item in modules.values()
+        ),
+        'precast_nonfinite_calls': sum(
+            item['precast_nonfinite_calls'] for item in modules.values()
+        ),
+        'max_precast_absmax': max(
+            (item['max_precast_absmax'] for item in modules.values()),
+            default=0.0,
+        ),
+    }
+    payload = {**_RANGE_AUDIT, 'summary': summary}
+    path = Path(_RANGE_AUDIT_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding='utf-8'
+    )
+    temporary.replace(path)
+
+
+if _RANGE_AUDIT_PATH:
+    atexit.register(_write_range_audit)
 
 
 def _target_module_count(plm, plm_type):
@@ -124,11 +223,23 @@ def _mixed_precision_adalora_forward(self, x):
     self._nbs_last_precast_absmax = detached_result.abs().amax().detach()
     self._nbs_last_precast_finite = torch.isfinite(detached_result).all().detach()
     self._nbs_output_dtype = base_result.dtype
+    dtype_limit = torch.finfo(base_result.dtype).max
+    _record_range_audit(
+        self,
+        input_absmax=self._nbs_last_input_absmax,
+        input_finite=self._nbs_last_input_finite,
+        base_absmax=self._nbs_last_base_absmax,
+        base_finite=self._nbs_last_base_finite,
+        delta_absmax=self._nbs_last_delta_absmax,
+        delta_finite=self._nbs_last_delta_finite,
+        precast_absmax=self._nbs_last_precast_absmax,
+        precast_finite=self._nbs_last_precast_finite,
+        dtype_limit=dtype_limit,
+    )
     # Do not let one rejected FP16 projection turn every downstream layer into
     # NaN.  The policy checks the health tensors after the PLM call and raises,
     # so this bounded value is never accepted for loss/inference.  It merely
     # contains the failure long enough to identify the first faulty modules.
-    dtype_limit = torch.finfo(base_result.dtype).max
     contained_result = torch.nan_to_num(
         result_fp32,
         nan=0.0,
