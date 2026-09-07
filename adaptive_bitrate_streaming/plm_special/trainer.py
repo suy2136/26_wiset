@@ -80,11 +80,19 @@ class Trainer:
             'nbs' if self.nbs_allocator is not None else 'uniform',
         )
         self.peft_adalora = self.lora_method in ('adalora', 'shapley')
+        self.fp16_numeric_safeguards = bool(
+            getattr(args, 'fp16_numeric_safeguards', False)
+        )
+        self.skip_nonfinite_batches = bool(
+            getattr(args, 'skip_nonfinite_batches', False)
+        )
         # EVA keeps fixed ranks, but still needs the same parameter/optimizer
         # transaction safety used by NBS. NBS-specific allocation behavior is
         # deliberately not enabled for EVA.
         self.transactional_numeric_safety = (
-            self.nbs_allocator is not None or self.lora_method == 'eva'
+            self.nbs_allocator is not None
+            or self.lora_method == 'eva'
+            or self.fp16_numeric_safeguards
         )
         self.nbs_diagnostics_path = nbs_diagnostics_path
         self.nbs_numeric_log_path = nbs_numeric_log_path
@@ -127,12 +135,13 @@ class Trainer:
             args, 'nbs_max_update_rms', 0.01
         )
         scaler_enabled = bool(
-            self.nbs_allocator is not None
+            (self.nbs_allocator is not None or self.fp16_numeric_safeguards)
             and getattr(args, 'fp16', False)
             and str(device).startswith('cuda')
             and torch.cuda.is_available()
         )
         self.grad_scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
+        self._reported_clamp_totals = {}
         
         self.exp_dataset_info = Munch(exp_dataset.exp_dataset_info)
         self.dataloader = DataLoader(
@@ -174,6 +183,13 @@ class Trainer:
                 max_consecutive_rollbacks=self.max_consecutive_rollbacks,
                 rollback_backup_device=self.rollback_backup_device,
                 max_rollback_backup_mib=self.max_rollback_backup_mib,
+            )
+        elif self.fp16_numeric_safeguards:
+            self._record_numeric_event(
+                'training_start',
+                transactional_numeric_safety=True,
+                grad_scaler_enabled=self.grad_scaler.is_enabled(),
+                skip_nonfinite_batches=self.skip_nonfinite_batches,
             )
 
     def record_trainable_dtype_summary(self, summary):
@@ -567,12 +583,45 @@ class Trainer:
                     self.optimizer_step
                 ),
             }
-        self._record_numeric_event(event, **details)
+        self._record_numeric_event(
+            event,
+            batch_will_be_skipped=self.skip_nonfinite_batches,
+            **details,
+        )
         self.optimizer.zero_grad(set_to_none=True)
-        if self.consecutive_nonfinite >= self.max_consecutive_nonfinite:
+        if (
+            self.consecutive_nonfinite >= self.max_consecutive_nonfinite
+            and not self.skip_nonfinite_batches
+        ):
             raise FloatingPointError(
                 f'{event} repeated {self.consecutive_nonfinite} times; '
                 f'see {self.nbs_numeric_log_path}'
+            )
+
+    def _record_selective_clamps(self, batch_step):
+        rows = []
+        for module_name, module in self.model.plm.named_modules():
+            total = int(getattr(
+                module, '_abr_total_selective_clamped_elements', 0
+            ))
+            previous = self._reported_clamp_totals.get(module_name, 0)
+            if total > previous:
+                rows.append({
+                    'module': module_name,
+                    'new_clamped_elements': total - previous,
+                    'total_clamped_elements': total,
+                    'threshold': float(getattr(
+                        module, '_abr_fp16_clamp_threshold', 0.0
+                    )),
+                })
+            self._reported_clamp_totals[module_name] = total
+        if rows:
+            self._record_numeric_event(
+                'fp16_selective_clamp', batch_step=batch_step,
+                clamped_elements=sum(
+                    row['new_clamped_elements'] for row in rows
+                ),
+                modules=rows,
             )
 
     def record_invalid_validation(self, **details):
@@ -834,6 +883,7 @@ class Trainer:
             while True:
                 try:
                     train_loss = self.train_step(batch)
+                    self._record_selective_clamps(step)
                     delta_issues = self._adalora_delta_issues()
                     loss_is_finite = bool(
                         torch.isfinite(train_loss.detach()).item()
@@ -934,7 +984,11 @@ class Trainer:
                 accumulated_steps >= self.grad_accum_steps
                 or (step + 1 == dataset_size)
             )
-            if self.nbs_allocator is None and not self.peft_adalora:
+            if (
+                self.nbs_allocator is None
+                and not self.peft_adalora
+                and not self.fp16_numeric_safeguards
+            ):
                 # Preserve the historical ABR training behavior for plain LoRA.
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), .25)
             if should_update:
@@ -1022,11 +1076,6 @@ class Trainer:
                     # that gradient after optimizer.step().
                     if self.grad_scaler.is_enabled():
                         self.grad_scaler.unscale_(self.optimizer)
-                    gradient_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), .25,
-                        error_if_nonfinite=True,
-                    )
-                elif self.lora_method == 'eva':
                     try:
                         gradient_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(), .25,
@@ -1035,10 +1084,50 @@ class Trainer:
                     except RuntimeError as exc:
                         if 'non-finite' not in str(exc).lower():
                             raise
+                        if self.grad_scaler.is_enabled():
+                            self.grad_scaler.update()
+                        self._register_nonfinite(
+                            'adalora_gradient_norm_nonfinite',
+                            batch_step=step, error=str(exc),
+                        )
+                        accumulated_steps = 0
+                        continue
+                elif self.lora_method == 'eva':
+                    try:
+                        if self.grad_scaler.is_enabled():
+                            self.grad_scaler.unscale_(self.optimizer)
+                        gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), .25,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        if 'non-finite' not in str(exc).lower():
+                            raise
+                        if self.grad_scaler.is_enabled():
+                            self.grad_scaler.update()
                         self._register_nonfinite(
                             'eva_gradient_norm_nonfinite',
                             batch_step=step,
                             error=str(exc),
+                        )
+                        accumulated_steps = 0
+                        continue
+                elif self.fp16_numeric_safeguards:
+                    try:
+                        if self.grad_scaler.is_enabled():
+                            self.grad_scaler.unscale_(self.optimizer)
+                        gradient_norm = torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(), .25,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as exc:
+                        if 'non-finite' not in str(exc).lower():
+                            raise
+                        if self.grad_scaler.is_enabled():
+                            self.grad_scaler.update()
+                        self._register_nonfinite(
+                            'gradient_norm_nonfinite',
+                            batch_step=step, error=str(exc),
                         )
                         accumulated_steps = 0
                         continue

@@ -5,6 +5,7 @@ import math
 import numpy as np
 import torch
 import pickle
+import re
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from pprint import pprint
@@ -124,6 +125,19 @@ def save_model(args, model, save_dir, role='checkpoint'):
             'role': role,
             **_seed_metadata(args),
             'physical_rank': args.rank,
+            'run_tag': getattr(args, 'run_tag', None),
+            'fp16_numeric_safeguards': bool(getattr(
+                args, 'fp16_numeric_safeguards', False
+            )),
+            'fp16_selective_clamp': bool(getattr(
+                args, 'fp16_selective_clamp', False
+            )),
+            'fp16_selective_clamp_threshold': getattr(
+                args, 'fp16_selective_clamp_threshold', None
+            ),
+            'skip_nonfinite_batches': bool(getattr(
+                args, 'skip_nonfinite_batches', False
+            )),
         }
         if allocator is not None:
             torch.save(
@@ -455,11 +469,17 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             if args.lora_method == 'nbs'
             else os.path.join(checkpoint_dir, 'eva_numeric_events.jsonl')
             if args.lora_method == 'eva'
+            else os.path.join(
+                checkpoint_dir, f'{args.lora_method}_numeric_events.jsonl'
+            ) if args.fp16_numeric_safeguards
             else None
         ),
         rollback_lr_callback=(
             reduce_learning_rate_after_rollback
-            if args.lora_method in ('nbs', 'eva') else None
+            if (
+                args.lora_method in ('nbs', 'eva')
+                or args.fp16_numeric_safeguards
+            ) else None
         ),
         peft_allocator_diagnostics_path=(
             os.path.join(
@@ -943,6 +963,8 @@ def run(args):
                 shapley_seed=args.lora_seed,
                 shapley_antithetic=args.shapley_antithetic,
                 eva_state=eva_state,
+                fp16_selective_clamp=args.fp16_selective_clamp,
+                fp16_clamp_threshold=args.fp16_selective_clamp_threshold,
             )
 
     # 4.2 create state encoder
@@ -1004,6 +1026,8 @@ def run(args):
         method_tag = f'_eva_budget{eva_state["total_rank_budget"]}'
     else:
         method_tag = ''
+    if args.run_tag:
+        method_tag += f'_run_{args.run_tag}'
     seed_path_fragment = _seed_path_fragment(args)
     models_dir = os.path.join(cfg.plm_ft_dir, f'{args.plm_type}_{args.plm_size}', train_exp_pool_info + f'_ss_{args.sample_step}', f'rank_{args.rank}{method_tag}_w_{args.w}_gamma_{args.gamma}_sfd_{args.state_feature_dim}'\
                               f'_lr_{args.lr}_wd_{args.weight_decay}_warm_{args.warmup_steps}_epochs_{args.num_epochs}_{seed_path_fragment}')
@@ -1109,6 +1133,26 @@ if __name__ == '__main__':
                         help='optional direct path to the base PLM directory')
     parser.add_argument('--fp16', action='store_true',
                         help='load base PLM weights directly in FP16')
+    parser.add_argument(
+        '--fp16-numeric-safeguards', action='store_true',
+        help='opt in to transactional FP16 checks for every LoRA method',
+    )
+    parser.add_argument(
+        '--fp16-selective-clamp', action='store_true',
+        help='clamp only finite AdaLoRA/NBS projection values before FP16 cast',
+    )
+    parser.add_argument(
+        '--fp16-selective-clamp-threshold', type=float, default=60000.0,
+        help='absolute finite-value threshold for the opt-in FP16 clamp',
+    )
+    parser.add_argument(
+        '--skip-nonfinite-batches', action='store_true',
+        help='log and skip irrecoverable NaN/Inf batches instead of aborting',
+    )
+    parser.add_argument(
+        '--run-tag',
+        help='optional filesystem-safe tag isolating model/result directories',
+    )
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
     parser.add_argument(
         '--lora-method',
@@ -1312,6 +1356,13 @@ if __name__ == '__main__':
     elif args.nbs_v19 and args.lora_method != 'nbs':
         parser.error('--nbs-v19 cannot be combined with a non-NBS --lora-method')
     args.nbs_v19 = args.lora_method == 'nbs'
+
+    if args.run_tag and not re.fullmatch(r'[A-Za-z0-9_.-]+', args.run_tag):
+        parser.error('--run-tag may contain only letters, digits, dot, dash, underscore')
+    if not 0 < args.fp16_selective_clamp_threshold <= 65504:
+        parser.error('--fp16-selective-clamp-threshold must be in (0, 65504]')
+    if args.fp16_selective_clamp and not args.fp16_numeric_safeguards:
+        parser.error('--fp16-selective-clamp requires --fp16-numeric-safeguards')
 
     if args.nbs_compact_inference is None:
         args.nbs_compact_inference = bool(args.test and args.nbs_v19)

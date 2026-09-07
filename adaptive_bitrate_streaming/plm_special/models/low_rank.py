@@ -222,8 +222,48 @@ def _mixed_precision_adalora_forward(self, x):
     self._nbs_last_delta_finite = delta_finite.detach()
     self._nbs_last_precast_absmax = detached_result.abs().amax().detach()
     self._nbs_last_precast_finite = torch.isfinite(detached_result).all().detach()
+    audit_precast_absmax = self._nbs_last_precast_absmax
+    audit_precast_finite = self._nbs_last_precast_finite
     self._nbs_output_dtype = base_result.dtype
     dtype_limit = torch.finfo(base_result.dtype).max
+    clamp_enabled = bool(
+        getattr(self, '_abr_fp16_selective_clamp', False)
+        and base_result.dtype == torch.float16
+    )
+    clamp_threshold = min(
+        float(getattr(self, '_abr_fp16_clamp_threshold', dtype_limit)),
+        float(dtype_limit),
+    )
+    self._abr_last_selective_clamp_count = 0
+    if clamp_enabled:
+        # Clamp finite values only. NaN/Inf remains observable through the
+        # health tensors and is rejected by RLPolicy/Trainer as before.
+        clamp_mask = torch.isfinite(result_fp32) & (
+            result_fp32.abs() > clamp_threshold
+        )
+        clamp_count = int(clamp_mask.sum().item())
+        self._abr_last_selective_clamp_count = clamp_count
+        if clamp_count:
+            self._abr_total_selective_clamp_calls = (
+                int(getattr(self, '_abr_total_selective_clamp_calls', 0)) + 1
+            )
+            self._abr_total_selective_clamped_elements = (
+                int(getattr(
+                    self, '_abr_total_selective_clamped_elements', 0
+                )) + clamp_count
+            )
+            result_fp32 = torch.where(
+                clamp_mask,
+                result_fp32.clamp(-clamp_threshold, clamp_threshold),
+                result_fp32,
+            )
+            detached_result = result_fp32.detach()
+            self._nbs_last_precast_absmax = (
+                detached_result.abs().amax().detach()
+            )
+            self._nbs_last_precast_finite = (
+                torch.isfinite(detached_result).all().detach()
+            )
     _record_range_audit(
         self,
         input_absmax=self._nbs_last_input_absmax,
@@ -232,8 +272,8 @@ def _mixed_precision_adalora_forward(self, x):
         base_finite=self._nbs_last_base_finite,
         delta_absmax=self._nbs_last_delta_absmax,
         delta_finite=self._nbs_last_delta_finite,
-        precast_absmax=self._nbs_last_precast_absmax,
-        precast_finite=self._nbs_last_precast_finite,
+        precast_absmax=audit_precast_absmax,
+        precast_finite=audit_precast_finite,
         dtype_limit=dtype_limit,
     )
     # Do not let one rejected FP16 projection turn every downstream layer into
@@ -249,7 +289,9 @@ def _mixed_precision_adalora_forward(self, x):
     return contained_result.to(base_result.dtype)
 
 
-def _patch_adalora_mixed_precision(model):
+def _patch_adalora_mixed_precision(
+    model, fp16_selective_clamp=False, fp16_clamp_threshold=60000.0,
+):
     patched = 0
     for module_name, module in model.named_modules():
         if module.__class__.__name__ != 'SVDLinear':
@@ -260,6 +302,10 @@ def _patch_adalora_mixed_precision(model):
             continue
         module.forward = MethodType(_mixed_precision_adalora_forward, module)
         module._nbs_module_name = module_name
+        module._abr_fp16_selective_clamp = bool(fp16_selective_clamp)
+        module._abr_fp16_clamp_threshold = float(fp16_clamp_threshold)
+        module._abr_total_selective_clamp_calls = 0
+        module._abr_total_selective_clamped_elements = 0
         patched += 1
     return patched
 
@@ -284,6 +330,8 @@ def peft_model(
     shapley_seed=0,
     shapley_antithetic=True,
     eva_state=None,
+    fp16_selective_clamp=False,
+    fp16_clamp_threshold=60000.0,
 ):
     if lora_method is None:
         lora_method = 'nbs' if nbs_v19 else 'uniform'
@@ -390,7 +438,11 @@ def peft_model(
     model.abr_target_module_count = module_count
     model.abr_effective_rank_budget = effective_rank_budget
     if use_adalora:
-        patched = _patch_adalora_mixed_precision(model)
+        patched = _patch_adalora_mixed_precision(
+            model,
+            fp16_selective_clamp=fp16_selective_clamp,
+            fp16_clamp_threshold=fp16_clamp_threshold,
+        )
         if patched == 0:
             raise RuntimeError(
                 f'{lora_method} found no AdaLoRA SVDLinear modules'

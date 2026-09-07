@@ -45,6 +45,32 @@ def experiment_seed_args(experiment):
     ]
 
 
+def numeric_safety_args(args, experiment):
+    command = []
+    if getattr(args, "fp16_numeric_safeguards", False):
+        command.extend([
+            "--fp16-numeric-safeguards",
+            "--nbs-rollback-min-lr", str(args.nbs_rollback_min_lr),
+        ])
+    if getattr(args, "skip_nonfinite_batches", False):
+        command.append("--skip-nonfinite-batches")
+    if getattr(args, "nbs_skip_batch_at_rollback_lr_floor", False):
+        command.append("--nbs-skip-batch-at-rollback-lr-floor")
+    if (
+        getattr(args, "fp16_selective_clamp", False)
+        and experiment_method(experiment) in ("nbs", "adalora", "shapley")
+    ):
+        command.extend([
+            "--fp16-selective-clamp",
+            "--fp16-selective-clamp-threshold",
+            str(getattr(args, "fp16_selective_clamp_threshold", 60000.0)),
+        ])
+    run_tag = experiment.get("run_tag")
+    if run_tag:
+        command.extend(["--run-tag", str(run_tag)])
+    return command
+
+
 def expected_variant(experiment):
     return {
         "nbs": "nbs_v19",
@@ -124,6 +150,7 @@ def build_training_command(args, experiment):
         "--checkpoint-retention", "best-latest",
     ]
     command[3:3] = experiment_seed_args(experiment)
+    command[3:3] = numeric_safety_args(args, experiment)
     if method == "nbs":
         command[3:3] = [
             "--nbs-v19",
@@ -141,8 +168,6 @@ def build_training_command(args, experiment):
             "--nbs-max-consecutive-rollbacks",
             str(args.nbs_max_consecutive_rollbacks),
         ]
-        if args.nbs_skip_batch_at_rollback_lr_floor:
-            command.insert(3, "--nbs-skip-batch-at-rollback-lr-floor")
     elif method in ("adalora", "shapley"):
         command[3:3] = [
             "--lora-method", method,
@@ -196,6 +221,7 @@ def build_test_command(args, experiment, checkpoint):
         "--speculative-draft-steps", "0",
     ]
     command[3:3] = experiment_seed_args(experiment)
+    command[3:3] = numeric_safety_args(args, experiment)
     if method == "nbs":
         command[3:3] = [
             "--nbs-v19",
@@ -255,6 +281,7 @@ def discover_best_checkpoint(experiment, started_at):
             and metadata.get("physical_rank") == experiment["physical_rank"]
             and metadata.get("effective_rank_budget")
             == experiment["rank_budget"]
+            and metadata.get("run_tag") == experiment.get("run_tag")
         ):
             candidates.append(metadata_path.parent)
     if not candidates:
@@ -299,6 +326,8 @@ def validate_checkpoint(path, experiment):
         raise ValueError(f"{experiment['name']} checkpoint data seed mismatch")
     if metadata.get("effective_rank_budget") != experiment["rank_budget"]:
         raise ValueError(f"{experiment['name']} rank budget mismatch")
+    if metadata.get("run_tag") != experiment.get("run_tag"):
+        raise ValueError(f"{experiment['name']} run tag mismatch")
     adapter = json.loads(
         (path / "adapter_config.json").read_text(encoding="utf-8")
     )
@@ -361,6 +390,18 @@ def signature(args, experiments):
                 args.nbs_skip_batch_at_rollback_lr_floor
             ),
             "max_consecutive_rollbacks": args.nbs_max_consecutive_rollbacks,
+            "fp16_numeric_safeguards": getattr(
+                args, "fp16_numeric_safeguards", False
+            ),
+            "fp16_selective_clamp": getattr(
+                args, "fp16_selective_clamp", False
+            ),
+            "fp16_selective_clamp_threshold": (
+                getattr(args, "fp16_selective_clamp_threshold", 60000.0)
+            ),
+            "skip_nonfinite_batches": getattr(
+                args, "skip_nonfinite_batches", False
+            ),
         },
         "features": {
             "temporal_selector": "none", "token_selector": "none",
@@ -388,6 +429,8 @@ def load_state(path, resume, run_signature):
         requested_safety = run_signature["numeric_safety"]
         for field in (
             "rollback_min_lr", "skip_batch_at_rollback_lr_floor",
+            "fp16_numeric_safeguards", "fp16_selective_clamp",
+            "fp16_selective_clamp_threshold", "skip_nonfinite_batches",
         ):
             if field not in saved_safety:
                 saved_safety[field] = requested_safety[field]
@@ -558,6 +601,12 @@ def parse_args(argv, state_file, output_file):
     parser.add_argument(
         "--nbs-max-consecutive-rollbacks", type=int, default=3,
     )
+    parser.add_argument("--fp16-numeric-safeguards", action="store_true")
+    parser.add_argument("--fp16-selective-clamp", action="store_true")
+    parser.add_argument(
+        "--fp16-selective-clamp-threshold", type=float, default=60000.0,
+    )
+    parser.add_argument("--skip-nonfinite-batches", action="store_true")
     parser.add_argument("--state-file", type=Path, default=state_file)
     parser.add_argument("--output", type=Path, default=output_file)
     parser.add_argument("--resume", action="store_true")

@@ -38,6 +38,7 @@ class TestLoraRangeAudit(unittest.TestCase):
         self.assertIn("--nbs-rank-budget 1536", output)
         self.assertIn("--data-seed 1", output)
         self.assertIn("--trace-num 1", output)
+        self.assertIn("--no-nbs-compact-inference", output)
         self.assertNotIn("--nbs-compact-inference", output)
 
     def test_incomplete_best_falls_back_to_complete_latest(self):

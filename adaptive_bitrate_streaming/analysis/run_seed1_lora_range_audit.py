@@ -101,6 +101,7 @@ def command(args: argparse.Namespace, checkpoint: Path | None = None) -> list[st
         "--nbs-v19",
         "--nbs-rank-budget", "1536",
         "--nbs-rank-config", "configs/nbs_v19_rank_config.json",
+        "--no-nbs-compact-inference",
         "--fp16",
         "--seed", "1",
         "--lora-seed", "1",
