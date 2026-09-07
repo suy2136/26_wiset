@@ -41,7 +41,9 @@ def parse_args() -> argparse.Namespace:
                  "uniform_r12", "uniform_b736", "adalora_peft_r12",
                  "shapley_v19", "eva", "plain",
                  "uniform_r8_data2", "adalora_b512_data2",
-                 "eva_b512_data2", "shapley_b512_data2"),
+                 "eva_b512_data2", "shapley_b512_data2",
+                 "uniform_r8_data1", "adalora_b512_data1",
+                 "eva_b512_data1"),
         required=True,
     )
     parser.add_argument("--train-log", type=Path, required=True)
@@ -344,6 +346,9 @@ def main() -> None:
         "adalora_b512_data2": "Stock AdaLoRA (init32-target8, data seed2)",
         "eva_b512_data2": "EVA (min2-max32-budget512, data seed2)",
         "shapley_b512_data2": "Shapley AdaLoRA (init32-target8, data seed2)",
+        "uniform_r8_data1": "Uniform LoRA (rank8, budget512, data seed1)",
+        "adalora_b512_data1": "Stock AdaLoRA (init32-target8, data seed1)",
+        "eva_b512_data1": "EVA (min2-max32-budget512, data seed1)",
         "plain": "NetLLM",
     }
     display_name = args.display_name or display_names[args.variant]
@@ -467,7 +472,7 @@ def main() -> None:
     if allocator and allocator.get("histogram"):
         rank_items = sorted((int(rank), count) for rank, count in allocator["histogram"].items())
         axes[1, 2].bar([str(rank) for rank, _ in rank_items], [count for _, count in rank_items])
-        if args.variant in ("eva", "eva_b512_data2"):
+        if args.variant in ("eva", "eva_b512_data2", "eva_b512_data1"):
             allocation_name = "EVA"
         elif args.variant in ("shapley_v19", "shapley_b512_data2"):
             allocation_name = "Shapley"
@@ -485,6 +490,7 @@ def main() -> None:
             uniform_rank = {
                 "uniform_r12": 12,
                 "uniform_r8_data2": 8,
+                "uniform_r8_data1": 8,
             }.get(args.variant, 32)
             rank_text = f"Uniform rank = {uniform_rank}"
         axes[1, 2].text(0.5, 0.5, rank_text, ha="center", va="center")

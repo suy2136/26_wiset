@@ -1928,7 +1928,9 @@ if __name__ == '__main__':
                                  'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
                                  'adalora_shapley', 'shapley_v19', 'eva',
                                  'uniform_r8_data2', 'adalora_b512_data2',
-                                 'eva_b512_data2', 'shapley_b512_data2'],
+                                 'eva_b512_data2', 'shapley_b512_data2',
+                                 'uniform_r8_data1', 'adalora_b512_data1',
+                                 'eva_b512_data1'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(

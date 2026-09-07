@@ -28,10 +28,13 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "uniform_r8_data2" && \
       "$VARIANT" != "adalora_b512_data2" && \
       "$VARIANT" != "eva_b512_data2" && \
+      "$VARIANT" != "uniform_r8_data1" && \
+      "$VARIANT" != "adalora_b512_data1" && \
+      "$VARIANT" != "eva_b512_data1" && \
       "$VARIANT" != "shapley_b512_data2" && \
       "$VARIANT" != "plain" ]]; then
   echo "Unknown NetLLM experiment variant: $VARIANT"
-  echo "Use scripts/run_vp_b512_data2_allocators.sh for the four budget-512 data-seed2 comparisons."
+  echo "Use scripts/run_vp_b512_data1_allocators.sh or scripts/run_vp_b512_data2_allocators.sh for budget-512 comparisons."
   exit 2
 fi
 
@@ -594,7 +597,8 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     "${ADAPTIVE_BUDGET_ARGS[@]}"
     "${EXPERIMENT_ARGS[@]}"
   )
-elif [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
+elif [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" || \
+        "$VARIANT" == "eva_b512_data1" ]]; then
   MODEL_TAG="llama_base_low_rank_eva"
   DISPLAY_NAME="EVA-NetLLM (activation-PCA, budget736, seed1)"
   RANK="${EVA_RANK:-12}"
@@ -606,17 +610,22 @@ elif [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
   EVA_STATE_ARTIFACT="$EVA_STATE_DIR/eva_state.pt"
   EARLY_STOPPING_PATIENCE="${EARLY_STOPPING_PATIENCE:-2}"
   EARLY_STOPPING_MIN_DELTA="${EARLY_STOPPING_MIN_DELTA:-0.0001}"
-  if [[ "$VARIANT" == "eva_b512_data2" ]]; then
+  if [[ "$VARIANT" == "eva_b512_data2" || "$VARIANT" == "eva_b512_data1" ]]; then
     use_v19_schedule
-    MODEL_TAG="llama_base_low_rank_eva_b512_data2"
-    DISPLAY_NAME="EVA-NetLLM (min2-max32-budget512, LoRA seed1, data seed2)"
+    MODEL_TAG="llama_base_low_rank_${VARIANT}"
     RANK=32
     RANK_BUDGET=512
     EVA_MIN_RANK=2
     EVA_MAX_RANK=32
     SEED=1
     LORA_SEED=1
-    DATA_SEED=2
+    if [[ "$VARIANT" == "eva_b512_data1" ]]; then
+      DATA_SEED=1
+      DISPLAY_NAME="EVA-NetLLM (min2-max32-budget512, LoRA seed1, data seed1)"
+    else
+      DATA_SEED=2
+      DISPLAY_NAME="EVA-NetLLM (min2-max32-budget512, LoRA seed1, data seed2)"
+    fi
   fi
   EXTRA_ARGS=(
     --use-eva
@@ -625,19 +634,24 @@ elif [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
-elif [[ "$VARIANT" == "uniform_r8_data2" ]]; then
+elif [[ "$VARIANT" == "uniform_r8_data2" || "$VARIANT" == "uniform_r8_data1" ]]; then
   use_v19_schedule
-  MODEL_TAG="llama_base_low_rank_uniform_r8_data2"
-  DISPLAY_NAME="Uniform LoRA (rank8, budget512, LoRA seed1, data seed2)"
+  MODEL_TAG="llama_base_low_rank_${VARIANT}"
   RANK=8
   RANK_BUDGET=512
   SEED=1
   LORA_SEED=1
-  DATA_SEED=2
+  if [[ "$VARIANT" == "uniform_r8_data1" ]]; then
+    DATA_SEED=1
+    DISPLAY_NAME="Uniform LoRA (rank8, budget512, LoRA seed1, data seed1)"
+  else
+    DATA_SEED=2
+    DISPLAY_NAME="Uniform LoRA (rank8, budget512, LoRA seed1, data seed2)"
+  fi
   EARLY_STOPPING_PATIENCE=2
   EARLY_STOPPING_MIN_DELTA=0.0001
   EXTRA_ARGS=(
-    --experiment-tag uniform_r8_data2
+    --experiment-tag "$VARIANT"
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
@@ -684,19 +698,25 @@ elif [[ "$VARIANT" == "adalora_peft_r12" ]]; then
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
-elif [[ "$VARIANT" == "adalora_b512_data2" ]]; then
+elif [[ "$VARIANT" == "adalora_b512_data2" || \
+        "$VARIANT" == "adalora_b512_data1" ]]; then
   use_v19_schedule
   # run_plm.py always inserts its own `_adalora` segment before the
   # experiment tag when --use-adalora is enabled.
-  MODEL_TAG="llama_base_low_rank_adalora_adalora_b512_data2"
+  MODEL_TAG="llama_base_low_rank_adalora_${VARIANT}"
   ADALORA_ALLOCATOR_MODE="peft"
-  DISPLAY_NAME="Stock PEFT AdaLoRA (init32-target8-budget512, LoRA seed1, data seed2)"
   RANK=8
   RANK_BUDGET=512
   ADALORA_INIT_RANK=32
   SEED=1
   LORA_SEED=1
-  DATA_SEED=2
+  if [[ "$VARIANT" == "adalora_b512_data1" ]]; then
+    DATA_SEED=1
+    DISPLAY_NAME="Stock PEFT AdaLoRA (init32-target8-budget512, LoRA seed1, data seed1)"
+  else
+    DATA_SEED=2
+    DISPLAY_NAME="Stock PEFT AdaLoRA (init32-target8-budget512, LoRA seed1, data seed2)"
+  fi
   BEST_MODEL_NAME="best_ar_model"
   EARLY_STOPPING_PATIENCE=2
   EARLY_STOPPING_MIN_DELTA=0.0001
@@ -705,7 +725,7 @@ elif [[ "$VARIANT" == "adalora_b512_data2" ]]; then
     --adalora-allocator peft
     --adalora-init-rank "$ADALORA_INIT_RANK"
     --adalora-allocation-interval "$ADALORA_ALLOCATION_INTERVAL"
-    --experiment-tag adalora_b512_data2
+    --experiment-tag "$VARIANT"
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
@@ -777,7 +797,8 @@ fi
 
 if [[ "${VP_B512_SMOKE:-0}" == "1" ]]; then
   case "$VARIANT" in
-    uniform_r8_data2|adalora_b512_data2|eva_b512_data2|shapley_b512_data2)
+    uniform_r8_data2|adalora_b512_data2|eva_b512_data2|shapley_b512_data2|\
+    uniform_r8_data1|adalora_b512_data1|eva_b512_data1)
       EPOCHS=1
       CHECKPOINT_INTERVAL=10
       VALIDATION_INTERVAL=5
@@ -922,7 +943,8 @@ resolve_checkpoint() {
 }
 
 set -e
-if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
+if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" || \
+      "$VARIANT" == "eva_b512_data1" ]]; then
   write_status "eva_precompute" "running" 0
   if prepare_eva_state; then
     if [[ "$SKIP_VISUALIZATION" == "0" ]]; then
@@ -953,7 +975,8 @@ printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nv
   "${NBS_DIAGNOSTICS:-}" "${RANK_CONFIG:-}" "${LORA_RANK_CONFIG:-}" \
   "${RANK_BUDGET:-}" "${EARLY_STOPPING_PATIENCE:-}" "${EARLY_STOPPING_MIN_DELTA:-}" \
   "$SCHEDULED_SAMPLING" "${MIX_RATE:-}" > "$RUN_DIR/metadata.env"
-if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
+if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" || \
+      "$VARIANT" == "eva_b512_data1" ]]; then
   printf 'eva_state=%s\neva_rank_budget=%s\neva_min_rank=%s\neva_max_rank=%s\neva_rho=%s\neva_metric=%s\n' \
     "$EVA_STATE_ARTIFACT" "$RANK_BUDGET" "$EVA_MIN_RANK" "$EVA_MAX_RANK" \
     "$EVA_RHO" "${EVA_METRIC:-ratio}" >> "$RUN_DIR/metadata.env"
@@ -1214,7 +1237,8 @@ for index in "${!CHECKPOINT_ROLES[@]}"; do
       PLOT_CMD+=(--allocator-state "$CANONICAL_MODEL_PATH/nash_rank_allocator.pt")
       PLOT_CMD+=(--allocator-diagnostics "$NBS_DIAGNOSTICS")
     fi
-    if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" ]]; then
+    if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" || \
+          "$VARIANT" == "eva_b512_data1" ]]; then
       PLOT_CMD+=(--eva-state "$EVA_STATE_ARTIFACT")
     fi
     if [[ "$ADALORA_ALLOCATOR_MODE" == "shapley" || \
