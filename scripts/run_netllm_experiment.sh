@@ -13,6 +13,7 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v14" && "$VARIANT" != "nbs_v15" && \
       "$VARIANT" != "nbs_v16" && "$VARIANT" != "nbs_v17" && \
       "$VARIANT" != "nbs_v18" && "$VARIANT" != "nbs_v19" && \
+      "$VARIANT" != "nbs_v19_audit" && \
       "$VARIANT" != "nbs_v20" && \
       "$VARIANT" != "nbs_v21" && "$VARIANT" != "nbs_v22" && \
       "$VARIANT" != "nbs_v23" && "$VARIANT" != "nbs_v24" && \
@@ -55,6 +56,7 @@ ADALORA_BUDGET_MODE="${ADALORA_BUDGET_MODE:-fixed}"
 ADALORA_RELATIVE_LAMBDA="${ADALORA_RELATIVE_LAMBDA:-0.15}"
 ADALORA_ADAPTIVE_MIN_BUDGET="${ADALORA_ADAPTIVE_MIN_BUDGET:-}"
 ADALORA_ADAPTIVE_MAX_BUDGET="${ADALORA_ADAPTIVE_MAX_BUDGET:-}"
+NBS_ALLOCATION_AUDIT=0
 SEED="${SEED:-1}"
 if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ && "$CHECKPOINT_INTERVAL" =~ ^[1-9][0-9]*$ && \
         "$VALIDATION_INTERVAL" =~ ^[1-9][0-9]*$ && "$EVAL_PROGRESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
@@ -140,6 +142,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v14" || "$VARIANT" == "nbs_v15" || \
       "$VARIANT" == "nbs_v16" || "$VARIANT" == "nbs_v17" || \
       "$VARIANT" == "nbs_v18" || "$VARIANT" == "nbs_v19" || \
+      "$VARIANT" == "nbs_v19_audit" || \
       "$VARIANT" == "nbs_v20" || "$VARIANT" == "nbs_v21" || \
       "$VARIANT" == "nbs_v22" || "$VARIANT" == "nbs_v23" || \
       "$VARIANT" == "nbs_v24" || "$VARIANT" == "nbs_v25" || \
@@ -381,6 +384,24 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     EARLY_STOPPING_MIN_DELTA=0.0001
     EXPERIMENT_ARGS=(
       --experiment-tag nbs_v19
+      --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
+      --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
+    )
+  elif [[ "$VARIANT" == "nbs_v19_audit" ]]; then
+    use_v19_schedule
+    MODEL_TAG="llama_base_low_rank_adalora_nbs_v19_audit"
+    DISPLAY_NAME="NBS-NetLLM v19 audit (min2-max32-budget512, mean-rank8, seed1)"
+    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_BUDGET=512
+    SEED=1
+    LORA_SEED=1
+    DATA_SEED=1
+    NBS_ALLOCATION_AUDIT=1
+    EARLY_STOPPING_PATIENCE=2
+    EARLY_STOPPING_MIN_DELTA=0.0001
+    EXPERIMENT_ARGS=(
+      --experiment-tag nbs_v19_audit
+      --nbs-allocation-audit
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
@@ -962,13 +983,13 @@ if [[ "$VARIANT" == "eva" || "$VARIANT" == "eva_b512_data2" || \
   fi
 fi
 write_status "training" "running" 0
-printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nadalora_init_rank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
+printf 'variant=%s\nrun_id=%s\nseed=%s\nlora_seed=%s\ndata_seed=%s\nepochs=%s\nvalidation_interval=%s\ncheckpoint_interval=%s\nsave_periodic_checkpoints=%s\neval_progress_interval=%s\nlatency_warmup_steps=%s\nrank=%s\nadalora_init_rank=%s\nlearning_rate=%s\nadalora_ema_beta=%s\nadalora_shadow_update_policy=%s\nadalora_budget_mode=%s\nadalora_relative_lambda=%s\nadalora_adaptive_min_budget=%s\nadalora_adaptive_max_budget=%s\nadalora_allocator=%s\nnbs_allocation_audit=%s\nmultimodal_mode=%s\npatch_selection_weights=%s\npatch_top_k=%s\nselector_recent_k=%s\nspeculative_gamma=%s\nspeculative_threshold=%s\nbest_ar_model=%s\nbest_post_nbs_model=%s\nfinal_nbs_model=%s\nresult_csv=%s\nnbs_diagnostics=%s\nrank_config=%s\nlora_rank_config=%s\nrank_budget=%s\nearly_stopping_patience=%s\nearly_stopping_min_delta=%s\nscheduled_sampling=%s\nmix_rate=%s\n' \
   "$VARIANT" "$RUN_ID" "$SEED" "$LORA_SEED" "$DATA_SEED" "$EPOCHS" "$VALIDATION_INTERVAL" "$CHECKPOINT_INTERVAL" \
   "$SAVE_PERIODIC_CHECKPOINTS" "$EVAL_PROGRESS_INTERVAL" "$LATENCY_WARMUP_STEPS" "$RANK" \
   "$ADALORA_INIT_RANK" "$LEARNING_RATE" "$ADALORA_EMA_BETA" "$ADALORA_SHADOW_UPDATE_POLICY" \
   "$ADALORA_BUDGET_MODE" "$ADALORA_RELATIVE_LAMBDA" \
   "$ADALORA_ADAPTIVE_MIN_BUDGET" "$ADALORA_ADAPTIVE_MAX_BUDGET" \
-  "$ADALORA_ALLOCATOR_MODE" "$MULTIMODAL_MODE" \
+  "$ADALORA_ALLOCATOR_MODE" "$NBS_ALLOCATION_AUDIT" "$MULTIMODAL_MODE" \
   "${PATCH_SELECTION_WEIGHTS:-}" "${PATCH_TOP_K:-}" "${SELECTOR_RECENT_K_VALUE:-}" \
   "${SPECULATIVE_GAMMA_VALUE:-}" "${SPECULATIVE_THRESHOLD_VALUE:-}" \
   "$BEST_MODEL" "$BEST_POST_NBS_MODEL" "$FINAL_NBS_MODEL" "$RESULT_CSV" \

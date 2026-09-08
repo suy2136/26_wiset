@@ -10,6 +10,7 @@ from collections import OrderedDict
 from fnmatch import fnmatchcase
 import heapq
 import re
+import time
 
 import torch
 
@@ -44,7 +45,7 @@ class NashRankAllocator:
                  cooldown_start_step=None, allocation_interval=1,
                  shadow_update_policy="legacy", budget_mode="fixed",
                  relative_lambda=0.15, adaptive_min_budget=None,
-                 adaptive_max_budget=None):
+                 adaptive_max_budget=None, enable_allocation_audit=False):
         self.model = model
         self.adapter_name = adapter_name
         self.target_rank = int(target_rank)
@@ -105,6 +106,9 @@ class NashRankAllocator:
         self.last_allocated_gain = None
         self.next_rejected_gain = None
         self.stopping_reason = "initialization"
+        self.enable_allocation_audit = bool(enable_allocation_audit)
+        self.last_decision_trace = []
+        self.last_allocation_audit = None
 
         self.layers = self._find_layers()
         if not self.layers:
@@ -410,17 +414,38 @@ class NashRankAllocator:
         self.stopping_threshold = None
         self.last_allocated_gain = None
         self.next_rejected_gain = None
-        for _ in range(remaining):
+        self.last_decision_trace = []
+        for unit_index in range(remaining):
             if not heap:
                 break
             neg_gain, _, selected = heapq.heappop(heap)
             selected_gain = -neg_gain
+            rank_before = int(ranks[selected])
             self.last_gains[selected] = selected_gain
             self.last_allocated_gain = selected_gain
             ranks[selected] += 1
             self._push_next_gain(
                 heap, tie_breaker, selected, ranks, utilities, weights
             )
+            if self.enable_allocation_audit:
+                runner_up_gain = -heap[0][0] if heap else None
+                runner_up_name = heap[0][2] if heap else None
+                layer_index, module_type = self._module_coordinates(selected)
+                self.last_decision_trace.append({
+                    "unit_index": int(unit_index),
+                    "selected_layer_name": selected,
+                    "selected_transformer_layer_index": layer_index,
+                    "selected_module_type": module_type,
+                    "rank_before": rank_before,
+                    "rank_after": int(ranks[selected]),
+                    "selected_marginal_nash_gain": float(selected_gain),
+                    "runner_up_layer_name": runner_up_name,
+                    "runner_up_marginal_nash_gain": runner_up_gain,
+                    "selection_gap": (
+                        None if runner_up_gain is None
+                        else float(selected_gain - runner_up_gain)
+                    ),
+                })
         self.next_rejected_gain = -heap[0][0] if heap else None
         self.stopping_reason = "fixed_budget_reached"
         return ranks, utilities, weights
@@ -433,6 +458,7 @@ class NashRankAllocator:
         self.last_allocated_gain = None
         self.next_rejected_gain = None
         self.stopping_reason = "no_available_candidate"
+        self.last_decision_trace = []
 
         while heap and sum(ranks.values()) < self.adaptive_max_budget:
             best_gain = -heap[0][0]
@@ -446,12 +472,32 @@ class NashRankAllocator:
                 break
             neg_gain, _, selected = heapq.heappop(heap)
             selected_gain = -neg_gain
+            rank_before = int(ranks[selected])
             self.last_gains[selected] = selected_gain
             self.last_allocated_gain = selected_gain
             ranks[selected] += 1
             self._push_next_gain(
                 heap, tie_breaker, selected, ranks, utilities, weights
             )
+            if self.enable_allocation_audit:
+                runner_up_gain = -heap[0][0] if heap else None
+                runner_up_name = heap[0][2] if heap else None
+                layer_index, module_type = self._module_coordinates(selected)
+                self.last_decision_trace.append({
+                    "unit_index": len(self.last_decision_trace),
+                    "selected_layer_name": selected,
+                    "selected_transformer_layer_index": layer_index,
+                    "selected_module_type": module_type,
+                    "rank_before": rank_before,
+                    "rank_after": int(ranks[selected]),
+                    "selected_marginal_nash_gain": float(selected_gain),
+                    "runner_up_layer_name": runner_up_name,
+                    "runner_up_marginal_nash_gain": runner_up_gain,
+                    "selection_gap": (
+                        None if runner_up_gain is None
+                        else float(selected_gain - runner_up_gain)
+                    ),
+                })
         else:
             if sum(ranks.values()) >= self.adaptive_max_budget:
                 self.stopping_reason = "adaptive_max_budget_reached"
@@ -844,12 +890,74 @@ class NashRankAllocator:
 
     def allocate(self, step=None):
         """Allocate ranks using the most recently updated sensitivities."""
+        allocation_started = time.perf_counter() if self.enable_allocation_audit else None
         self._refresh_spectral_shadow()
+        refresh_finished = time.perf_counter() if self.enable_allocation_audit else None
         previous_ranks = dict(self.ranks)
         ranks, utilities, weights = self._choose_ranks()
+        choice_finished = time.perf_counter() if self.enable_allocation_audit else None
+        audit_started = choice_finished
+        pre_rows = []
+        gain_curve_rows = []
+        if self.enable_allocation_audit:
+            corrected = self._bias_corrected_sensitivity()
+            for name in self.layers:
+                rank_pre = int(previous_ranks[name])
+                rank_post = int(ranks[name])
+                utility = utilities[name]
+                layer_index, module_type = self._module_coordinates(name)
+                pre_rows.append({
+                    "layer_name": name,
+                    "transformer_layer_index": layer_index,
+                    "module_type": module_type,
+                    "rank_pre": rank_pre,
+                    "rank_post": rank_post,
+                    "rank_delta": rank_post - rank_pre,
+                    "sensitivity": float(corrected[name]),
+                    "alpha": float(weights[name]),
+                    "utility_at_rank_pre": float(utility[rank_pre].item()),
+                    "pre_next_utility_increment": (
+                        self._utility_increment(utility, rank_pre)
+                        if rank_pre < self.max_ranks[name] else None
+                    ),
+                    "pre_marginal_utility_gain": (
+                        self._marginal_utility_gain(utility, rank_pre)
+                        if rank_pre < self.max_ranks[name] else None
+                    ),
+                    "pre_marginal_nash_gain": (
+                        self._marginal_gain(utility, rank_pre, weights[name])
+                        if rank_pre < self.max_ranks[name] else None
+                    ),
+                    "spectral_energy_total": float(
+                        self._spectral_energy(name).sum().item()
+                    ),
+                })
+                for candidate_rank in range(
+                    int(self.min_ranks[name]), int(self.max_ranks[name])
+                ):
+                    marginal_utility = self._marginal_utility_gain(
+                        utility, candidate_rank
+                    )
+                    gain_curve_rows.append({
+                        "layer_name": name,
+                        "transformer_layer_index": layer_index,
+                        "module_type": module_type,
+                        "candidate_rank": int(candidate_rank),
+                        "utility": float(utility[candidate_rank].item()),
+                        "next_utility_increment": self._utility_increment(
+                            utility, candidate_rank
+                        ),
+                        "marginal_utility_gain": marginal_utility,
+                        "alpha": float(weights[name]),
+                        "marginal_nash_gain": float(
+                            weights[name] * marginal_utility
+                        ),
+                    })
+        audit_finished = time.perf_counter() if self.enable_allocation_audit else None
         # Do not publish candidate ranks until the full allocation has passed
         # validation and its masks have been applied successfully.
         self._apply_allocation(ranks, utilities)
+        apply_finished = time.perf_counter() if self.enable_allocation_audit else None
         self.ranks = OrderedDict(ranks)
         self.last_step = step
         diagnostic_step = self.ema_step if step is None else step
@@ -861,6 +969,24 @@ class NashRankAllocator:
             utilities=utilities,
             weights=weights,
         )
+        if self.enable_allocation_audit:
+            for rows in (pre_rows, gain_curve_rows, self.last_decision_trace):
+                for row in rows:
+                    row["optimizer_step"] = int(diagnostic_step)
+            self.last_allocation_audit = {
+                "optimizer_step": int(diagnostic_step),
+                "pre_allocation": pre_rows,
+                "gain_curves": gain_curve_rows,
+                "decision_trace": list(self.last_decision_trace),
+                "timing": {
+                    "optimizer_step": int(diagnostic_step),
+                    "refresh_shadow_s": refresh_finished - allocation_started,
+                    "rank_choice_s": choice_finished - refresh_finished,
+                    "audit_materialization_s": audit_finished - audit_started,
+                    "apply_mask_s": apply_finished - audit_finished,
+                    "allocation_total_s": apply_finished - allocation_started,
+                },
+            }
         return dict(self.ranks)
 
     def active_rank_summary(self):

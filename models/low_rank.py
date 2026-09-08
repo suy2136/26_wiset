@@ -143,6 +143,7 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 adalora_relative_lambda=0.15,
                 adalora_adaptive_min_budget=None,
                 adalora_adaptive_max_budget=None,
+                adalora_allocation_audit=False,
                 shapley_permutations=3,
                 shapley_truncate_fraction=0.05,
                 shapley_antithetic=True,
@@ -283,6 +284,7 @@ def peft_model(plm, plm_type, rank, task_type=TaskType.FEATURE_EXTRACTION,
                 relative_lambda=adalora_relative_lambda,
                 adaptive_min_budget=adalora_adaptive_min_budget,
                 adaptive_max_budget=adalora_adaptive_max_budget,
+                enable_allocation_audit=adalora_allocation_audit,
             )
             model.nash_rank_allocation_interval = int(adalora_allocation_interval)
             model.nash_physical_rank = int(physical_rank)

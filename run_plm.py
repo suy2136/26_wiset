@@ -109,6 +109,18 @@ def _append_nash_diagnostics(path, rows):
         os.fsync(handle.fileno())
 
 
+def _append_jsonl(path, rows):
+    """Durably append JSON records used by the opt-in allocation audit."""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + '\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def _last_validation_event(path):
     """Return the last durable validation index, including after resume."""
     if path is None or not os.path.exists(path):
@@ -430,6 +442,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     allocator = None
     nash_diagnostics_path = None
     allocator_snapshot_dir = None
+    allocation_audit_dir = None
     validation_event_count = 0
     if (args.rank != -1 and args.use_adalora and
             args.adalora_allocator == 'nbs'):
@@ -442,6 +455,12 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             os.path.dirname(nash_diagnostics_path), 'rank_snapshots'
         )
         os.makedirs(allocator_snapshot_dir, exist_ok=True)
+        if args.nbs_allocation_audit:
+            allocation_audit_dir = os.path.join(
+                os.path.dirname(nash_diagnostics_path), 'allocation_audit'
+            )
+            os.makedirs(allocation_audit_dir, exist_ok=True)
+            print('NBS allocation audit enabled at', allocation_audit_dir)
         pre_mask_snapshot_path = os.path.join(
             allocator_snapshot_dir, 'pre_mask_initial_spectrum.pt'
         )
@@ -592,12 +611,30 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     last_teacher_forcing_valid_loss = None
     non_improving_validations = 0
     stop_training = False
+    training_started_wall = datetime.datetime.now(datetime.timezone.utc)
+    training_started_perf = time.perf_counter()
+    best_elapsed_s = None
+    validation_time_s = 0.0
+    optimizer_time_s = 0.0
+    checkpoint_time_s = 0.0
+
+    def timed_checkpoint(operation, *operation_args, **operation_kwargs):
+        nonlocal checkpoint_time_s
+        if allocation_audit_dir is None:
+            return operation(*operation_args, **operation_kwargs)
+        started = time.perf_counter()
+        try:
+            return operation(*operation_args, **operation_kwargs)
+        finally:
+            checkpoint_time_s += time.perf_counter() - started
     if args.early_stopping_patience is not None and args.early_stopping_patience <= 0:
         raise ValueError('--early-stopping-patience must be positive')
     if args.early_stopping_min_delta < 0:
         raise ValueError('--early-stopping-min-delta must be non-negative')
 
     def validate():
+        nonlocal validation_time_s
+        validation_started = time.perf_counter()
         pipeline.eval()
         with torch.no_grad():
             ps_history_start = len(pipeline.patch_selection_history) if args.multimodal_mode == 'patch-selection' else None
@@ -624,26 +661,28 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                     print(f'[patch-selection] valid selected-patch avg={sum(counts)/len(counts):.2f} '
                           f'min={min(counts)} max={max(counts)}')
             pipeline.train()
+            validation_time_s += time.perf_counter() - validation_started
             return autoregressive_loss, teacher_forcing_loss
 
     def process_validation(valid_loss, teacher_forcing_valid_loss, position_kind, position):
         nonlocal best_loss, best_epoch, best_step, non_improving_validations
         nonlocal best_post_nbs_loss, best_post_nbs_epoch, best_post_nbs_step
         nonlocal last_valid_loss, last_teacher_forcing_valid_loss
-        nonlocal validation_event_count
+        nonlocal validation_event_count, best_elapsed_s
         validation_event_count += 1
         last_valid_loss = float(valid_loss)
         last_teacher_forcing_valid_loss = float(teacher_forcing_valid_loss)
         allocation_started = allocator is not None and allocator.last_step is not None
         improved = valid_loss < best_loss - args.early_stopping_min_delta
         if improved:
+            best_elapsed_s = time.perf_counter() - training_started_perf
             best_loss = valid_loss
             if position_kind == 'step':
                 best_step = position
             else:
                 best_epoch = position
             non_improving_validations = 0
-            save_model(args, pipeline, best_model_path, metadata={
+            timed_checkpoint(save_model, args, pipeline, best_model_path, metadata={
                 'checkpoint_role': 'best_ar',
                 'optimizer_step': int(opt_step),
                 'validation_event': int(validation_event_count),
@@ -684,12 +723,14 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 'first_successful_allocation_step': int(allocator.last_step),
             }
             if saved_checkpoint_steps['best_ar'] == int(opt_step):
-                save_checkpoint_alias(
+                timed_checkpoint(
+                    save_checkpoint_alias,
                     best_post_nbs_model_path, best_model_path, post_metadata
                 )
                 storage_description = f'alias of {best_model_path}'
             else:
-                save_model(
+                timed_checkpoint(
+                    save_model,
                     args, pipeline, best_post_nbs_model_path,
                     metadata=post_metadata,
                 )
@@ -802,7 +843,12 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 # Clip once per effective batch, after NBS has measured the raw
                 # accumulated A/B gradients and immediately before optimizer.step().
                 torch.nn.utils.clip_grad_norm_(gradient_clip_parameters, 1.0)
-                optimizer.step()
+                if allocation_audit_dir is None:
+                    optimizer.step()
+                else:
+                    optimizer_started = time.perf_counter()
+                    optimizer.step()
+                    optimizer_time_s += time.perf_counter() - optimizer_started
                 if allocator is not None:
                     # Allocation/mask enforcement happens after optimizer.step
                     # and before zero_grad, while the next forward sees the
@@ -851,6 +897,25 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                             _append_nash_diagnostics(
                                 nash_diagnostics_path, allocator.last_diagnostics
                             )
+                            if allocation_audit_dir is not None:
+                                audit = allocator.last_allocation_audit or {}
+                                _append_jsonl(
+                                    os.path.join(allocation_audit_dir, 'pre_allocation.jsonl'),
+                                    audit.get('pre_allocation', []),
+                                )
+                                _append_jsonl(
+                                    os.path.join(allocation_audit_dir, 'gain_curves.jsonl'),
+                                    audit.get('gain_curves', []),
+                                )
+                                _append_jsonl(
+                                    os.path.join(allocation_audit_dir, 'decision_trace.jsonl'),
+                                    audit.get('decision_trace', []),
+                                )
+                                timing = audit.get('timing')
+                                _append_jsonl(
+                                    os.path.join(allocation_audit_dir, 'allocation_timing.jsonl'),
+                                    [] if timing is None else [timing],
+                                )
                     else:
                         # During warm-up, between allocation intervals, and
                         # throughout cooldown, preserve the existing topology.
@@ -922,7 +987,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 save_checkpoint_path = os.path.join(checkpoint_path, str(global_step // args.save_checkpoint_per_step)) # save checkpoint
                 if not os.path.exists(save_checkpoint_path):
                     os.makedirs(save_checkpoint_path)
-                save_model(args, pipeline, save_checkpoint_path)
+                timed_checkpoint(save_model, args, pipeline, save_checkpoint_path)
                 print('save checkpoint at', save_checkpoint_path)
 
         if stop_training:
@@ -942,7 +1007,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             save_checkpoint_path = os.path.join(checkpoint_path, f'epoch{epoch}') # save checkpoint
             if not os.path.exists(save_checkpoint_path):
                 os.makedirs(save_checkpoint_path)
-            save_model(args, pipeline, save_checkpoint_path)
+            timed_checkpoint(save_model, args, pipeline, save_checkpoint_path)
             print('save checkpoint at', save_checkpoint_path)
 
     if allocator is not None:
@@ -984,24 +1049,28 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             'stopped_early': bool(stop_training),
         }
         if saved_checkpoint_steps['best_ar'] == int(opt_step):
-            save_checkpoint_alias(
+            timed_checkpoint(
+                save_checkpoint_alias,
                 final_nbs_model_path, best_model_path, final_metadata
             )
             final_storage_description = f'alias of {best_model_path}'
         elif saved_checkpoint_steps['best_post_nbs'] == int(opt_step):
-            save_checkpoint_alias(
+            timed_checkpoint(
+                save_checkpoint_alias,
                 final_nbs_model_path, best_post_nbs_model_path, final_metadata
             )
             final_storage_description = f'alias of {best_post_nbs_model_path}'
         else:
-            save_model(
+            timed_checkpoint(
+                save_model,
                 args, pipeline, final_nbs_model_path, metadata=final_metadata
             )
             final_storage_description = final_nbs_model_path
         print('Final NBS model saved as', final_storage_description)
     elif (args.rank != -1 and args.use_adalora and
           args.adalora_allocator == 'shapley'):
-        save_model(
+        timed_checkpoint(
+            save_model,
             args,
             pipeline,
             final_shapley_model_path,
@@ -1015,6 +1084,50 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             },
         )
         print('Final Shapley AdaLoRA model saved at', final_shapley_model_path)
+
+    if allocation_audit_dir is not None:
+        training_finished_wall = datetime.datetime.now(datetime.timezone.utc)
+        training_elapsed_s = time.perf_counter() - training_started_perf
+        allocation_timing_path = os.path.join(
+            allocation_audit_dir, 'allocation_timing.jsonl'
+        )
+        allocation_timings = []
+        if os.path.exists(allocation_timing_path):
+            with open(allocation_timing_path, encoding='utf-8') as handle:
+                allocation_timings = [json.loads(line) for line in handle if line.strip()]
+        allocation_total_s = sum(
+            float(row.get('allocation_total_s', 0.0)) for row in allocation_timings
+        )
+        audit_materialization_s = sum(
+            float(row.get('audit_materialization_s', 0.0)) for row in allocation_timings
+        )
+        timing_summary = {
+            **_seed_metadata(args),
+            'started_at_utc': training_started_wall.isoformat(),
+            'finished_at_utc': training_finished_wall.isoformat(),
+            'training_wall_time_s': float(training_elapsed_s),
+            'time_to_best_s': best_elapsed_s,
+            'optimizer_step_time_s': float(optimizer_time_s),
+            'validation_time_s': float(validation_time_s),
+            'checkpoint_time_s': float(checkpoint_time_s),
+            'allocation_rounds': len(allocation_timings),
+            'allocation_total_s': float(allocation_total_s),
+            'audit_materialization_s': float(audit_materialization_s),
+            'allocation_share_of_training_pct': (
+                100.0 * allocation_total_s / training_elapsed_s
+                if training_elapsed_s > 0 else None
+            ),
+            'audit_materialization_share_of_training_pct': (
+                100.0 * audit_materialization_s / training_elapsed_s
+                if training_elapsed_s > 0 else None
+            ),
+        }
+        with open(
+            os.path.join(allocation_audit_dir, 'training_timing.json'),
+            'w', encoding='utf-8'
+        ) as handle:
+            json.dump(timing_summary, handle, indent=2, ensure_ascii=False)
+        print('NBS allocation audit timing saved at', allocation_audit_dir)
 
     print('Done adaptation, average training loss =', tot_loss / global_step)
 
@@ -1556,6 +1669,7 @@ def run(args):
                 adalora_relative_lambda=args.adalora_relative_lambda,
                 adalora_adaptive_min_budget=args.adalora_adaptive_min_budget,
                 adalora_adaptive_max_budget=args.adalora_adaptive_max_budget,
+                adalora_allocation_audit=args.nbs_allocation_audit,
                 shapley_permutations=args.shapley_permutations,
                 shapley_truncate_fraction=args.shapley_truncate_fraction,
                 shapley_antithetic=args.shapley_antithetic,
@@ -1914,13 +2028,22 @@ if __name__ == '__main__':
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
+    parser.add_argument(
+        '--nbs-allocation-audit', action='store_true',
+        help=(
+            'Opt in to durable pre-allocation utilities, complete marginal-gain '
+            'curves, unit-level greedy decisions, and timing diagnostics. The '
+            'historical allocator path is unchanged when this flag is omitted.'
+        ),
+    )
     parser.add_argument('--experiment-tag',
                         choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
                                  'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
                                  'nbs_v10', 'nbs_v11', 'nbs_v12',
                                  'nbs_v12_repeat', 'nbs_v13',
                                  'nbs_v14', 'nbs_v15', 'nbs_v16', 'nbs_v17',
-                                 'nbs_v18', 'nbs_v19', 'nbs_v20', 'nbs_v21',
+                                 'nbs_v18', 'nbs_v19', 'nbs_v19_audit',
+                                 'nbs_v20', 'nbs_v21',
                                  'nbs_v22', 'nbs_v23', 'nbs_v24', 'nbs_v25',
                                  'nbs_v27', 'nbs_v28', 'nbs_v29',
                                  'nbs_v19_data2', 'nbs_budget256_seed1',

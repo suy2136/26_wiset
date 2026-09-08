@@ -391,6 +391,60 @@ def check_shadow_reallocation_and_restore():
     )
 
 
+def check_opt_in_allocation_audit():
+    legacy_model = FakeAdaModel(n_layers=3, rank=6)
+    audit_model = FakeAdaModel(n_layers=3, rank=6)
+    audit_model.load_state_dict(legacy_model.state_dict())
+    legacy = NashRankAllocator(
+        legacy_model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=5,
+        rank_budget=7,
+    )
+    legacy_ranks = legacy.allocate(step=1)
+    assert legacy.last_allocation_audit is None
+
+    allocator = NashRankAllocator(
+        audit_model,
+        target_rank=2,
+        min_rank=1,
+        max_rank=5,
+        rank_budget=7,
+        enable_allocation_audit=True,
+    )
+    previous = allocator.active_rank_summary()
+    allocated = allocator.allocate(step=11)
+    assert allocated == legacy_ranks
+    audit = allocator.last_allocation_audit
+    assert audit is not None
+    assert audit["optimizer_step"] == 11
+    assert len(audit["pre_allocation"]) == len(allocator.layers)
+    assert len(audit["gain_curves"]) == len(allocator.layers) * (5 - 1)
+    assert len(audit["decision_trace"]) == 7 - len(allocator.layers)
+    assert all(row["optimizer_step"] == 11 for row in audit["pre_allocation"])
+    assert all(row["optimizer_step"] == 11 for row in audit["gain_curves"])
+    assert all(row["optimizer_step"] == 11 for row in audit["decision_trace"])
+    assert all(
+        row["rank_pre"] == previous[row["layer_name"]]
+        and row["rank_post"] == allocated[row["layer_name"]]
+        and row["rank_delta"] == row["rank_post"] - row["rank_pre"]
+        for row in audit["pre_allocation"]
+    )
+    assert all(
+        row["runner_up_marginal_nash_gain"] is None
+        or row["selection_gap"] >= -1e-12
+        for row in audit["decision_trace"]
+    )
+    required_timing = {
+        "refresh_shadow_s", "rank_choice_s", "audit_materialization_s",
+        "apply_mask_s", "allocation_total_s",
+    }
+    assert required_timing.issubset(audit["timing"])
+    assert all(audit["timing"][key] >= 0 for key in required_timing)
+    print("[PASS] opt-in pre-allocation, decision, gain-curve, and timing audit")
+
+
 def check_optional_real_adalora():
     try:
         from peft import TaskType
@@ -597,6 +651,7 @@ def main():
     check_max_rank_uses_all_physical_slots()
     check_invalid_allocation_is_transactional()
     check_shadow_reallocation_and_restore()
+    check_opt_in_allocation_audit()
     check_optional_real_adalora()
     print("All Nash allocator checks completed.")
 
