@@ -6,6 +6,8 @@ import numpy as np
 import torch
 import pickle
 import re
+import datetime
+import time
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from pprint import pprint
@@ -137,6 +139,9 @@ def save_model(args, model, save_dir, role='checkpoint'):
             ),
             'skip_nonfinite_batches': bool(getattr(
                 args, 'skip_nonfinite_batches', False
+            )),
+            'nbs_allocation_audit': bool(getattr(
+                args, 'nbs_allocation_audit', False
             )),
         }
         if allocator is not None:
@@ -488,6 +493,10 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             )
             if args.lora_method in ('adalora', 'shapley') else None
         ),
+        nbs_allocation_audit_dir=(
+            os.path.join(checkpoint_dir, 'allocation_audit')
+            if args.nbs_allocation_audit else None
+        ),
     )
     if trainable_dtype_summary is not None:
         trainer.record_trainable_dtype_summary(trainable_dtype_summary)
@@ -516,17 +525,25 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
                 ', '.join(removed),
             )
 
+    checkpoint_time_s = 0.0
+
     def save_training_checkpoint(path, role):
-        if rotate_best_latest:
-            atomic_save_adapter_checkpoint(
-                path,
-                lambda temporary: save_model(
-                    args, model, temporary, role=role
-                ),
-                require_nbs_allocator=args.nbs_v19,
-            )
-        else:
-            save_model(args, model, path, role=role)
+        nonlocal checkpoint_time_s
+        started = time.perf_counter()
+        try:
+            if rotate_best_latest:
+                atomic_save_adapter_checkpoint(
+                    path,
+                    lambda temporary: save_model(
+                        args, model, temporary, role=role
+                    ),
+                    require_nbs_allocator=args.nbs_v19,
+                )
+            else:
+                save_model(args, model, path, role=role)
+        finally:
+            if args.nbs_allocation_audit:
+                checkpoint_time_s += time.perf_counter() - started
 
     if args.start_epoch > 0:
         resumed_optimizer_step = args.start_epoch * updates_per_epoch
@@ -551,6 +568,10 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
 
     total_train_losses = []
     early_stopped = False
+    training_started_wall = datetime.datetime.now(datetime.timezone.utc)
+    training_started_perf = time.perf_counter()
+    validation_time_s = 0.0
+    time_to_best_s = None
     for epoch in range(args.start_epoch, args.num_epochs):
         train_logs, train_losses = trainer.train_epoch()
         total_train_losses.extend(train_losses)
@@ -571,8 +592,13 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             print('Checkpoint saved at:', checkpoint_dir_epoch)
 
         if epoch % args.eval_per_epoch == 0:
-            eval_logs = evaluate_on_env(args, env_settings=eval_env_settings, model=model, target_return=target_return, max_ep_num=args.trace_num,
-                                        process_reward_fn=eval_process_reward_fn)
+            validation_started = time.perf_counter()
+            try:
+                eval_logs = evaluate_on_env(args, env_settings=eval_env_settings, model=model, target_return=target_return, max_ep_num=args.trace_num,
+                                            process_reward_fn=eval_process_reward_fn)
+            finally:
+                if args.nbs_allocation_audit:
+                    validation_time_s += time.perf_counter() - validation_started
             if not eval_logs.get('evaluation_valid', True):
                 trainer.record_invalid_validation(
                     epoch=epoch,
@@ -583,12 +609,21 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
                     inference_details=eval_logs.get('nonfinite_details'),
                 )
                 eval_logs['best_return'] = best_eval_return
+                trainer.record_nbs_validation_audit(
+                    epoch,
+                    eval_logs,
+                    time.perf_counter() - validation_started,
+                )
                 print('>' * 10, 'Invalid Evaluation (best model unchanged)')
                 pprint(eval_logs)
                 continue
             episodes_return = eval_logs['episodes_return']
             if best_eval_return < episodes_return:
                 best_eval_return = episodes_return
+                if args.nbs_allocation_audit:
+                    time_to_best_s = (
+                        time.perf_counter() - training_started_perf
+                    )
                 save_training_checkpoint(best_model_dir, role='best')
                 print('Best model saved at:', best_model_dir)
 
@@ -634,6 +669,11 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
             eval_logs['early_stopping/should_stop'] = plateau.should_stop
             eval_logs['learning_rate/current'] = optimizer.param_groups[0]['lr']
             eval_logs['learning_rate/reduced'] = lr_reduced
+            trainer.record_nbs_validation_audit(
+                epoch,
+                eval_logs,
+                time.perf_counter() - validation_started,
+            )
             print('>' * 10, 'Evaluation Information')
             pprint(eval_logs)
             if plateau.should_stop:
@@ -663,6 +703,17 @@ def adapt(args, model, exp_dataset, exp_dataset_info, eval_env_settings,
     else:
         save_model(args, model, final_model_dir, role='final')
         print('Final model saved at:', final_model_dir)
+    if args.nbs_allocation_audit:
+        finished_wall = datetime.datetime.now(datetime.timezone.utc)
+        timing_path = trainer.write_nbs_training_timing(
+            started_at_utc=training_started_wall.isoformat(),
+            finished_at_utc=finished_wall.isoformat(),
+            training_wall_time_s=time.perf_counter() - training_started_perf,
+            time_to_best_s=time_to_best_s,
+            validation_time_s=validation_time_s,
+            checkpoint_time_s=checkpoint_time_s,
+        )
+        print('NBS allocation audit timing saved at:', timing_path)
 
 
 def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, test_process_reward_fn):
@@ -697,6 +748,7 @@ def run(args):
         )
     args.nbs_v19 = args.lora_method == 'nbs'
     comparison_defaults = {
+        'nbs_allocation_audit': False,
         'adalora_rank_budget': None,
         'adalora_allocation_interval': 10,
         'adalora_schedule_epochs': None,
@@ -709,6 +761,8 @@ def run(args):
     for name, value in comparison_defaults.items():
         if not hasattr(args, name):
             setattr(args, name, value)
+    if args.nbs_allocation_audit and not args.nbs_v19:
+        raise ValueError('--nbs-allocation-audit requires NBS LoRA')
     args.seed, args.lora_seed, args.data_seed = resolve_experiment_seeds(
         args.seed,
         getattr(args, 'lora_seed', None),
@@ -965,6 +1019,7 @@ def run(args):
                 eva_state=eva_state,
                 fp16_selective_clamp=args.fp16_selective_clamp,
                 fp16_clamp_threshold=args.fp16_selective_clamp_threshold,
+                nbs_allocation_audit=args.nbs_allocation_audit,
             )
 
     # 4.2 create state encoder
@@ -1165,6 +1220,10 @@ if __name__ == '__main__':
     )
     parser.add_argument('--nbs-v19', action='store_true',
                         help='enable the fixed-budget NBS allocation v19 recipe')
+    parser.add_argument(
+        '--nbs-allocation-audit', action='store_true',
+        help='record pre-allocation gains, decisions, rank changes, and timing',
+    )
     parser.add_argument(
         '--adalora-rank-budget', type=int,
         help='exact final global rank budget for stock/Shapley AdaLoRA',

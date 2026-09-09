@@ -27,6 +27,7 @@ EXPERIMENTS = (
         **COMMON, "name": "NBS_C1536_DATA3_SAFE", "method": "nbs",
         "physical_rank": 32,
         "rank_config": "configs/nbs_v19_rank_config.json",
+        "nbs_allocation_audit": True,
     },
     {
         **COMMON, "name": "UNIFORM_R24_DATA3_SAFE",

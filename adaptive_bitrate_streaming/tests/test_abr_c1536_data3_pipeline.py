@@ -68,6 +68,16 @@ class ABRC1536Data3PipelineTests(unittest.TestCase):
         )
         self.assertIn("--nbs-compact-inference", nbs_test)
 
+        nbs_train = build_training_command(
+            self.args, all_data3.EXPERIMENTS[0]
+        )
+        self.assertIn("--nbs-allocation-audit", nbs_train)
+        for item in all_data3.EXPERIMENTS[1:]:
+            self.assertNotIn(
+                "--nbs-allocation-audit",
+                build_training_command(self.args, item),
+            )
+
         eva_command = build_eva_precompute_command(
             self.args, all_data3.EXPERIMENTS[3]
         )

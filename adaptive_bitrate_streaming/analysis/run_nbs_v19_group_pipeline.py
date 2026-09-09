@@ -168,6 +168,8 @@ def build_training_command(args, experiment):
             "--nbs-max-consecutive-rollbacks",
             str(args.nbs_max_consecutive_rollbacks),
         ]
+        if experiment.get("nbs_allocation_audit", False):
+            command.insert(3, "--nbs-allocation-audit")
     elif method in ("adalora", "shapley"):
         command[3:3] = [
             "--lora-method", method,
@@ -678,6 +680,33 @@ def _run_experiment(
     saved_metadata = metrics_dir / f"{name}_checkpoint_metadata.json"
     shutil.copy2(checkpoint / "checkpoint_metadata.json", saved_metadata)
     auxiliary_artifacts = []
+    if experiment_method(experiment) == "nbs":
+        checkpoint_roots = sorted(
+            checkpoint.parent.glob("*_checkpoint"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for checkpoint_root in checkpoint_roots:
+            for artifact_name in (
+                "nbs_rank_diagnostics.csv",
+                "nbs_numeric_events.jsonl",
+                "train_losses.txt",
+            ):
+                source = checkpoint_root / artifact_name
+                if source.is_file():
+                    destination = metrics_dir / f"{name}_{artifact_name}"
+                    shutil.copy2(source, destination)
+                    auxiliary_artifacts.append(str(destination.resolve()))
+            audit_dir = checkpoint_root / "allocation_audit"
+            if not audit_dir.is_dir():
+                break
+            for source in sorted(audit_dir.iterdir()):
+                if not source.is_file():
+                    continue
+                destination = metrics_dir / f"{name}_{source.name}"
+                shutil.copy2(source, destination)
+                auxiliary_artifacts.append(str(destination.resolve()))
+            break
     if experiment_method(experiment) in ("adalora", "shapley"):
         diagnostic_name = f"{experiment_method(experiment)}_rank_diagnostics.jsonl"
         diagnostic_source = checkpoint.parent / diagnostic_name

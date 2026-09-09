@@ -332,6 +332,7 @@ def peft_model(
     eva_state=None,
     fp16_selective_clamp=False,
     fp16_clamp_threshold=60000.0,
+    nbs_allocation_audit=False,
 ):
     if lora_method is None:
         lora_method = 'nbs' if nbs_v19 else 'uniform'
@@ -460,6 +461,7 @@ def peft_model(
             allocation_interval=nbs_allocation_interval,
             shadow_update_policy='legacy',
             budget_mode='fixed',
+            enable_allocation_audit=nbs_allocation_audit,
         )
         model.nbs_variant = 'nbs_v19'
         print(

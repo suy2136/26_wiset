@@ -62,7 +62,8 @@ class Trainer:
                  batch_size=1, grad_accum_steps=1, lr_scheduler=None,
                  nbs_diagnostics_path=None, nbs_numeric_log_path=None,
                  rollback_lr_callback=None,
-                 peft_allocator_diagnostics_path=None):
+                 peft_allocator_diagnostics_path=None,
+                 nbs_allocation_audit_dir=None):
         self.args = args
         self.model = model
         self.optimizer = optimizer
@@ -99,6 +100,9 @@ class Trainer:
         self.peft_allocator_diagnostics_path = (
             peft_allocator_diagnostics_path
         )
+        self.nbs_allocation_audit_dir = nbs_allocation_audit_dir
+        self.optimizer_step_time_s = 0.0
+        self.nbs_validation_event = 0
         self.skipped_nonfinite_updates = 0
         self.consecutive_nonfinite = 0
         self.invalid_nonfinite_validations = 0
@@ -312,6 +316,12 @@ class Trainer:
                 copy.deepcopy(self.nbs_allocator.last_diagnostics)
                 if self.nbs_allocator is not None else None
             ),
+            'allocator_last_allocation_audit': (
+                copy.deepcopy(getattr(
+                    self.nbs_allocator, 'last_allocation_audit', None
+                ))
+                if self.nbs_allocator is not None else None
+            ),
             'optimizer_step': self.optimizer_step,
             'optimizer_state_dtype_verified': (
                 self.optimizer_state_dtype_verified
@@ -324,6 +334,7 @@ class Trainer:
             'rng_state': self._snapshot_rng_state(),
             'pending_rank_diagnostics': None,
             'pending_rank_event': None,
+            'pending_allocation_audit': None,
         }
 
     def _restore_optimizer_transaction(self, snapshot):
@@ -358,6 +369,9 @@ class Trainer:
             self.nbs_allocator.load_state_dict(snapshot['allocator_state'])
             self.nbs_allocator.last_diagnostics = copy.deepcopy(
                 snapshot['allocator_last_diagnostics']
+            )
+            self.nbs_allocator.last_allocation_audit = copy.deepcopy(
+                snapshot['allocator_last_allocation_audit']
             )
         self.optimizer_step = snapshot['optimizer_step']
         self.optimizer_state_dtype_verified = snapshot[
@@ -474,6 +488,9 @@ class Trainer:
         rank_event = snapshot.get('pending_rank_event')
         if rank_event:
             self._record_numeric_event('rank_allocation', **rank_event)
+        allocation_audit = snapshot.get('pending_allocation_audit')
+        if allocation_audit:
+            self._write_nbs_allocation_audit(allocation_audit)
         self._record_numeric_event(
             'optimizer_update_committed',
             validating_batch_step=validating_batch_step,
@@ -821,6 +838,116 @@ class Trainer:
                 writer.writeheader()
             writer.writerows(rows)
 
+    @staticmethod
+    def _append_jsonl(path, rows):
+        if not path or not rows:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + '\n')
+
+    def _write_nbs_allocation_audit(self, audit):
+        if not self.nbs_allocation_audit_dir or not audit:
+            return
+        outputs = {
+            'pre_allocation.jsonl': audit.get('pre_allocation', []),
+            'gain_curves.jsonl': audit.get('gain_curves', []),
+            'decision_trace.jsonl': audit.get('decision_trace', []),
+            'allocation_timing.jsonl': (
+                [] if audit.get('timing') is None else [audit['timing']]
+            ),
+        }
+        for filename, rows in outputs.items():
+            self._append_jsonl(
+                os.path.join(self.nbs_allocation_audit_dir, filename), rows
+            )
+
+    def write_nbs_training_timing(
+        self, *, started_at_utc, finished_at_utc, training_wall_time_s,
+        time_to_best_s, validation_time_s, checkpoint_time_s,
+    ):
+        if not self.nbs_allocation_audit_dir:
+            return None
+        timing_path = os.path.join(
+            self.nbs_allocation_audit_dir, 'allocation_timing.jsonl'
+        )
+        allocation_timings = []
+        if os.path.isfile(timing_path):
+            with open(timing_path, encoding='utf-8') as stream:
+                allocation_timings = [
+                    json.loads(line) for line in stream if line.strip()
+                ]
+        allocation_total_s = sum(
+            float(row.get('allocation_total_s', 0.0))
+            for row in allocation_timings
+        )
+        audit_materialization_s = sum(
+            float(row.get('audit_materialization_s', 0.0))
+            for row in allocation_timings
+        )
+        elapsed = float(training_wall_time_s)
+        summary = {
+            'seed': int(self.args.seed),
+            'lora_seed': int(self.args.lora_seed),
+            'data_seed': int(self.args.data_seed),
+            'started_at_utc': started_at_utc,
+            'finished_at_utc': finished_at_utc,
+            'training_wall_time_s': elapsed,
+            'time_to_best_s': time_to_best_s,
+            'optimizer_step_time_s': float(self.optimizer_step_time_s),
+            'validation_time_s': float(validation_time_s),
+            'checkpoint_time_s': float(checkpoint_time_s),
+            'allocation_rounds': len(allocation_timings),
+            'allocation_total_s': allocation_total_s,
+            'audit_materialization_s': audit_materialization_s,
+            'allocation_share_of_training_pct': (
+                100.0 * allocation_total_s / elapsed if elapsed > 0 else None
+            ),
+            'audit_materialization_share_of_training_pct': (
+                100.0 * audit_materialization_s / elapsed
+                if elapsed > 0 else None
+            ),
+        }
+        os.makedirs(self.nbs_allocation_audit_dir, exist_ok=True)
+        output = os.path.join(
+            self.nbs_allocation_audit_dir, 'training_timing.json'
+        )
+        with open(output, 'w', encoding='utf-8') as stream:
+            json.dump(summary, stream, indent=2, ensure_ascii=False)
+        return output
+
+    def record_nbs_validation_audit(self, epoch, eval_logs, elapsed_s):
+        if not self.nbs_allocation_audit_dir or self.nbs_allocator is None:
+            return
+        self.nbs_validation_event += 1
+        ranks = self.nbs_allocator.active_rank_summary()
+        payload = {
+            'validation_event': self.nbs_validation_event,
+            'epoch': int(epoch),
+            'optimizer_step': int(self.optimizer_step),
+            'evaluation_valid': bool(
+                eval_logs.get('evaluation_valid', True)
+            ),
+            'episodes_return': (
+                float(eval_logs['episodes_return'])
+                if eval_logs.get('episodes_return') is not None else None
+            ),
+            'best_return': (
+                float(eval_logs['best_return'])
+                if eval_logs.get('best_return') is not None else None
+            ),
+            'validation_elapsed_s': float(elapsed_s),
+            'rank_budget': int(sum(ranks.values())),
+            'active_ranks': {name: int(rank) for name, rank in ranks.items()},
+        }
+        self._append_jsonl(
+            os.path.join(
+                self.nbs_allocation_audit_dir, 'validation_events.jsonl'
+            ),
+            [payload],
+        )
+
     def snapshot_nbs(self, event='snapshot'):
         if self.nbs_allocator is None:
             return
@@ -1151,11 +1278,19 @@ class Trainer:
                     (time.perf_counter() - transaction_started) * 1000.0
                     if transaction is not None else 0.0
                 )
+                optimizer_started = (
+                    time.perf_counter()
+                    if self.nbs_allocation_audit_dir else None
+                )
                 if self.grad_scaler.is_enabled():
                     self.grad_scaler.step(self.optimizer)
                     self.grad_scaler.update()
                 else:
                     self.optimizer.step()
+                if optimizer_started is not None:
+                    self.optimizer_step_time_s += (
+                        time.perf_counter() - optimizer_started
+                    )
                 if transaction is not None:
                     parameter_issues = self._parameter_issues()
                     optimizer_state_issues = self._optimizer_state_issues(
@@ -1249,6 +1384,9 @@ class Trainer:
                             'optimizer_moment_tensors_reset': reset_tensors,
                             'gradient_norm': float(gradient_norm.item()),
                         }
+                        transaction['pending_allocation_audit'] = copy.deepcopy(
+                            self.nbs_allocator.last_allocation_audit
+                        )
                     else:
                         self.nbs_allocator.enforce_masks()
                     allocator_issues = self._allocator_numeric_issues()
