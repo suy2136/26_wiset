@@ -517,6 +517,10 @@ def result_rows(state, experiments):
             "lora_seed": experiment_lora_seed(experiment),
             "data_seed": experiment_data_seed(experiment),
             "checkpoint_dir": run["checkpoint_dir"],
+            "training_wall_time_s": run.get("training_wall_time_s"),
+            "eva_precompute_wall_time_s": run.get(
+                "eva_precompute_wall_time_s"
+            ),
             "checkpoint_metadata_path": run.get("checkpoint_metadata_path"),
             "allocator_artifacts": ";".join(
                 run.get("allocator_artifacts", [])
@@ -549,6 +553,7 @@ def write_results(path, rows, run_signature):
             "experiment", "rank_budget", "mean_active_rank",
             "physical_rank", "learning_rate", "lr_schedule", "warmup_steps",
             "seed", "lora_seed", "data_seed",
+            "training_wall_time_s", "eva_precompute_wall_time_s",
             "mean_reward", "mean_reward_delta_vs_first",
             "inference_latency_mean_ms", "latency_reduction_vs_first",
             "nbs_compact_inference", "nbs_compaction_logits_equivalent",
@@ -628,7 +633,11 @@ def _run_experiment(
             command = build_eva_precompute_command(args, experiment)
             print(f"[{name}:eva] {shlex.join(command)}", flush=True)
             if not args.dry_run:
+                precompute_started = time.perf_counter()
                 subprocess.run(command, cwd=ABR_ROOT, check=True)
+                run["eva_precompute_wall_time_s"] = (
+                    time.perf_counter() - precompute_started
+                )
         elif not args.dry_run:
             print(f"[{name}:eva] state already available: {state_path}", flush=True)
 
@@ -640,11 +649,14 @@ def _run_experiment(
             checkpoint = Path(f"/best_checkpoint/{name}")
         else:
             started_at = time.time() - 1.0
+            training_started = time.perf_counter()
             subprocess.run(command, cwd=ABR_ROOT, check=True)
+            training_wall_time_s = time.perf_counter() - training_started
             checkpoint = discover_best_checkpoint(experiment, started_at)
             run.update({
                 "status": "trained",
                 "checkpoint_dir": str(checkpoint.resolve()),
+                "training_wall_time_s": training_wall_time_s,
                 "trained_at": time.time(),
             })
             atomic_json(args.state_file, state)
