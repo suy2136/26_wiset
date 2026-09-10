@@ -236,6 +236,71 @@ class Pipeline(nn.Module):
         outputs = self.plm(inputs_embeds=x.to(plm_dtype), attention_mask = torch.ones(x.shape[0], x.shape[1], dtype=torch.long, device=self.device), teacher_forcing=True)
         return outputs.logits.float()
 
+    def differentiable_patch_selection_loss(
+            self, history, future, video_user_position, temperature=1.0):
+        """Compute VP loss through hard top-k tokens with straight-through gates."""
+        if self.multimodal_mode != 'patch-selection':
+            raise ValueError('differentiable selector loss requires patch-selection mode')
+        if self.patch_top_k is None or self.patch_top_k <= 0:
+            raise ValueError('differentiable selector loss requires positive patch_top_k')
+        if history.shape[0] != 1:
+            raise ValueError(
+                'NBS-prediction selector fine-tuning currently requires batch size 1'
+            )
+        if temperature <= 0:
+            raise ValueError('selector straight-through temperature must be positive')
+
+        logits = self.patch_selection_module(history)
+        top_k = min(int(self.patch_top_k), logits.shape[1])
+        indices_tensor = torch.topk(logits.detach(), top_k, dim=1).indices
+        indices = indices_tensor[0].tolist()
+        video_index, image_index = self._resolve_frame_index(video_user_position)
+        patches = self._load_frame_patches(
+            video_index, image_index, indices=indices
+        )
+        features = vit_features_for_patches(
+            patches, range(len(indices)), self._vit_feature_fn,
+            device=self.device,
+        )
+
+        # The forward gate is exactly one, preserving the hard top-k inference
+        # path. Its backward value comes from every selector logit through the
+        # normalized soft budget, allowing later top-k membership to change.
+        soft_budget = torch.softmax(logits / temperature, dim=1) * float(top_k)
+        selected_soft = torch.gather(soft_budget, 1, indices_tensor)
+        straight_through_gate = (
+            torch.ones_like(selected_soft)
+            + selected_soft - selected_soft.detach()
+        )
+        mapped_tensor = self.embed_multimodal(features)
+        mapped_tensor = (
+            mapped_tensor * straight_through_gate[0].unsqueeze(-1)
+        ).unsqueeze(0)
+
+        sequence = torch.cat((history, future), dim=1)
+        embeddings = []
+        for index in range(sequence.shape[1]):
+            embeddings.append(
+                self.embed_vp(
+                    self.conv1d(sequence[:, index, :]).view(1, 256)
+                ).unsqueeze(1)
+            )
+        trajectory_tokens = torch.cat(embeddings, dim=1)
+        inputs = self.embed_ln(
+            torch.cat([mapped_tensor, trajectory_tokens], dim=1)
+        )
+        plm_dtype = self._plm_compute_dtype()
+        outputs = self.plm(
+            inputs_embeds=inputs.to(plm_dtype),
+            attention_mask=torch.ones(
+                inputs.shape[0], inputs.shape[1], dtype=torch.long,
+                device=self.device,
+            ),
+            teacher_forcing=True,
+        )
+        prediction = outputs.logits.float()
+        return self.loss_fct(prediction, future.to(prediction.device)), logits, indices
+
     def _plm_compute_dtype(self):
         """Return the dtype expected by the frozen base projection weights.
 

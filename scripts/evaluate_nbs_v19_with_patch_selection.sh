@@ -56,6 +56,8 @@ if [[ -z "$SOURCE_CHECKPOINT" ]]; then
 fi
 PATCH_SELECTION_WEIGHTS="${PATCH_SELECTION_WEIGHTS:-patch_selection_delivery/model/best_patch_selection.pth}"
 PATCH_THRESHOLD="${PATCH_THRESHOLD:-0.5}"
+PATCH_TOP_K="${PATCH_TOP_K:-}"
+MULTIMODAL_PROJECTOR_CHECKPOINT="${MULTIMODAL_PROJECTOR_CHECKPOINT:-}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 LIMIT_TEST_SAMPLES="${LIMIT_TEST_SAMPLES:-}"
@@ -70,19 +72,38 @@ for required in \
     exit 3
   fi
 done
+if [[ -n "$MULTIMODAL_PROJECTOR_CHECKPOINT" ]]; then
+  if [[ -d "$MULTIMODAL_PROJECTOR_CHECKPOINT" ]]; then
+    PROJECTOR_FILE="$MULTIMODAL_PROJECTOR_CHECKPOINT/modules_except_plm.bin"
+  else
+    PROJECTOR_FILE="$MULTIMODAL_PROJECTOR_CHECKPOINT"
+  fi
+  if [[ ! -f "$PROJECTOR_FILE" ]]; then
+    echo "Multimodal projector checkpoint not found: $PROJECTOR_FILE" >&2
+    exit 3
+  fi
+fi
 if [[ ! -d viewport_prediction/data/images/Jin2022_images ]]; then
   echo "Raw Jin2022 frames not found: viewport_prediction/data/images/Jin2022_images" >&2
   exit 3
 fi
 
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
-RUN_DIR="$ARTIFACT_ROOT/nbs_v19_patch_selection_probe/$RUN_ID"
+RUN_DIR="${PATCH_SELECTOR_RUN_DIR:-$ARTIFACT_ROOT/nbs_v19_patch_selection_probe/$RUN_ID}"
 mkdir -p "$RUN_DIR"
 printf '%s\n' "$RUN_DIR" > "$ARTIFACT_ROOT/nbs_v19_patch_selection_probe_latest.txt"
 
 LIMIT_ARGS=()
 if [[ -n "$LIMIT_TEST_SAMPLES" ]]; then
   LIMIT_ARGS+=(--limit-test-samples "$LIMIT_TEST_SAMPLES")
+fi
+SELECTION_ARGS=(--patch-threshold "$PATCH_THRESHOLD")
+if [[ -n "$PATCH_TOP_K" ]]; then
+  SELECTION_ARGS=(--patch-top-k "$PATCH_TOP_K")
+fi
+PROJECTOR_ARGS=()
+if [[ -n "$MULTIMODAL_PROJECTOR_CHECKPOINT" ]]; then
+  PROJECTOR_ARGS+=(--multimodal-projector-checkpoint "$MULTIMODAL_PROJECTOR_CHECKPOINT")
 fi
 
 COMMAND=(
@@ -108,7 +129,8 @@ COMMAND=(
   --nbs-inference-mode original
   --multimodal-mode patch-selection
   --patch-selection-weights "$PATCH_SELECTION_WEIGHTS"
-  --patch-threshold "$PATCH_THRESHOLD"
+  "${SELECTION_ARGS[@]}"
+  "${PROJECTOR_ARGS[@]}"
   --epochs "${epochs:-4}"
   --bs 1
   --grad-accum-steps 32
@@ -132,6 +154,8 @@ source_checkpoint=$SOURCE_CHECKPOINT
 source_checkpoint_multimodal_mode=${multimodal_mode:-unknown}
 patch_selection_weights=$PATCH_SELECTION_WEIGHTS
 patch_threshold=$PATCH_THRESHOLD
+patch_top_k=$PATCH_TOP_K
+multimodal_projector_checkpoint=$MULTIMODAL_PROJECTOR_CHECKPOINT
 nbs_inference_mode=original
 note=NBS_v19_was_trained_without_patch_selection;_this_is_an_inference-only_probe
 EOF

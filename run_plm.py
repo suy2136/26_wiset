@@ -2,6 +2,7 @@ import sys
 import argparse
 import csv
 import copy
+import hashlib
 import json
 import math
 import os
@@ -19,9 +20,11 @@ from utils.console_logger import ConsoleLogger
 from utils.plms_utils import load_plm
 from utils.normalize import normalize_data, denormalize_data
 from utils.result_notebook import ResultNotebook
+from utils.patch_labeling import viewport_sequence_to_patch_labels
 from torch.utils.data import DataLoader
 from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
+from models.kinematic_patch_selector import KinematicPatchSelector
 from models.selectable_pipeline import LlamaSelectablePipeline
 from models.selectors import RecentKSelector
 from models.speculative_pipeline import LlamaSpeculativeBlockVerifyPipeline
@@ -388,6 +391,415 @@ def load_model(args, model, model_dir):
     return model
 
 
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_multimodal_projector(model, checkpoint_path):
+    """Load only embed_multimodal, leaving every other checkpoint tensor intact."""
+    source_path = checkpoint_path
+    if os.path.isdir(source_path):
+        source_path = os.path.join(source_path, 'modules_except_plm.bin')
+    if not os.path.isfile(source_path):
+        raise FileNotFoundError(
+            f'multimodal projector checkpoint not found: {source_path}'
+        )
+
+    source_state = torch.load(source_path, map_location='cpu')
+    if not isinstance(source_state, dict):
+        raise TypeError(
+            f'expected a state_dict in {source_path}, got {type(source_state).__name__}'
+        )
+    aliases = {
+        'weight': ('1.weight', 'embed_multimodal.weight', 'weight'),
+        'bias': ('1.bias', 'embed_multimodal.bias', 'bias'),
+    }
+    expected_state = model.embed_multimodal.state_dict()
+    projector_state = {}
+    source_keys = {}
+    for target_key, candidates in aliases.items():
+        source_key = next((key for key in candidates if key in source_state), None)
+        if source_key is None:
+            raise KeyError(
+                f'{source_path} has no recognized embed_multimodal {target_key} key; '
+                f'tried {candidates}'
+            )
+        value = source_state[source_key]
+        if tuple(value.shape) != tuple(expected_state[target_key].shape):
+            raise ValueError(
+                f'embed_multimodal {target_key} shape mismatch: source '
+                f'{tuple(value.shape)} != model {tuple(expected_state[target_key].shape)}'
+            )
+        projector_state[target_key] = value
+        source_keys[target_key] = source_key
+
+    incompatible = model.embed_multimodal.load_state_dict(
+        projector_state, strict=True
+    )
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(f'projector load was not exact: {incompatible}')
+    return {
+        'source_path': os.path.abspath(source_path),
+        'source_sha256': _sha256_file(source_path),
+        'source_keys': source_keys,
+        'weight_shape': list(projector_state['weight'].shape),
+        'bias_shape': list(projector_state['bias'].shape),
+    }
+
+
+def freeze_pipeline_for_selector_training(pipeline):
+    """Freeze every component except PatchSelectionModule and audit the result."""
+    selector = getattr(pipeline, 'patch_selection_module', None)
+    if selector is None:
+        raise ValueError('selector-only training requires PatchSelectionModule')
+    for parameter in pipeline.parameters():
+        parameter.requires_grad_(False)
+    for parameter in selector.parameters():
+        parameter.requires_grad_(True)
+
+    trainable = [
+        name for name, parameter in pipeline.named_parameters()
+        if parameter.requires_grad
+    ]
+    unexpected = [
+        name for name in trainable
+        if not name.startswith('patch_selection_module.')
+    ]
+    if unexpected or not trainable:
+        raise RuntimeError(
+            'selector-only freeze audit failed: trainable={} unexpected={}'.format(
+                trainable, unexpected
+            )
+        )
+    return trainable
+
+
+def _patch_selector_labels(future, grid_rows, grid_cols):
+    labels = [
+        viewport_sequence_to_patch_labels(
+            sample.detach().cpu().numpy(), grid_rows, grid_cols,
+            include_neighbors=True,
+        )
+        for sample in future
+    ]
+    return torch.from_numpy(np.stack(labels, axis=0)).float()
+
+
+def _rotation_aware_mae_degrees(prediction, target):
+    """Mean absolute viewport error in degrees with roll/yaw wrapping."""
+    error = prediction.float() - target.float()
+    roll = torch.remainder(error[..., 0] + 1.0, 2.0) - 1.0
+    pitch = error[..., 1]
+    yaw = torch.remainder(error[..., 2] + 1.0, 2.0) - 1.0
+    degrees = torch.stack(
+        (roll.abs() * 180.0, pitch.abs() * 90.0, yaw.abs() * 180.0),
+        dim=-1,
+    )
+    return degrees.mean()
+
+
+def train_patch_selector_only(args, pipeline, dataloader_train, dataloader_valid,
+                              projector_report):
+    """Train only the selector with BCE pretraining or frozen-NBS task loss."""
+    if args.multimodal_mode != 'patch-selection':
+        raise ValueError(
+            '--train-patch-selector-only requires --multimodal-mode patch-selection'
+        )
+    if not args.use_adalora or args.adalora_allocator != 'nbs':
+        raise ValueError(
+            '--train-patch-selector-only requires the frozen NBS model path'
+        )
+    if not args.patch_selector_output_dir:
+        raise ValueError(
+            '--train-patch-selector-only requires --patch-selector-output-dir'
+        )
+    if projector_report is None:
+        raise ValueError(
+            '--train-patch-selector-only requires --multimodal-projector-checkpoint'
+        )
+    if args.patch_top_k is None or args.patch_top_k <= 0:
+        raise ValueError(
+            '--train-patch-selector-only requires a positive --patch-top-k budget'
+        )
+
+    output_dir = os.path.abspath(args.patch_selector_output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    selector = pipeline.patch_selection_module
+    trainable_names = freeze_pipeline_for_selector_training(pipeline)
+    pipeline.eval()
+    selector.train()
+    optimizer = AdamW(
+        [parameter for parameter in selector.parameters() if parameter.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    optimizer_ids = {
+        id(parameter)
+        for group in optimizer.param_groups for parameter in group['params']
+    }
+    selector_ids = {id(parameter) for parameter in selector.parameters()}
+    if optimizer_ids != selector_ids:
+        raise RuntimeError('selector optimizer contains missing or non-selector parameters')
+
+    source_files = []
+    resume_dir = _resolve_checkpoint_alias(args.resume_path)
+    for filename in ('adapter_model.bin', 'modules_except_plm.bin',
+                     'nash_rank_allocator.pt'):
+        path = os.path.join(resume_dir, filename)
+        if os.path.isfile(path):
+            source_files.append({
+                'path': os.path.abspath(path),
+                'size_bytes': os.path.getsize(path),
+                'sha256_before': _sha256_file(path),
+            })
+    for path in (args.patch_selection_weights,
+                 projector_report.get('source_path')):
+        if path and os.path.isfile(path):
+            absolute_path = os.path.abspath(path)
+            if not any(record['path'] == absolute_path for record in source_files):
+                source_files.append({
+                    'path': absolute_path,
+                    'size_bytes': os.path.getsize(absolute_path),
+                    'sha256_before': _sha256_file(absolute_path),
+                })
+
+    history_path = os.path.join(output_dir, 'selector_training_history.csv')
+    best_path = os.path.join(output_dir, 'best_patch_selector.pth')
+    latest_path = os.path.join(output_dir, 'latest_patch_selector.pth')
+    best_valid_score = float('inf')
+    history_rows = []
+
+    def run_bce_epoch(loader, training):
+        selector.train(training)
+        total_loss = total_bce = total_budget = 0.0
+        total_samples = 0
+        for history, future, _ in loader:
+            history = normalize_data(
+                history.to(args.device), args.train_dataset
+            )
+            labels = _patch_selector_labels(
+                future, selector.grid_rows, selector.grid_cols
+            ).to(args.device)
+            if training:
+                optimizer.zero_grad(set_to_none=True)
+            with torch.set_grad_enabled(training):
+                logits = selector(history)
+                bce = selector.compute_loss(logits, labels)
+                expected_count = torch.sigmoid(logits).sum(dim=1)
+                budget_loss = (
+                    (expected_count - float(args.patch_top_k)) /
+                    float(selector.num_patches)
+                ).pow(2).mean()
+                loss = bce + args.patch_selector_budget_penalty * budget_loss
+                if training:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(selector.parameters(), 1.0)
+                    optimizer.step()
+            batch_size = history.shape[0]
+            total_samples += batch_size
+            total_loss += float(loss.detach()) * batch_size
+            total_bce += float(bce.detach()) * batch_size
+            total_budget += float(budget_loss.detach()) * batch_size
+        if total_samples == 0:
+            raise ValueError('selector-only training received an empty dataloader')
+        return {
+            'loss': total_loss / total_samples,
+            'bce': total_bce / total_samples,
+            'budget_loss': total_budget / total_samples,
+        }
+
+    def run_prediction_epoch(loader):
+        selector.train()
+        total_loss = total_task = total_bce = total_budget = 0.0
+        total_samples = 0
+        optimizer.zero_grad(set_to_none=True)
+        for batch_index, (history, future, video_user_info) in enumerate(loader):
+            history = normalize_data(
+                history.to(args.device), args.train_dataset
+            )
+            normalized_future = normalize_data(
+                future.to(args.device), args.train_dataset
+            )
+            labels = _patch_selector_labels(
+                future, selector.grid_rows, selector.grid_cols
+            ).to(args.device)
+            task_loss, logits, _ = pipeline.differentiable_patch_selection_loss(
+                history, normalized_future, video_user_info,
+                temperature=args.patch_selector_st_temperature,
+            )
+            bce = selector.compute_loss(logits, labels)
+            expected_count = torch.sigmoid(logits).sum(dim=1)
+            budget_loss = (
+                (expected_count - float(args.patch_top_k)) /
+                float(selector.num_patches)
+            ).pow(2).mean()
+            loss = (
+                task_loss
+                + args.patch_selector_bce_weight * bce
+                + args.patch_selector_budget_penalty * budget_loss
+            )
+            (loss / args.grad_accum_steps).backward()
+            should_step = (
+                (batch_index + 1) % args.grad_accum_steps == 0
+                or batch_index + 1 == len(loader)
+            )
+            if should_step:
+                torch.nn.utils.clip_grad_norm_(selector.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            total_samples += 1
+            total_loss += float(loss.detach())
+            total_task += float(task_loss.detach())
+            total_bce += float(bce.detach())
+            total_budget += float(budget_loss.detach())
+        if total_samples == 0:
+            raise ValueError('selector NBS-prediction training received an empty dataloader')
+        return {
+            'loss': total_loss / total_samples,
+            'task_loss': total_task / total_samples,
+            'bce': total_bce / total_samples,
+            'budget_loss': total_budget / total_samples,
+        }
+
+    def validate_hard_top_k(loader):
+        pipeline.eval()
+        total_mse = total_mae = 0.0
+        total_samples = 0
+        limit = args.patch_selector_validation_samples
+        try:
+            with torch.no_grad():
+                for history, future, video_user_info in loader:
+                    history = normalize_data(
+                        history.to(args.device), args.train_dataset
+                    )
+                    normalized_future = normalize_data(
+                        future.to(args.device), args.train_dataset
+                    )
+                    prediction = pipeline.auto_regressive(
+                        history, normalized_future, video_user_info
+                    )
+                    total_mse += float(
+                        pipeline.loss_fct(prediction, normalized_future)
+                    )
+                    total_mae += float(
+                        _rotation_aware_mae_degrees(
+                            prediction, normalized_future
+                        )
+                    )
+                    total_samples += 1
+                    if limit and total_samples >= limit:
+                        break
+        finally:
+            pipeline.eval()
+            selector.train()
+        if total_samples == 0:
+            raise ValueError('hard top-k validation received an empty dataloader')
+        return {
+            'hard_valid_mse': total_mse / total_samples,
+            'hard_valid_mae_deg': total_mae / total_samples,
+            'hard_valid_samples': total_samples,
+        }
+
+    started_at = datetime.datetime.now(datetime.timezone.utc)
+    for epoch in range(1, args.epochs + 1):
+        if args.selector_objective == 'bce':
+            train_metrics = run_bce_epoch(dataloader_train, training=True)
+            with torch.no_grad():
+                valid_metrics = run_bce_epoch(dataloader_valid, training=False)
+            row = {
+                'epoch': epoch,
+                'train_loss': train_metrics['loss'],
+                'train_task_loss': '',
+                'train_bce': train_metrics['bce'],
+                'train_budget_loss': train_metrics['budget_loss'],
+                'valid_loss': valid_metrics['loss'],
+                'valid_bce': valid_metrics['bce'],
+                'valid_budget_loss': valid_metrics['budget_loss'],
+                'hard_valid_mse': '',
+                'hard_valid_mae_deg': '',
+                'hard_valid_samples': '',
+            }
+            validation_score = valid_metrics['loss']
+        else:
+            train_metrics = run_prediction_epoch(dataloader_train)
+            valid_metrics = validate_hard_top_k(dataloader_valid)
+            row = {
+                'epoch': epoch,
+                'train_loss': train_metrics['loss'],
+                'train_task_loss': train_metrics['task_loss'],
+                'train_bce': train_metrics['bce'],
+                'train_budget_loss': train_metrics['budget_loss'],
+                'valid_loss': valid_metrics['hard_valid_mse'],
+                'valid_bce': '',
+                'valid_budget_loss': '',
+                **valid_metrics,
+            }
+            validation_score = valid_metrics['hard_valid_mae_deg']
+        history_rows.append(row)
+        torch.save(selector.state_dict(), latest_path)
+        if validation_score < best_valid_score:
+            best_valid_score = validation_score
+            torch.save(selector.state_dict(), best_path)
+        print(
+            '[selector-only:{}] epoch {}/{} train={:.6f} valid-score={:.6f} best={:.6f}'.format(
+                args.selector_objective, epoch, args.epochs,
+                train_metrics['loss'], validation_score, best_valid_score,
+            ),
+            flush=True,
+        )
+
+    with open(history_path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(history_rows[0]))
+        writer.writeheader()
+        writer.writerows(history_rows)
+
+    for record in source_files:
+        record['sha256_after'] = _sha256_file(record['path'])
+        record['unchanged'] = record['sha256_before'] == record['sha256_after']
+    if not all(record['unchanged'] for record in source_files):
+        raise RuntimeError('a read-only source checkpoint changed during selector training')
+
+    manifest = {
+        'experiment': 'frozen_nbs_v19_learned_patch_selector',
+        'selector_objective': args.selector_objective,
+        'started_at_utc': started_at.isoformat(),
+        'finished_at_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'nbs_checkpoint': os.path.abspath(resume_dir),
+        'multimodal_projector': projector_report,
+        'vit': 'torchvision.models.vit_b_16 ImageNet pretrained; frozen',
+        'trainable_parameter_names': trainable_names,
+        'trainable_parameter_count': sum(
+            parameter.numel() for parameter in selector.parameters()
+        ),
+        'frozen_parameter_policy': 'all pipeline parameters except patch_selection_module',
+        'patch_top_k': args.patch_top_k,
+        'budget_penalty': args.patch_selector_budget_penalty,
+        'bce_weight': args.patch_selector_bce_weight,
+        'straight_through_temperature': args.patch_selector_st_temperature,
+        'checkpoint_selection_metric': (
+            'validation_bce_budget_loss' if args.selector_objective == 'bce'
+            else 'hard_top_k_rotation_aware_mae_deg'
+        ),
+        'best_valid_score': best_valid_score,
+        'source_checkpoint_integrity': source_files,
+        'outputs': {
+            'best_selector': best_path,
+            'latest_selector': latest_path,
+            'history': history_path,
+        },
+        **_seed_metadata(args),
+    }
+    _write_json_atomic(
+        os.path.join(output_dir, 'selector_training_manifest.json'), manifest
+    )
+    print('Selector-only training complete:', output_dir)
+    return manifest
+
+
 def load_compact_nbs_model(model, model_dir):
     """Load an inference-only compact NBS derivative into a fresh pipeline."""
     model_dir = _resolve_checkpoint_alias(model_dir)
@@ -438,6 +850,28 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     if args.resume:
         pipeline = load_model(args, pipeline, args.resume_path)
         print('Resume weights for training from:', args.resume_path)
+
+    projector_report = None
+    if args.multimodal_projector_checkpoint:
+        projector_report = load_multimodal_projector(
+            pipeline, args.multimodal_projector_checkpoint
+        )
+        print(
+            'Loaded embed_multimodal only from:',
+            projector_report['source_path'],
+        )
+
+    if args.train_patch_selector_only:
+        if not args.resume or not args.resume_path:
+            raise ValueError(
+                '--train-patch-selector-only requires --resume --resume-path '
+                'for the immutable NBS-v19 source checkpoint'
+            )
+        train_patch_selector_only(
+            args, pipeline, dataloader_train, dataloader_valid,
+            projector_report,
+        )
+        return
 
     allocator = None
     nash_diagnostics_path = None
@@ -1198,6 +1632,15 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
     else:
         print('\033[33mWarning:\033[0m', model_path, 'not found, skip loading weights.')
 
+    if args.multimodal_projector_checkpoint:
+        projector_report = load_multimodal_projector(
+            pipeline, args.multimodal_projector_checkpoint
+        )
+        print(
+            'Loaded embed_multimodal only for evaluation from:',
+            projector_report['source_path'],
+        )
+
     if args.nbs_inference_mode == 'compact':
         if (args.nbs_compaction_rtol < 0 or args.nbs_compaction_atol < 0 or
                 args.nbs_compaction_output_rtol < 0 or
@@ -1709,13 +2152,40 @@ def run(args):
 
     patch_selection_module = None
     if args.multimodal_mode == 'patch-selection':
-        patch_selection_module = PatchSelectionModule(grid_rows=cfg.default_patch_grid[0], grid_cols=cfg.default_patch_grid[1]).to(args.device)
-        if args.patch_selection_weights:
-            patch_selection_module.load_state_dict(torch.load(args.patch_selection_weights, map_location=args.device))
-            patch_selection_module.eval()
+        if args.patch_selector_type == 'kinematic':
+            patch_selection_module = KinematicPatchSelector(
+                grid_rows=cfg.default_patch_grid[0],
+                grid_cols=cfg.default_patch_grid[1],
+                velocity_window=args.kinematic_velocity_window,
+                horizon_scale=args.kinematic_horizon_scale,
+                acceleration_weight=args.kinematic_acceleration_weight,
+                uncertainty_deg=args.kinematic_uncertainty_deg,
+                uncertainty_growth=args.kinematic_uncertainty_growth,
+                horizontal_fov_deg=args.kinematic_horizontal_fov_deg,
+                vertical_fov_deg=args.kinematic_vertical_fov_deg,
+                prediction_points=args.kinematic_prediction_points,
+                future_steps=args.fut_window,
+            ).to(args.device)
+            print(
+                'Training-free kinematic patch selector:',
+                patch_selection_module.configuration(),
+            )
         else:
-            print('\033[33mWarning:\033[0m --multimodal-mode patch-selection was set without --patch-selection-weights; '
-                  'using a freshly-initialized (UNTRAINED) patch selection module.')
+            patch_selection_module = PatchSelectionModule(
+                grid_rows=cfg.default_patch_grid[0],
+                grid_cols=cfg.default_patch_grid[1],
+            ).to(args.device)
+            if args.patch_selection_weights:
+                patch_selection_module.load_state_dict(
+                    torch.load(
+                        args.patch_selection_weights,
+                        map_location=args.device,
+                    )
+                )
+                patch_selection_module.eval()
+            else:
+                print('\033[33mWarning:\033[0m --multimodal-mode patch-selection was set without --patch-selection-weights; '
+                      'using a freshly-initialized (UNTRAINED) patch selection module.')
 
     pipeline = Pipeline(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, frequency=args.dataset_frequency,
                          multimodal_mode=args.multimodal_mode, dataset=args.train_dataset,
@@ -1736,14 +2206,20 @@ def run(args):
     if args.test:
         test_video_split = copy.deepcopy(cfg.dataset_video_split[args.test_dataset])
         short_videos = set(cfg.dataset_short_frame_videos.get(args.test_dataset, []))
-        present_short = [v for v in test_video_split['test'] if v in short_videos]
+        present_short = [
+            video for video in test_video_split[args.evaluation_split]
+            if video in short_videos
+        ]
         if present_short:
             if args.exclude_short_videos_test:
-                test_video_split['test'] = [v for v in test_video_split['test'] if v not in short_videos]
+                test_video_split[args.evaluation_split] = [
+                    video for video in test_video_split[args.evaluation_split]
+                    if video not in short_videos
+                ]
                 print(f'\033[33mWarning:\033[0m excluded short-frame-count videos {present_short} from the '
-                      f'test split (--exclude-short-videos-test was set).')
+                      f'{args.evaluation_split} split (--exclude-short-videos-test was set).')
             else:
-                print(f'\033[33mWarning:\033[0m test split includes short-frame-count videos {present_short}; '
+                print(f'\033[33mWarning:\033[0m {args.evaluation_split} split includes short-frame-count videos {present_short}; '
                       f'their tail frames are clamp-repeated (see utils/frame_utils.py), which may distort MAE. '
                       f'Pass --exclude-short-videos-test to drop them from the test split instead.')
 
@@ -1755,7 +2231,7 @@ def run(args):
                 fut_window=args.fut_window,
                 trim_head=args.trim_head,
                 trim_tail=args.trim_tail,
-                include=['test'],
+                include=[args.evaluation_split],
                 frequency=args.dataset_frequency,
                 step=args.sample_step,
             )[0]
@@ -1764,8 +2240,19 @@ def run(args):
             if args.limit_test_samples <= 0:
                 raise ValueError('--limit-test-samples must be positive')
             n = min(args.limit_test_samples, len(raw_dataset_test))
-            raw_dataset_test = torch.utils.data.Subset(raw_dataset_test, range(n))
-            print(f'\033[33mDebug:\033[0m truncated test set to {n} samples (--limit-test-samples).')
+            if args.limit_test_samples_random:
+                generator = make_data_generator(args.data_seed, offset=3)
+                indices = torch.randperm(
+                    len(raw_dataset_test), generator=generator
+                )[:n].tolist()
+            else:
+                indices = range(n)
+            raw_dataset_test = torch.utils.data.Subset(raw_dataset_test, indices)
+            print(
+                f'\033[33mDebug:\033[0m truncated {args.evaluation_split} '
+                f'split to {n} samples (--limit-test-samples; '
+                f'random={args.limit_test_samples_random}).'
+            )
 
         dataloader_test = DataLoader(
             raw_dataset_test,
@@ -1819,6 +2306,10 @@ if __name__ == '__main__':
     # ========== dataset settings related arguments ==========
     parser.add_argument('--train-dataset', action='store', dest='train_dataset', help='Dataset for training.')
     parser.add_argument('--test-dataset', action='store', dest='test_dataset', help='Dataset for testing.')
+    parser.add_argument(
+        '--evaluation-split', choices=['valid', 'test'], default='test',
+        help='Dataset split used by --test. Parameter search should use valid.',
+    )
 
     # ========== dataset loading/processing settings related arguments ==========
     parser.add_argument('--his-window', action='store', dest='his_window',
@@ -1878,6 +2369,67 @@ if __name__ == '__main__':
     parser.add_argument('--patch-selection-weights', action='store', dest='patch_selection_weights', type=str,
                         help='(Optional) Path to a pretrained PatchSelectionModule state_dict for --multimodal-mode patch-selection. '
                              'If omitted, a freshly-initialized (UNTRAINED) module is used.')
+    parser.add_argument(
+        '--patch-selector-type', choices=['learned', 'kinematic'], default='learned',
+        help='Learned checkpoint selector or training-free motion selector.',
+    )
+    parser.add_argument('--kinematic-velocity-window', type=int, default=3)
+    parser.add_argument('--kinematic-horizon-scale', type=float, default=1.0)
+    parser.add_argument('--kinematic-acceleration-weight', type=float, default=0.5)
+    parser.add_argument('--kinematic-uncertainty-deg', type=float, default=20.0)
+    parser.add_argument('--kinematic-uncertainty-growth', type=float, default=1.0)
+    parser.add_argument('--kinematic-horizontal-fov-deg', type=float, default=110.0)
+    parser.add_argument('--kinematic-vertical-fov-deg', type=float, default=90.0)
+    parser.add_argument('--kinematic-prediction-points', type=int, default=5)
+    parser.add_argument(
+        '--multimodal-projector-checkpoint', type=str, default=None,
+        help=(
+            'Checkpoint directory or modules_except_plm.bin from which only '
+            'embed_multimodal (ModuleList index 1) is loaded. Other modules '
+            'and the source checkpoint are left untouched.'
+        ),
+    )
+    parser.add_argument(
+        '--train-patch-selector-only', action='store_true',
+        help=(
+            'Train only PatchSelectionModule using --selector-objective. '
+            'Requires a resumed NBS checkpoint, patch-selection mode, a '
+            'multimodal projector checkpoint, and a separate output directory.'
+        ),
+    )
+    parser.add_argument(
+        '--patch-selector-output-dir', type=str, default=None,
+        help='Separate directory for selector-only weights, history, and manifest.',
+    )
+    parser.add_argument(
+        '--patch-selector-budget-penalty', type=float, default=1.0,
+        help=(
+            'Weight of the differentiable expected-patch-count penalty used '
+            'during selector-only BCE training (default: 1.0).'
+        ),
+    )
+    parser.add_argument(
+        '--selector-objective', choices=['bce', 'nbs-prediction'], default='bce',
+        help=(
+            'Selector-only objective: bce for stage-1 FOV-label pretraining, '
+            'or nbs-prediction for stage-2 fine-tuning through frozen NBS-v19.'
+        ),
+    )
+    parser.add_argument(
+        '--patch-selector-bce-weight', type=float, default=0.1,
+        help='BCE retention weight during nbs-prediction fine-tuning.',
+    )
+    parser.add_argument(
+        '--patch-selector-st-temperature', type=float, default=1.0,
+        help='Straight-through softmax temperature for hard top-k fine-tuning.',
+    )
+    parser.add_argument(
+        '--patch-selector-validation-samples', type=int, default=128,
+        help=(
+            'Hard-top-k autoregressive validation samples per fine-tuning '
+            'epoch; 0 evaluates the complete validation split.'
+        ),
+    )
     parser.add_argument('--exclude-short-videos-test', action='store_true', dest='exclude_short_videos_test',
                         help='(Optional) Exclude videos with fewer extracted frames than the nominal count '
                              '(see cfg.dataset_short_frame_videos) from the test split, to avoid MAE distortion '
@@ -2072,6 +2624,10 @@ if __name__ == '__main__':
                         help='(Optional, debug) Truncate the validation set to this many samples.')
     parser.add_argument('--limit-test-samples', action='store', dest='limit_test_samples', type=int,
                         help='(Optional, smoke test) Truncate the test set to the first N samples.')
+    parser.add_argument(
+        '--limit-test-samples-random', action='store_true',
+        help='Use a deterministic random subset with --limit-test-samples.',
+    )
     args = parser.parse_args()
     try:
         args.seed, args.lora_seed, args.data_seed = resolve_experiment_seeds(
@@ -2118,6 +2674,44 @@ if __name__ == '__main__':
         parser.error('--shapley-validation-batches must be positive')
     if not 0.0 <= args.shapley_truncate_fraction <= 1.0:
         parser.error('--shapley-truncate-fraction must be in [0, 1]')
+    if args.patch_selector_budget_penalty < 0:
+        parser.error('--patch-selector-budget-penalty must be non-negative')
+    if args.patch_selector_type == 'kinematic':
+        if args.patch_selection_weights:
+            parser.error('--patch-selector-type kinematic does not use weights')
+        if args.train_patch_selector_only:
+            parser.error('kinematic selector is evaluation-only')
+        if args.patch_top_k is None or args.patch_top_k <= 0:
+            parser.error('kinematic selector requires positive --patch-top-k')
+        if args.kinematic_velocity_window <= 0:
+            parser.error('--kinematic-velocity-window must be positive')
+        if args.kinematic_horizon_scale <= 0:
+            parser.error('--kinematic-horizon-scale must be positive')
+        if (args.kinematic_uncertainty_deg < 0
+                or args.kinematic_uncertainty_growth < 0):
+            parser.error('kinematic uncertainty values must be non-negative')
+        if args.kinematic_prediction_points <= 0:
+            parser.error('--kinematic-prediction-points must be positive')
+    if args.patch_selector_bce_weight < 0:
+        parser.error('--patch-selector-bce-weight must be non-negative')
+    if args.patch_selector_st_temperature <= 0:
+        parser.error('--patch-selector-st-temperature must be positive')
+    if args.patch_selector_validation_samples < 0:
+        parser.error('--patch-selector-validation-samples must be non-negative')
+    if args.train_patch_selector_only and not args.adapt:
+        parser.error('--train-patch-selector-only requires --adapt')
+    if (args.selector_objective == 'nbs-prediction'
+            and not args.train_patch_selector_only):
+        parser.error(
+            '--selector-objective nbs-prediction requires '
+            '--train-patch-selector-only'
+        )
+    if (args.selector_objective == 'nbs-prediction'
+            and not args.patch_selection_weights):
+        parser.error(
+            '--selector-objective nbs-prediction requires a converged '
+            '--patch-selection-weights checkpoint'
+        )
 
     # resolve the 3-way multimodal mode; --multimodal (legacy) maps to 'baseline' when
     # --multimodal-mode isn't explicitly given
