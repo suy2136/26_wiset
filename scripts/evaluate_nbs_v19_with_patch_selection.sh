@@ -120,7 +120,7 @@ COMMAND=(
   --results-output-dir "$RUN_DIR"
   --latency-output-path "$RUN_DIR/latency.json"
   --inference-trace-output-path "$RUN_DIR/inference_trace.json"
-  --inference-tag delivered_patch_selector_threshold_${PATCH_THRESHOLD}
+  --inference-tag selector
   "${LIMIT_ARGS[@]}"
 )
 
