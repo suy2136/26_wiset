@@ -63,6 +63,10 @@ def build_command(args, experiment):
     temporal = bool(experiment.get("temporal"))
     token = bool(experiment.get("token"))
     speculative = bool(experiment.get("speculative"))
+    event_max_events = int(experiment.get("event_max_events", 1))
+    token_offsets = tuple(experiment.get("token_offsets", (2, 6, 7)))
+    speculative_steps = int(experiment.get("speculative_steps", 3))
+    speculative_drafter = experiment.get("speculative_drafter", "repeat-last")
     command = [
         sys.executable, "run_plm.py", "--test", "--nbs-v19", "--fp16",
         "--seed", str(args.data_seed), "--lora-seed", "1",
@@ -81,8 +85,8 @@ def build_command(args, experiment):
         "--temporal-selector", "event-aware" if temporal else "none",
         "--token-selector", "intra-timestep" if token else "none",
         "--selector-history-steps", "20",
-        "--speculative-draft-steps", "3" if speculative else "0",
-        "--speculative-drafter", "repeat-last" if speculative else "mpc",
+        "--speculative-draft-steps", str(speculative_steps) if speculative else "0",
+        "--speculative-drafter", speculative_drafter if speculative else "mpc",
         "--speculative-verification-mode", "sample",
         "--speculative-buffer-tolerance", "1.0",
         "--speculative-state-tolerance", "0.25",
@@ -90,13 +94,16 @@ def build_command(args, experiment):
     ]
     if temporal:
         command.extend([
-            "--event-max-events", "1", "--event-min-spacing", "2",
+            "--event-max-events", str(event_max_events),
+            "--event-min-spacing", "2",
             "--event-throughput-threshold", "0.6",
             "--event-buffer-threshold", "6.0",
             "--event-bitrate-jump-threshold", "1",
         ])
     if token:
-        command.extend(["--intra-token-keep-offsets", "2", "6", "7"])
+        command.extend([
+            "--intra-token-keep-offsets", *(str(value) for value in token_offsets)
+        ])
     return command
 
 
