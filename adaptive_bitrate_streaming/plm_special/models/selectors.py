@@ -295,15 +295,17 @@ class EventAwareTemporalSelector(BaseSelector):
 class IntraTimestepTokenSelector(BaseSelector):
     """Reduce tokens inside temporally selected ABR history blocks.
 
-    Temporal selection must run first and provide the absolute selected
-    timestep IDs and event metadata.  Return/action anchors are always kept,
-    event-causal state tokens are preserved, the latest historical block is
-    kept whole, and the current/MPC suffix is never pruned.
+    Temporal selection may provide absolute selected timestep IDs and event
+    metadata.  By default, return/action anchors and event-causal tokens are
+    kept and the latest historical block remains whole.  ``keep_offsets``
+    instead applies one explicit offset set to every historical block.  The
+    current/MPC suffix is never pruned in either mode.
     """
 
     requires_temporal_metadata = True
 
-    def __init__(self, tokens_per_history_step=8, current_step_tokens=7):
+    def __init__(self, tokens_per_history_step=8, current_step_tokens=7,
+                 keep_offsets=None):
         super().__init__()
         for name, value in (
             ("tokens_per_history_step", tokens_per_history_step),
@@ -315,6 +317,17 @@ class IntraTimestepTokenSelector(BaseSelector):
             raise ValueError("intra-timestep ABR layout currently requires 8 tokens")
         self.tokens_per_history_step = tokens_per_history_step
         self.current_step_tokens = current_step_tokens
+        if keep_offsets is None:
+            self.keep_offsets = None
+        else:
+            offsets = tuple(int(offset) for offset in keep_offsets)
+            if not offsets:
+                raise ValueError("keep_offsets must not be empty")
+            if tuple(sorted(set(offsets))) != offsets:
+                raise ValueError("keep_offsets must be unique and sorted")
+            if offsets[0] < 0 or offsets[-1] >= tokens_per_history_step:
+                raise ValueError("keep_offsets contains an invalid ABR token offset")
+            self.keep_offsets = offsets
 
     def forward(self, embeddings, attention_mask=None, context=None):
         self.validate_inputs(embeddings, attention_mask)
@@ -350,7 +363,7 @@ class IntraTimestepTokenSelector(BaseSelector):
         offsets_by_step = {}
         selected_history_token_count = 0
         for block_index, timestep in enumerate(selected_steps):
-            offsets = protected_history_token_offsets(
+            offsets = self.keep_offsets or protected_history_token_offsets(
                 event_reasons.get(timestep),
                 preserve_all=timestep == latest_step,
             )
@@ -378,10 +391,19 @@ class IntraTimestepTokenSelector(BaseSelector):
                 "selected_history_steps": selected_steps,
                 "latest_history_step": latest_step,
                 "event_token_offsets": offsets_by_step,
-                "always_preserved_offsets": [0, 7],
+                "always_preserved_offsets": (
+                    [0, 7] if self.keep_offsets is None
+                    else list(self.keep_offsets)
+                ),
+                "configured_keep_offsets": (
+                    None if self.keep_offsets is None
+                    else list(self.keep_offsets)
+                ),
                 "history_original_tokens": history_tokens,
                 "history_selected_tokens": selected_history_token_count,
-                "preserves_latest_history_block": latest_step is not None,
+                "preserves_latest_history_block": (
+                    latest_step is not None and self.keep_offsets is None
+                ),
                 "protected_suffix_tokens": protected,
                 "preserves_order": True,
             },

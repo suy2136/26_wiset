@@ -170,6 +170,9 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         'temporal_selector': getattr(args, 'temporal_selector', 'none'),
         'selector': getattr(args, 'token_selector', 'none'),
         'selector_history_steps': getattr(args, 'selector_history_steps', None),
+        'intra_token_keep_offsets': getattr(
+            args, 'intra_token_keep_offsets', None
+        ),
         'event_max_events': getattr(args, 'event_max_events', None),
         'event_min_spacing': getattr(args, 'event_min_spacing', None),
         'event_throughput_threshold': getattr(
@@ -181,6 +184,7 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
         'event_bitrate_jump_threshold': getattr(
             args, 'event_bitrate_jump_threshold', None
         ),
+        'speculative_drafter': getattr(args, 'speculative_drafter', 'mpc'),
         'inference_calls': len(inference_latencies_ms),
         'inference_latency_mean_ms': float(np.mean(inference_latencies_ms)),
         'inference_latency_p50_ms': float(np.percentile(inference_latencies_ms, 50)),

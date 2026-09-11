@@ -32,7 +32,10 @@ from plm_special.models.selectors import (
 )
 from plm_special.models.state_encoder import EncoderNetwork
 from plm_special.models.low_rank import peft_model
-from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
+from plm_special.speculative.mpc_draft import (
+    RepeatLastDraftGenerator,
+    RobustMPCDraftGenerator,
+)
 from plm_special.training_control import ValidationPlateauController
 from plm_special.utils.utils import set_random_seed
 from plm_special.utils.utils import process_batch
@@ -797,6 +800,19 @@ def run(args):
             'event-aware temporal selection supports token selector none or '
             'intra-timestep only'
         )
+    if args.intra_token_keep_offsets is not None:
+        offsets = args.intra_token_keep_offsets
+        if args.token_selector != 'intra-timestep':
+            raise ValueError(
+                '--intra-token-keep-offsets requires '
+                '--token-selector intra-timestep'
+            )
+        if not offsets or offsets != sorted(set(offsets)):
+            raise ValueError(
+                '--intra-token-keep-offsets must be unique and sorted'
+            )
+        if offsets[0] < 0 or offsets[-1] >= 8:
+            raise ValueError('--intra-token-keep-offsets must be in [0, 7]')
     if not 0 <= args.speculative_draft_steps <= 5:
         raise ValueError('--speculative-draft-steps must be between 0 and 5')
     if args.speculative_buffer_tolerance < 0:
@@ -1051,10 +1067,17 @@ def run(args):
             bitrate_jump_threshold=args.event_bitrate_jump_threshold,
         )
     elif args.token_selector == 'intra-timestep':
-        token_selector = IntraTimestepTokenSelector()
+        token_selector = IntraTimestepTokenSelector(
+            keep_offsets=args.intra_token_keep_offsets
+        )
     draft_generator = None
     if args.speculative_draft_steps > 0:
-        draft_generator = RobustMPCDraftGenerator.from_video_size_dir(
+        generator_class = (
+            RepeatLastDraftGenerator
+            if args.speculative_drafter == 'repeat-last'
+            else RobustMPCDraftGenerator
+        )
+        draft_generator = generator_class.from_video_size_dir(
             video_size_dir, max_horizon=args.speculative_draft_steps
         )
     rl_policy = OfflineRLPolicy(state_feature_dim=args.state_feature_dim, bitrate_levels=BITRATE_LEVELS, state_encoder=state_encoder, plm=plm, plm_embed_size=plm_embed_size,
@@ -1108,10 +1131,14 @@ def run(args):
             f'_br{args.event_bitrate_jump_threshold}'
         )
     else:
-        selector_tag = 'selector_intra_timestep'
+        offset_tag = (
+            '' if args.intra_token_keep_offsets is None
+            else '_keep' + '-'.join(map(str, args.intra_token_keep_offsets))
+        )
+        selector_tag = f'selector_intra_timestep{offset_tag}'
     speculative_tag = (
         'speculative_none' if args.speculative_draft_steps == 0
-        else f'speculative_mpc_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
+        else f'speculative_{args.speculative_drafter.replace("-", "_")}_k{args.speculative_draft_steps}_{args.speculative_verification_mode}_btol{args.speculative_buffer_tolerance}_stol{args.speculative_state_tolerance}_rtol{args.speculative_return_tolerance}'
     )
     result_parts = [
         cfg.results_dir,
@@ -1369,6 +1396,13 @@ if __name__ == '__main__':
                         help='inference-time token selection policy')
     parser.add_argument('--selector-history-steps', type=int, default=20,
                         help='number of complete real-history timesteps retained by recent-timestep')
+    parser.add_argument(
+        '--intra-token-keep-offsets', type=int, nargs='+',
+        help=(
+            'fixed sorted ABR history offsets retained by intra-timestep '
+            'selection; default uses event-aware offsets'
+        ),
+    )
     parser.add_argument('--event-max-events', type=int, default=3,
                         help='maximum older events retained by event-aware selector')
     parser.add_argument('--event-min-spacing', type=int, default=2,
@@ -1381,6 +1415,10 @@ if __name__ == '__main__':
                         help='minimum bitrate-index jump that triggers an event')
     parser.add_argument('--speculative-draft-steps', type=int, default=0,
                         help='MPC draft horizon; 0 disables speculative draft generation')
+    parser.add_argument(
+        '--speculative-drafter', choices=('mpc', 'repeat-last'), default='mpc',
+        help='action used to propose speculative bitrate actions',
+    )
     parser.add_argument('--speculative-verification-mode', choices=('greedy', 'sample'), default='sample',
                         help='how target logits choose actions during draft verification')
     parser.add_argument('--speculative-buffer-tolerance', type=float, default=1.0,

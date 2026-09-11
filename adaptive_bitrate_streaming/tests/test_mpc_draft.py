@@ -10,7 +10,10 @@ if ABR_ROOT not in sys.path:
     sys.path.insert(0, ABR_ROOT)
 
 from baseline_special.utils.constants import MAX_VIDEO_BIT_RATE, VIDEO_BIT_RATE
-from plm_special.speculative.mpc_draft import RobustMPCDraftGenerator
+from plm_special.speculative.mpc_draft import (
+    RepeatLastDraftGenerator,
+    RobustMPCDraftGenerator,
+)
 
 
 def sample_state(throughput=10.0, buffer_size=10.0, remaining=10.0):
@@ -103,6 +106,16 @@ class RobustMPCDraftGeneratorTest(unittest.TestCase):
             predicted_bandwidth=forecast,
         )
         self.assertEqual(len(self.generator.past_bandwidth_estimates), 1)
+
+    def test_repeat_last_uses_same_rollout_contract(self):
+        generator = RepeatLastDraftGenerator(self.video_sizes, max_horizon=5)
+        rollout = generator.generate(
+            state=sample_state(), last_bitrate=3, buffer_size=10.0,
+            video_chunk_remain=10, target_return=5.0, timestep=7, horizon=3,
+        )
+        self.assertEqual(rollout.actions.tolist(), [3, 3, 3])
+        self.assertEqual(rollout.states.shape, (3, 6, 6))
+        self.assertEqual(rollout.timesteps.tolist(), [7, 8, 9])
 
 
 if __name__ == '__main__':

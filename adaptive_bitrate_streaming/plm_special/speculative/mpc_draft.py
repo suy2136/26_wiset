@@ -266,3 +266,16 @@ class RobustMPCDraftGenerator:
             predicted_rewards=np.asarray(rewards, dtype=np.float32),
             predicted_rebuffers=np.asarray(rebuffers, dtype=np.float32),
         )
+
+
+class RepeatLastDraftGenerator(RobustMPCDraftGenerator):
+    """Draft by repeating the last executed bitrate.
+
+    State, buffer, reward, and return rollout remain identical to MPC.  Only
+    action proposal changes, avoiding sequence search while exploiting the
+    ABR policy's tendency to retain its most recent bitrate.
+    """
+
+    @staticmethod
+    def _valid_sequences(last_bitrate, horizon):
+        yield (int(last_bitrate),) * int(horizon)

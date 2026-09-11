@@ -132,6 +132,21 @@ class SelectorTensorContractTest(unittest.TestCase):
             output.metadata['event_token_offsets']['2'], [0, 2, 3, 4, 7]
         )
 
+    def test_intra_timestep_fixed_offsets_apply_to_every_history_block(self):
+        embeddings = torch.arange(23, dtype=torch.float32).reshape(1, 23, 1)
+        output = self.IntraTimestepTokenSelector(keep_offsets=(2, 6, 7))(
+            embeddings,
+            context={
+                'selected_history_steps': [2, 5],
+                'latest_history_step': 5,
+                'event_scores': [],
+                'protected_suffix_tokens': 7,
+            },
+        )
+        expected = torch.as_tensor([2, 6, 7, 10, 14, 15, *range(16, 23)])
+        self.assertTrue(torch.equal(output.selected_indices.cpu(), expected))
+        self.assertEqual(output.metadata['configured_keep_offsets'], [2, 6, 7])
+
 
 @unittest.skipIf(torch is None, 'PyTorch is not installed in this environment')
 class MPCVerificationContractTest(unittest.TestCase):
