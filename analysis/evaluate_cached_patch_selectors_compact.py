@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -84,7 +85,7 @@ def build_command(args, model_path, result_dir, policy=None,
             str(result_dir / "selector_stats.json"),
             "--multimodal-projector-checkpoint",
             str(args.projector_checkpoint),
-            "--inference-tag", f"cached_{policy}",
+            "--inference-tag", "selector",
         ])
     return command
 
@@ -112,6 +113,32 @@ def aggregate_result(directory):
     }
 
 
+def run_streaming_command(command, cwd, log_path):
+    """Mirror an unbuffered child process to the console and its log file."""
+    environment = os.environ.copy()
+    environment["PYTHONUNBUFFERED"] = "1"
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command, cwd=cwd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            encoding="utf-8", errors="replace", env=environment,
+        )
+        try:
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+        except BaseException:
+            process.terminate()
+            process.wait()
+            raise
+        finally:
+            process.stdout.close()
+        return_code = process.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command)
+
+
 def run_case(command, directory, resume):
     metrics_path = directory / "metrics.json"
     if resume and metrics_path.is_file():
@@ -120,11 +147,7 @@ def run_case(command, directory, resume):
     (directory / "command.json").write_text(
         json.dumps(command, indent=2), encoding="utf-8"
     )
-    with (directory / "run.log").open("w", encoding="utf-8") as log:
-        subprocess.run(
-            command, cwd=REPO_ROOT, stdout=log,
-            stderr=subprocess.STDOUT, check=True,
-        )
+    run_streaming_command(command, REPO_ROOT, directory / "run.log")
     metrics = aggregate_result(directory)
     stats_path = directory / "selector_stats.json"
     if stats_path.is_file():

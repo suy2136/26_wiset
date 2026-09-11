@@ -106,7 +106,7 @@ def selector_command(args, model_path, result_dir, config):
         "--cached-patch-stats-output-path",
         str(result_dir / "selector_stats.json"),
         "--multimodal-projector-checkpoint", str(args.projector_checkpoint),
-        "--inference-tag", result_dir.name,
+        "--inference-tag", "selector",
     ])
     if config.get("projector_cache"):
         command.append("--cached-patch-projector-cache")
