@@ -64,7 +64,13 @@ SPEED_CASES = (
 
 def parser():
     result = argparse.ArgumentParser()
-    result.add_argument("--group", choices=("quality", "speed"), required=True)
+    result.add_argument(
+        "--group", choices=("quality", "speed", "all"), required=True,
+        help=(
+            "Run the four quality cases, the four speed cases, or all eight "
+            "sequentially after one shared pure-NBS compact baseline."
+        ),
+    )
     result.add_argument("--nbs-checkpoint", type=Path, required=True)
     result.add_argument("--projector-checkpoint", type=Path, required=True)
     result.add_argument("--cache-dir", type=Path, required=True)
@@ -114,7 +120,12 @@ def main():
         setattr(args, name, absolute(getattr(args, name)))
     if args.projector_cache_max_entries <= 0:
         raise ValueError("--projector-cache-max-entries must be positive")
-    cases = QUALITY_CASES if args.group == "quality" else SPEED_CASES
+    if args.group == "quality":
+        cases = QUALITY_CASES
+    elif args.group == "speed":
+        cases = SPEED_CASES
+    else:
+        cases = QUALITY_CASES + SPEED_CASES
     compact_dir = args.output_dir / "compact_checkpoint"
     compact_exists = (compact_dir / "compact_adapter.pt").is_file()
     baseline_model = compact_dir if compact_exists else args.nbs_checkpoint
@@ -142,7 +153,11 @@ def main():
     for name, config, command in commands:
         row = {
             "case": name,
-            "group": args.group,
+            "group": (
+                "baseline" if config is None
+                else "quality" if name.startswith("q_")
+                else "speed"
+            ),
             "status": "failed",
             **(config or {}),
         }
