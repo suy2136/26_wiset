@@ -1,4 +1,5 @@
 import os
+from collections import OrderedDict
 import torch
 import torch.nn as nn
 from typing import *
@@ -39,6 +40,10 @@ class Pipeline(nn.Module):
                 patch_threshold = None,
                 cached_patch_features_dir = None,
                 cached_patch_cache_device = 'cpu',
+                cached_patch_projector_cache = False,
+                cached_patch_projector_cache_max_entries = 512,
+                cached_patch_refresh_interval = 1,
+                cached_patch_max_skip_calls = 0,
                 ):
         """
         :param plm: the pretrained llm
@@ -105,6 +110,28 @@ class Pipeline(nn.Module):
         # patches actually got selected (meaningful for threshold selection; constant for
         # top_k). Not touched by any other mode.
         self.patch_selection_history = []
+        self.cached_patch_visual_token_history = []
+        self.cached_patch_projector_cache = bool(cached_patch_projector_cache)
+        self.cached_patch_projector_cache_max_entries = int(
+            cached_patch_projector_cache_max_entries
+        )
+        self.cached_patch_refresh_interval = int(cached_patch_refresh_interval)
+        self.cached_patch_max_skip_calls = int(cached_patch_max_skip_calls)
+        if self.cached_patch_projector_cache_max_entries <= 0:
+            raise ValueError('cached patch projector cache size must be positive')
+        if self.cached_patch_refresh_interval <= 0:
+            raise ValueError('cached patch refresh interval must be positive')
+        if self.cached_patch_max_skip_calls < 0:
+            raise ValueError('cached patch max skip calls must be non-negative')
+        self._cached_patch_projected = OrderedDict()
+        self._cached_patch_stream_tokens = {}
+        self._cached_patch_skip_streaks = {}
+        self.cached_patch_runtime_stats = {
+            'projector_cache_hits': 0,
+            'projector_cache_misses': 0,
+            'refresh_reuses': 0,
+            'forced_visual_tokens': 0,
+        }
 
         # frame-index clamping applies to every multimodal mode that indexes into per-video
         # frame data (baseline's offline cache included -- it only has entries up to the real
@@ -520,18 +547,79 @@ class Pipeline(nn.Module):
             self, video_user_position, history_viewports):
         """Gather cached patch features and pool them into one visual token."""
         video_index, image_index = self._resolve_frame_index(video_user_position)
-        with torch.no_grad():
-            indices = self.patch_selection_module.select_indices(
-                history_viewports.to(self.device)
-            )
-            features = self.cached_patch_feature_store.get(
-                video_index, image_index, indices
-            )
+        stream_key = self._cached_patch_stream_key(video_user_position)
+        indices = self.patch_selection_module.select_indices(
+            history_viewports.to(self.device)
+        )
+
+        if indices.numel() == 0:
+            streak = self._cached_patch_skip_streaks.get(stream_key, 0)
+            if (self.cached_patch_max_skip_calls > 0
+                    and streak >= self.cached_patch_max_skip_calls):
+                indices = self.patch_selection_module.current_index(
+                    history_viewports.to(self.device)
+                )
+                self._cached_patch_skip_streaks[stream_key] = 0
+                self.cached_patch_runtime_stats['forced_visual_tokens'] += 1
+            else:
+                self._cached_patch_skip_streaks[stream_key] = streak + 1
+                self.patch_selection_history.append(0)
+                self.cached_patch_visual_token_history.append(0)
+                return torch.empty(
+                    (1, 0, self.embed_size), device=self.device,
+                    dtype=self.embed_multimodal.weight.dtype,
+                )
+        else:
+            self._cached_patch_skip_streaks[stream_key] = 0
+
+        stream_entry = self._cached_patch_stream_tokens.get(stream_key)
+        if stream_entry is not None:
+            calls_since_refresh, previous = stream_entry
+            if calls_since_refresh + 1 < self.cached_patch_refresh_interval:
+                self._cached_patch_stream_tokens[stream_key] = (
+                    calls_since_refresh + 1, previous
+                )
+                self.cached_patch_runtime_stats['refresh_reuses'] += 1
+                self.patch_selection_history.append(int(indices.numel()))
+                self.cached_patch_visual_token_history.append(1)
+                return previous
+
+        index_tuple = tuple(int(index) for index in indices.tolist())
+        projector_key = (video_index, image_index, index_tuple)
+        mapped = self._cached_patch_projected.get(projector_key)
+        if self.cached_patch_projector_cache and mapped is not None:
+            self._cached_patch_projected.move_to_end(projector_key)
+            self.cached_patch_runtime_stats['projector_cache_hits'] += 1
+        else:
+            with torch.no_grad():
+                features = self.cached_patch_feature_store.get(
+                    video_index, image_index, indices
+                )
+                # Pool before projection. Linear(mean(x)) == mean(Linear(x)),
+                # while this performs only one 768->LLM projection.
+                pooled = features.float().mean(dim=0, keepdim=True).to(self.device)
+                mapped = self.embed_multimodal(pooled).unsqueeze(0).detach()
+            self.cached_patch_runtime_stats['projector_cache_misses'] += 1
+            if self.cached_patch_projector_cache:
+                self._cached_patch_projected[projector_key] = mapped
+                self._cached_patch_projected.move_to_end(projector_key)
+                while (len(self._cached_patch_projected)
+                       > self.cached_patch_projector_cache_max_entries):
+                    self._cached_patch_projected.popitem(last=False)
+
+        self._cached_patch_stream_tokens[stream_key] = (0, mapped)
         self.patch_selection_history.append(int(indices.numel()))
-        # Pool before projection. Linear(mean(x)) == mean(Linear(x)), while this
-        # performs only one 768->LLM projection and always contributes one token.
-        pooled = features.float().mean(dim=0, keepdim=True).to(self.device)
-        return self.embed_multimodal(pooled).unsqueeze(0)
+        self.cached_patch_visual_token_history.append(1)
+        return mapped
+
+    @staticmethod
+    def _cached_patch_stream_key(video_user_position):
+        """Return a stable video/user key for refresh and skip state."""
+        values = []
+        for index in (0, 1):
+            value = video_user_position[index]
+            values.append(int(value.item() if hasattr(value, 'item') else value))
+        return tuple(values)
 
     def preload_cached_patch_features(self, video_indices):
         if self.cached_patch_feature_store is None:

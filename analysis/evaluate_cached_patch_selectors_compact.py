@@ -129,8 +129,14 @@ def run_case(command, directory, resume):
     stats_path = directory / "selector_stats.json"
     if stats_path.is_file():
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
-        metrics["selected_patches_mean"] = stats["selected_patches_mean"]
-        metrics["visual_tokens_per_call"] = stats["visual_tokens_per_call"]
+        for key in (
+            "selected_patches_mean", "visual_tokens_per_call",
+            "zero_patch_calls", "projector_cache_hits",
+            "projector_cache_misses", "refresh_reuses",
+            "forced_visual_tokens",
+        ):
+            if key in stats:
+                metrics[key] = stats[key]
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     return metrics
 
@@ -152,7 +158,8 @@ def plot_rows(rows, output_path):
         print("matplotlib unavailable; skipped PNG plot", flush=True)
         return
     labels = [row["case"] for row in rows]
-    colors = ["#3675B5", "#4E9F6D", "#E3A52B", "#B45A68"]
+    palette = ["#3675B5", "#4E9F6D", "#E3A52B", "#B45A68", "#6F63B6"]
+    colors = [palette[index % len(palette)] for index in range(len(rows))]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     axes[0].barh(labels, [row["mae"] for row in rows], color=colors)
     axes[0].invert_yaxis()

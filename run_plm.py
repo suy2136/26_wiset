@@ -1919,9 +1919,15 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                 )
         if args.multimodal_mode == 'cached-patch-selection':
             counts = pipeline.patch_selection_history
+            visual_counts = pipeline.cached_patch_visual_token_history
             stats = {
                 'policy': args.cached_patch_policy,
                 'motion_threshold_deg': args.cached_patch_motion_threshold_deg,
+                'motion_history_window': args.cached_patch_motion_history_window,
+                'acceleration_weight': args.cached_patch_acceleration_weight,
+                'rapid_motion_multiplier': args.cached_patch_rapid_motion_multiplier,
+                'refresh_interval': args.cached_patch_refresh_interval,
+                'max_skip_calls': args.cached_patch_max_skip_calls,
                 'calls': len(counts),
                 'selected_patches_mean': (
                     sum(counts) / len(counts) if counts else None
@@ -1930,7 +1936,12 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                 'selected_patches_max': max(counts) if counts else None,
                 'one_patch_calls': sum(count == 1 for count in counts),
                 'two_patch_calls': sum(count == 2 for count in counts),
-                'visual_tokens_per_call': 1,
+                'zero_patch_calls': sum(count == 0 for count in counts),
+                'visual_tokens_per_call': (
+                    sum(visual_counts) / len(visual_counts)
+                    if visual_counts else None
+                ),
+                **pipeline.cached_patch_runtime_stats,
             }
             stats_path = (
                 args.cached_patch_stats_output_path
@@ -2226,6 +2237,9 @@ def run(args):
             grid_rows=cfg.default_patch_grid[0],
             grid_cols=cfg.default_patch_grid[1],
             motion_threshold_deg=args.cached_patch_motion_threshold_deg,
+            motion_history_window=args.cached_patch_motion_history_window,
+            acceleration_weight=args.cached_patch_acceleration_weight,
+            rapid_motion_multiplier=args.cached_patch_rapid_motion_multiplier,
         ).to(args.device)
         print(
             'Cached viewport patch selector:',
@@ -2247,7 +2261,11 @@ def run(args):
                          patch_selection_module=patch_selection_module,
                          patch_top_k=args.patch_top_k, patch_threshold=args.patch_threshold,
                          cached_patch_features_dir=cached_patch_features_dir,
-                         cached_patch_cache_device=cached_patch_cache_device)
+                         cached_patch_cache_device=cached_patch_cache_device,
+                         cached_patch_projector_cache=args.cached_patch_projector_cache,
+                         cached_patch_projector_cache_max_entries=args.cached_patch_projector_cache_max_entries,
+                         cached_patch_refresh_interval=args.cached_patch_refresh_interval,
+                         cached_patch_max_skip_calls=args.cached_patch_max_skip_calls)
     # print_trainable_parameters(pipeline)
 
     if args.compile:
@@ -2440,13 +2458,26 @@ if __name__ == '__main__':
     parser.add_argument('--kinematic-vertical-fov-deg', type=float, default=90.0)
     parser.add_argument('--kinematic-prediction-points', type=int, default=5)
     parser.add_argument(
-        '--cached-patch-policy', choices=['k1', 'adaptive', 'k2'],
+        '--cached-patch-policy',
+        choices=['k1', 'adaptive', 'k2', 'cross', 'gated-k1', 'gated-adaptive'],
         default='adaptive',
         help='Selection rule for --multimodal-mode cached-patch-selection.',
     )
     parser.add_argument(
         '--cached-patch-motion-threshold-deg', type=float, default=12.0,
         help='One-step angular-motion threshold at which adaptive policy uses K=2.',
+    )
+    parser.add_argument(
+        '--cached-patch-motion-history-window', type=int, default=1,
+        help='Number of recent motion deltas averaged by the cached selector.',
+    )
+    parser.add_argument(
+        '--cached-patch-acceleration-weight', type=float, default=0.0,
+        help='Non-negative weight applied to the latest angular acceleration.',
+    )
+    parser.add_argument(
+        '--cached-patch-rapid-motion-multiplier', type=float, default=2.0,
+        help='Gated-adaptive K=2 threshold relative to the motion threshold.',
     )
     parser.add_argument(
         '--cached-patch-features-dir', type=str, default=None,
@@ -2459,6 +2490,22 @@ if __name__ == '__main__':
     parser.add_argument(
         '--cached-patch-preload', action='store_true',
         help='Preload evaluation-split patch tensors before latency measurement.',
+    )
+    parser.add_argument(
+        '--cached-patch-projector-cache', action='store_true',
+        help='Cache bounded projected visual tokens by frame and selected patches.',
+    )
+    parser.add_argument(
+        '--cached-patch-projector-cache-max-entries', type=int, default=512,
+        help='Maximum number of projected visual tokens retained by the LRU cache.',
+    )
+    parser.add_argument(
+        '--cached-patch-refresh-interval', type=int, default=1,
+        help='Reuse a stream visual token for this many selected calls.',
+    )
+    parser.add_argument(
+        '--cached-patch-max-skip-calls', type=int, default=0,
+        help='Force one visual token after this many consecutive gated omissions; 0 disables the limit.',
     )
     parser.add_argument(
         '--cached-patch-stats-output-path', type=str, default=None,
@@ -2777,6 +2824,18 @@ if __name__ == '__main__':
             parser.error('--kinematic-prediction-points must be positive')
     if args.cached_patch_motion_threshold_deg < 0:
         parser.error('--cached-patch-motion-threshold-deg must be non-negative')
+    if args.cached_patch_motion_history_window <= 0:
+        parser.error('--cached-patch-motion-history-window must be positive')
+    if args.cached_patch_acceleration_weight < 0:
+        parser.error('--cached-patch-acceleration-weight must be non-negative')
+    if args.cached_patch_rapid_motion_multiplier < 1:
+        parser.error('--cached-patch-rapid-motion-multiplier must be at least one')
+    if args.cached_patch_projector_cache_max_entries <= 0:
+        parser.error('--cached-patch-projector-cache-max-entries must be positive')
+    if args.cached_patch_refresh_interval <= 0:
+        parser.error('--cached-patch-refresh-interval must be positive')
+    if args.cached_patch_max_skip_calls < 0:
+        parser.error('--cached-patch-max-skip-calls must be non-negative')
     if args.multimodal_mode == 'cached-patch-selection':
         if args.train_patch_selector_only:
             parser.error('cached patch selectors are evaluation-only')

@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 
-POLICIES = ("k1", "adaptive", "k2")
+POLICIES = ("k1", "adaptive", "k2", "cross", "gated-k1", "gated-adaptive")
 
 
 class CachedViewportPatchSelector(nn.Module):
@@ -20,7 +20,8 @@ class CachedViewportPatchSelector(nn.Module):
     """
 
     def __init__(self, policy="adaptive", grid_rows=4, grid_cols=4,
-                 motion_threshold_deg=12.0):
+                 motion_threshold_deg=12.0, motion_history_window=1,
+                 acceleration_weight=0.0, rapid_motion_multiplier=2.0):
         super().__init__()
         if policy not in POLICIES:
             raise ValueError(f"policy must be one of {POLICIES}, got {policy}")
@@ -28,17 +29,73 @@ class CachedViewportPatchSelector(nn.Module):
             raise ValueError("patch grid dimensions must be positive")
         if motion_threshold_deg < 0:
             raise ValueError("motion threshold must be non-negative")
+        if motion_history_window <= 0:
+            raise ValueError("motion history window must be positive")
+        if acceleration_weight < 0:
+            raise ValueError("acceleration weight must be non-negative")
+        if rapid_motion_multiplier < 1:
+            raise ValueError("rapid motion multiplier must be at least one")
         self.policy = policy
         self.grid_rows = int(grid_rows)
         self.grid_cols = int(grid_cols)
         self.motion_threshold_deg = float(motion_threshold_deg)
+        self.motion_history_window = int(motion_history_window)
+        self.acceleration_weight = float(acceleration_weight)
+        self.rapid_motion_multiplier = float(rapid_motion_multiplier)
 
     @staticmethod
     def _wrapped_yaw_delta(current, previous):
         return torch.remainder(current - previous + 180.0, 360.0) - 180.0
 
+    def _current_cell(self, history):
+        pitch = (history[0, -1, 1] * 90.0).clamp(-90.0, 90.0)
+        yaw = torch.remainder(history[0, -1, 2] * 180.0 + 180.0, 360.0) - 180.0
+        row = torch.floor((90.0 - pitch) / (180.0 / self.grid_rows)).long()
+        col = torch.floor((yaw + 180.0) / (360.0 / self.grid_cols)).long()
+        row = row.clamp(0, self.grid_rows - 1)
+        col = torch.remainder(col, self.grid_cols)
+        return pitch, yaw, row, col
+
+    def _motion(self, history):
+        if history.shape[1] < 2:
+            zero = history.new_zeros(())
+            return zero, zero, zero
+
+        start = max(1, history.shape[1] - self.motion_history_window)
+        pitch = history[0, :, 1] * 90.0
+        yaw = history[0, :, 2] * 180.0
+        delta_pitch = pitch[1:] - pitch[:-1]
+        delta_yaw = self._wrapped_yaw_delta(yaw[1:], yaw[:-1])
+        velocity_pitch = delta_pitch[start - 1:].mean()
+        velocity_yaw = delta_yaw[start - 1:].mean()
+
+        if history.shape[1] >= 3 and self.acceleration_weight:
+            acceleration_pitch = delta_pitch[-1] - delta_pitch[-2]
+            acceleration_yaw = self._wrapped_yaw_delta(
+                delta_yaw[-1], delta_yaw[-2]
+            )
+            velocity_pitch = (
+                velocity_pitch + self.acceleration_weight * acceleration_pitch
+            )
+            velocity_yaw = (
+                velocity_yaw + self.acceleration_weight * acceleration_yaw
+            )
+        speed = torch.sqrt(velocity_pitch.square() + velocity_yaw.square())
+        return velocity_pitch, velocity_yaw, speed
+
+    def current_index(self, history_viewports):
+        """Return the latest viewport cell without applying a gating policy."""
+        history = history_viewports.float()
+        _, _, row, col = self._current_cell(history)
+        return (row * self.grid_cols + col).reshape(1)
+
     def select_indices(self, history_viewports):
-        """Return selected row-major patch indices for a batch-size-one history."""
+        """Return selected row-major patch indices for a batch-size-one history.
+
+        Gated policies may deliberately return an empty tensor.  The caller then
+        omits the visual token, which is the only selector path that reduces the
+        LLM prompt length relative to the original one-CLS-token baseline.
+        """
         if history_viewports.ndim != 3 or history_viewports.shape[-1] != 3:
             raise ValueError("history_viewports must have shape (B, T, 3)")
         if history_viewports.shape[0] != 1:
@@ -47,30 +104,38 @@ class CachedViewportPatchSelector(nn.Module):
             raise ValueError("history_viewports must contain at least one timestep")
 
         history = history_viewports.float()
-        pitch = (history[0, -1, 1] * 90.0).clamp(-90.0, 90.0)
-        yaw = torch.remainder(history[0, -1, 2] * 180.0 + 180.0, 360.0) - 180.0
-        row = torch.floor((90.0 - pitch) / (180.0 / self.grid_rows)).long()
-        col = torch.floor((yaw + 180.0) / (360.0 / self.grid_cols)).long()
-        row = row.clamp(0, self.grid_rows - 1)
-        col = torch.remainder(col, self.grid_cols)
+        pitch, yaw, row, col = self._current_cell(history)
         current = row * self.grid_cols + col
 
         if self.policy == "k1":
             return current.reshape(1)
 
-        if history.shape[1] >= 2:
-            previous_pitch = history[0, -2, 1] * 90.0
-            previous_yaw = history[0, -2, 2] * 180.0
-            delta_pitch = pitch - previous_pitch
-            delta_yaw = self._wrapped_yaw_delta(yaw, previous_yaw)
-        else:
-            delta_pitch = torch.zeros_like(pitch)
-            delta_yaw = torch.zeros_like(yaw)
-
-        speed = torch.sqrt(delta_pitch.square() + delta_yaw.square())
+        delta_pitch, delta_yaw, speed = self._motion(history)
+        if self.policy in ("gated-k1", "gated-adaptive") and bool(
+            (speed < self.motion_threshold_deg).item()
+        ):
+            return torch.empty(0, dtype=torch.long, device=history.device)
+        if self.policy == "gated-k1":
+            return current.reshape(1)
         if (self.policy == "adaptive"
                 and bool((speed < self.motion_threshold_deg).item())):
             return current.reshape(1)
+        if (self.policy == "gated-adaptive"
+                and bool((speed < (self.motion_threshold_deg
+                                   * self.rapid_motion_multiplier)).item())):
+            return current.reshape(1)
+
+        if self.policy == "cross":
+            neighbours = [current]
+            if row > 0:
+                neighbours.append((row - 1) * self.grid_cols + col)
+            if row < self.grid_rows - 1:
+                neighbours.append((row + 1) * self.grid_cols + col)
+            neighbours.extend((
+                row * self.grid_cols + torch.remainder(col - 1, self.grid_cols),
+                row * self.grid_cols + torch.remainder(col + 1, self.grid_cols),
+            ))
+            return torch.stack(neighbours)
 
         # Compare displacement in grid-cell units so horizontal and vertical
         # directions are treated consistently on non-square equirectangular grids.
@@ -106,6 +171,9 @@ class CachedViewportPatchSelector(nn.Module):
             "grid_rows": self.grid_rows,
             "grid_cols": self.grid_cols,
             "motion_threshold_deg": self.motion_threshold_deg,
+            "motion_history_window": self.motion_history_window,
+            "acceleration_weight": self.acceleration_weight,
+            "rapid_motion_multiplier": self.rapid_motion_multiplier,
         }
 
 

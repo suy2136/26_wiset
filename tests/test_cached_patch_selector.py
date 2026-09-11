@@ -62,14 +62,56 @@ class CachedPatchSelectorTest(unittest.TestCase):
             )
             pipeline.cached_patch_feature_store = store
             pipeline.patch_selection_history = []
+            pipeline.cached_patch_visual_token_history = []
+            pipeline.cached_patch_projector_cache = False
+            pipeline.cached_patch_projector_cache_max_entries = 8
+            pipeline.cached_patch_refresh_interval = 1
+            pipeline.cached_patch_max_skip_calls = 0
+            pipeline._cached_patch_projected = {}
+            pipeline._cached_patch_stream_tokens = {}
+            pipeline._cached_patch_skip_streaks = {}
+            pipeline.cached_patch_runtime_stats = {
+                "projector_cache_hits": 0,
+                "projector_cache_misses": 0,
+                "refresh_reuses": 0,
+                "forced_visual_tokens": 0,
+            }
             pipeline.embed_multimodal = nn.Linear(768, 8)
             pipeline._resolve_frame_index = lambda _: (4, 1)
             output = pipeline._get_multimodal_information_cached_patch_selection(
-                None,
+                (torch.tensor(4), torch.tensor(1), torch.tensor(1)),
                 torch.zeros(1, 2, 3),
             )
             self.assertEqual(tuple(output.shape), (1, 1, 8))
             self.assertEqual(pipeline.patch_selection_history, [2])
+
+    def test_gated_selector_omits_static_visual_token(self):
+        selector = CachedViewportPatchSelector(
+            policy="gated-k1", motion_threshold_deg=3.0
+        )
+        static = torch.zeros(1, 3, 3)
+        moving = static.clone()
+        moving[0, -1, 2] = 6.0 / 180.0
+        self.assertEqual(selector.select_indices(static).numel(), 0)
+        self.assertEqual(selector.select_indices(moving).numel(), 1)
+
+    def test_history_smoothing_rejects_single_reversed_delta(self):
+        selector = CachedViewportPatchSelector(
+            policy="adaptive", motion_threshold_deg=8.0,
+            motion_history_window=3,
+        )
+        history = torch.zeros(1, 4, 3)
+        history[0, :, 2] = torch.tensor([0.0, 10.0, 20.0, 15.0]) / 180.0
+        # Mean speed is 5 degrees, so adaptive remains at K=1 even though the
+        # latest absolute delta alone is also directionally reversed.
+        self.assertEqual(selector.select_indices(history).numel(), 1)
+
+    def test_cross_policy_keeps_current_and_grid_neighbours(self):
+        selector = CachedViewportPatchSelector(policy="cross")
+        history = torch.zeros(1, 2, 3)
+        indices = selector.select_indices(history)
+        self.assertEqual(indices.numel(), 5)
+        self.assertEqual(len(set(indices.tolist())), 5)
 
     def test_evaluation_command_uses_cache_preload_and_one_policy(self):
         args = argparse.Namespace(
