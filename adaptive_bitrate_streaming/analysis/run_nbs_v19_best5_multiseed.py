@@ -1,4 +1,4 @@
-"""Run/aggregate the ABR best-five inference matrix over data seeds 1, 2, 3.
+"""Run/aggregate the ABR best-five inference matrix over evaluation seeds.
 
 An existing seed-1 CSV is reused when available. Missing seeds are evaluated
 with the same checkpoint and feature settings, and both per-seed records and
@@ -64,6 +64,34 @@ def read_rows(path, data_seed):
         row["data_seed"] = data_seed
         row["seed_results_path"] = str(path.resolve())
     return rows
+
+
+def resolved_path(value):
+    return Path(value).expanduser().resolve()
+
+
+def validate_reusable_rows(rows, args, data_seed):
+    expected_checkpoint = resolved_path(args.checkpoint_dir)
+    checkpoints = {
+        resolved_path(row["checkpoint_dir"])
+        for row in rows if row.get("checkpoint_dir")
+    }
+    if checkpoints != {expected_checkpoint}:
+        found = ", ".join(sorted(str(path) for path in checkpoints)) or "missing"
+        raise ValueError(
+            f"seed {data_seed} result checkpoint mismatch: expected "
+            f"{expected_checkpoint}, found {found}"
+        )
+    for row in rows:
+        if int(float(row.get("rank_budget", -1))) != args.rank_budget:
+            raise ValueError(f"seed {data_seed} result rank-budget mismatch")
+        if int(float(row.get("physical_rank", -1))) != args.physical_rank:
+            raise ValueError(f"seed {data_seed} result physical-rank mismatch")
+    return rows
+
+
+def load_reusable_rows(path, args, data_seed):
+    return validate_reusable_rows(read_rows(path, data_seed), args, data_seed)
 
 
 def finite_float(value):
@@ -190,7 +218,14 @@ def parse_args(argv=None):
     parser.add_argument("--trace-num", type=int, default=100)
     parser.add_argument("--video", default="video1")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--data-seeds", nargs="+", type=int, default=[1, 2, 3])
+    parser.add_argument(
+        "--evaluation-seeds", "--data-seeds", dest="data_seeds",
+        nargs="+", type=int, default=[1, 2, 3],
+        help=(
+            "inference sampling seeds; --data-seeds is retained as a "
+            "backward-compatible alias"
+        ),
+    )
     parser.add_argument("--seed1-results", type=Path, default=DEFAULT_SEED1_RESULTS)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--resume", action="store_true")
@@ -207,12 +242,21 @@ def main(argv=None):
     all_rows = []
     for data_seed in data_seeds:
         generated = args.output_dir / f"best5_seed_{data_seed}.csv"
-        source = (
-            args.seed1_results
-            if data_seed == 1 and args.seed1_results.is_file()
-            else generated
-        )
-        if source.is_file():
+        source = generated
+        rows = None
+        seed1_candidate = data_seed == 1 and args.seed1_results.is_file()
+        if seed1_candidate:
+            try:
+                rows = load_reusable_rows(args.seed1_results, args, data_seed)
+                source = args.seed1_results
+            except ValueError as exc:
+                print(
+                    f"[seed {data_seed}] not reusing incompatible result: {exc}",
+                    flush=True,
+                )
+        if rows is None and generated.is_file():
+            rows = load_reusable_rows(generated, args, data_seed)
+        if rows is not None:
             print(f"[seed {data_seed}] reusing {source.resolve()}", flush=True)
         else:
             command = seed_command(args, data_seed, generated)
@@ -221,8 +265,9 @@ def main(argv=None):
                 continue
             subprocess.run(command, cwd=ABR_ROOT, check=True)
             source = generated
+            rows = load_reusable_rows(source, args, data_seed)
         if not args.dry_run:
-            all_rows.extend(read_rows(source, data_seed))
+            all_rows.extend(rows)
             completed = sorted({int(row["data_seed"]) for row in all_rows})
             if set(completed) == set(data_seeds):
                 summaries = aggregate_rows(all_rows, data_seeds)

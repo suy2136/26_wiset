@@ -1,4 +1,5 @@
 import importlib.util
+import argparse
 from pathlib import Path
 import tempfile
 import unittest
@@ -41,6 +42,33 @@ class BestFiveMultiseedTest(unittest.TestCase):
             path.write_text("experiment,mean_reward\nnbs_compact_only,0.8\n")
             with self.assertRaises(ValueError):
                 multiseed.read_rows(path, 1)
+
+    def test_reuse_rejects_a_different_checkpoint(self):
+        rows = [{
+            "experiment": item["name"], "data_seed": 1,
+            "checkpoint_dir": str(Path("old-checkpoint").resolve()),
+            "rank_budget": "1536", "physical_rank": "32",
+        } for item in multiseed.best5.EXPERIMENTS]
+        args = argparse.Namespace(
+            checkpoint_dir=Path("c-checkpoint"), rank_budget=1536,
+            physical_rank=32,
+        )
+        with self.assertRaisesRegex(ValueError, "checkpoint mismatch"):
+            multiseed.validate_reusable_rows(rows, args, 1)
+
+    def test_reuse_accepts_matching_checkpoint(self):
+        checkpoint = Path("c-checkpoint").resolve()
+        rows = [{
+            "experiment": item["name"], "data_seed": 1,
+            "checkpoint_dir": str(checkpoint),
+            "rank_budget": "1536", "physical_rank": "32",
+        } for item in multiseed.best5.EXPERIMENTS]
+        args = argparse.Namespace(
+            checkpoint_dir=checkpoint, rank_budget=1536, physical_rank=32,
+        )
+        self.assertIs(
+            multiseed.validate_reusable_rows(rows, args, 1), rows
+        )
 
 
 if __name__ == "__main__":
