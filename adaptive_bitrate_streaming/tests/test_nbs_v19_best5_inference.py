@@ -17,6 +17,7 @@ def args():
         exp_pool_path=Path("pool.pkl"), rank_budget=1536, physical_rank=32,
         rank_config=Path("configs/nbs_v19_rank_config.json"),
         trace="fcc-test", trace_num=100, video="video1", device="cuda:0",
+        data_seed=2,
     )
 
 
@@ -41,7 +42,9 @@ class BestFiveInferenceTest(unittest.TestCase):
             token = bool(experiment.get("token"))
             speculative = bool(experiment.get("speculative"))
             self.assertIn("--nbs-compact-inference", command)
-            self.assertEqual(value(command, "--seed"), "1")
+            self.assertEqual(value(command, "--seed"), "2")
+            self.assertEqual(value(command, "--lora-seed"), "1")
+            self.assertEqual(value(command, "--data-seed"), "2")
             self.assertEqual(value(command, "--trace"), "fcc-test")
             self.assertEqual(value(command, "--trace-num"), "100")
             self.assertEqual(

@@ -65,7 +65,9 @@ def build_command(args, experiment):
     speculative = bool(experiment.get("speculative"))
     command = [
         sys.executable, "run_plm.py", "--test", "--nbs-v19", "--fp16",
-        "--seed", "1", "--plm-type", "llama", "--plm-size", "base",
+        "--seed", str(args.data_seed), "--lora-seed", "1",
+        "--data-seed", str(args.data_seed),
+        "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
         "--model-dir", str(args.checkpoint_dir.resolve()),
         "--exp-pool-path", str(args.exp_pool_path.resolve()),
@@ -203,6 +205,13 @@ def parse_args(argv=None):
     parser.add_argument("--trace-num", type=int, default=100)
     parser.add_argument("--video", default="video1")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--data-seed", type=int, default=1,
+        help=(
+            "evaluation replicate seed; controls inference randomness and is "
+            "also recorded as the data seed (the checkpoint LoRA seed stays 1)"
+        ),
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--only", nargs="*", choices=[item["name"] for item in EXPERIMENTS]
@@ -237,7 +246,8 @@ def main(argv=None):
         "base_model_dir": str(args.base_model_dir.resolve()),
         "exp_pool_path": str(args.exp_pool_path.resolve()),
         "rank_budget": args.rank_budget, "physical_rank": args.physical_rank,
-        "rank_config": str(args.rank_config), "seed": 1,
+        "rank_config": str(args.rank_config), "seed": args.data_seed,
+        "lora_seed": 1, "data_seed": args.data_seed,
         "trace": args.trace, "trace_num": args.trace_num, "video": args.video,
         "experiments": [item["name"] for item in EXPERIMENTS],
     }
@@ -259,6 +269,7 @@ def main(argv=None):
             "checkpoint_dir": str(args.checkpoint_dir.resolve()),
             "rank_budget": args.rank_budget,
             "physical_rank": args.physical_rank,
+            "data_seed": args.data_seed,
             "configured_temporal": bool(experiment.get("temporal")),
             "configured_token": bool(experiment.get("token")),
             "configured_speculative": bool(experiment.get("speculative")),
