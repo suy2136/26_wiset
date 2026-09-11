@@ -27,6 +27,11 @@ class Config:
         'Jin2022':  _base_dir + 'data/images/Jin2022_images_features',
         'Wu2017':  _base_dir + 'data/images/Wu2017images/features'
     }
+    dataset_patch_features = {
+        # Offline ViT features for every 4x4 frame patch.  Unlike
+        # dataset_image_features, each frame stores 16 CLS embeddings.
+        'Jin2022': _base_dir + 'data/images/Jin2022_patch_features',
+    }
     dataset_image_ext = {
         'Jin2022': 'jpg',
         'Wu2017': 'png'

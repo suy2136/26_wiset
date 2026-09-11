@@ -8,10 +8,14 @@ from transformers.utils.dummy_pt_objects import PreTrainedModel
 from config import cfg
 from dataset.extract_features import extract_vit_features
 from models.patch_selection import PatchSelectionModule, crop_patches, crop_patches_at, vit_features_for_patches
+from models.cached_patch_selector import CachedPatchFeatureStore
 from utils.frame_utils import FrameIndexClamper
 from utils.losses import CircularViewportMSELoss
 
-MULTIMODAL_MODES = ('none', 'baseline', 'all-patch', 'patch-selection')
+MULTIMODAL_MODES = (
+    'none', 'baseline', 'all-patch', 'patch-selection',
+    'cached-patch-selection',
+)
 
 
 class Pipeline(nn.Module):
@@ -33,6 +37,8 @@ class Pipeline(nn.Module):
                 patch_grid = None,
                 patch_top_k = None,
                 patch_threshold = None,
+                cached_patch_features_dir = None,
+                cached_patch_cache_device = 'cpu',
                 ):
         """
         :param plm: the pretrained llm
@@ -49,6 +55,8 @@ class Pipeline(nn.Module):
               ViT, each patch fed as its own token (no pooling)
             - 'patch-selection': patch_selection_module picks a subset of patches from the
               historical viewport, only those patches run through the frozen ViT
+            - 'cached-patch-selection': a constant-time viewport selector gathers offline
+              ViT patch features and pools them into exactly one visual token
         :param patch_selection_module: required (or lazily created, untrained) for
             multimodal_mode='patch-selection'
         :param vit_model: frozen ViT feature extractor for 'all-patch'/'patch-selection' modes;
@@ -91,6 +99,7 @@ class Pipeline(nn.Module):
         self.patch_selection_module = patch_selection_module
         self.vit_model = vit_model
         self._patch_image_cache = {}
+        self.cached_patch_feature_store = None
         # one entry appended per _get_multimodal_information_patch_selection() call (i.e.
         # per sample, in 'patch-selection' mode only) -- lets callers report how many
         # patches actually got selected (meaningful for threshold selection; constant for
@@ -120,6 +129,21 @@ class Pipeline(nn.Module):
                   'creating a fresh (UNTRAINED) one. Pretrain it separately before real runs.')
             self.patch_selection_module = PatchSelectionModule(
                 grid_rows=self.grid_rows, grid_cols=self.grid_cols).to(device)
+
+        if self.multimodal_mode == 'cached-patch-selection':
+            if self.patch_selection_module is None:
+                raise ValueError(
+                    "cached-patch-selection requires CachedViewportPatchSelector"
+                )
+            if not cached_patch_features_dir:
+                raise ValueError(
+                    "cached-patch-selection requires cached_patch_features_dir"
+                )
+            self.cached_patch_feature_store = CachedPatchFeatureStore(
+                cached_patch_features_dir,
+                device=cached_patch_cache_device,
+                expected_patches=self.grid_rows * self.grid_cols,
+            )
 
         if loss_func is None:
             loss_func = CircularViewportMSELoss()
@@ -374,10 +398,11 @@ class Pipeline(nn.Module):
         - 'all-patch': all patch_grid patches of the frame, each through a frozen ViT
         - 'patch-selection': only the patches picked by self.patch_selection_module from
           history_viewports, each through a frozen ViT
+        - 'cached-patch-selection': cached K1/K2 features pooled into one visual token
 
         :param video_user_position: details information for current trajectory
         :param history_viewports: (B, his_window, 3) raw historical viewport trajectory,
-            required for 'patch-selection'
+            required for both patch-selection modes
         :return: (1, num_tokens, embed_size) tensor of image tokens
         """
         if self.multimodal_mode == 'baseline':
@@ -388,6 +413,14 @@ class Pipeline(nn.Module):
             if history_viewports is None:
                 raise ValueError("multimodal_mode='patch-selection' requires history_viewports")
             return self._get_multimodal_information_patch_selection(video_user_position, history_viewports)
+        elif self.multimodal_mode == 'cached-patch-selection':
+            if history_viewports is None:
+                raise ValueError(
+                    "cached-patch-selection requires history_viewports"
+                )
+            return self._get_multimodal_information_cached_patch_selection(
+                video_user_position, history_viewports
+            )
         else:
             raise ValueError(f'unsupported multimodal_mode: {self.multimodal_mode}')
 
@@ -482,3 +515,25 @@ class Pipeline(nn.Module):
         features = vit_features_for_patches(patches, range(len(indices)), self._vit_feature_fn, device=self.device)
         mapped_tensor = self.embed_multimodal(features)  # (len(indices), embed_size)
         return mapped_tensor.unsqueeze(0)  # (1, len(indices), embed_size)
+
+    def _get_multimodal_information_cached_patch_selection(
+            self, video_user_position, history_viewports):
+        """Gather cached patch features and pool them into one visual token."""
+        video_index, image_index = self._resolve_frame_index(video_user_position)
+        with torch.no_grad():
+            indices = self.patch_selection_module.select_indices(
+                history_viewports.to(self.device)
+            )
+            features = self.cached_patch_feature_store.get(
+                video_index, image_index, indices
+            )
+        self.patch_selection_history.append(int(indices.numel()))
+        # Pool before projection. Linear(mean(x)) == mean(Linear(x)), while this
+        # performs only one 768->LLM projection and always contributes one token.
+        pooled = features.float().mean(dim=0, keepdim=True).to(self.device)
+        return self.embed_multimodal(pooled).unsqueeze(0)
+
+    def preload_cached_patch_features(self, video_indices):
+        if self.cached_patch_feature_store is None:
+            return
+        self.cached_patch_feature_store.preload(video_indices)

@@ -25,6 +25,7 @@ from torch.utils.data import DataLoader
 from models.pipeline import Pipeline
 from models.patch_selection import PatchSelectionModule
 from models.kinematic_patch_selector import KinematicPatchSelector
+from models.cached_patch_selector import CachedViewportPatchSelector
 from models.selectable_pipeline import LlamaSelectablePipeline
 from models.selectors import RecentKSelector
 from models.speculative_pipeline import LlamaSpeculativeBlockVerifyPipeline
@@ -1071,7 +1072,7 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
         validation_started = time.perf_counter()
         pipeline.eval()
         with torch.no_grad():
-            ps_history_start = len(pipeline.patch_selection_history) if args.multimodal_mode == 'patch-selection' else None
+            ps_history_start = len(pipeline.patch_selection_history) if args.multimodal_mode in ('patch-selection', 'cached-patch-selection') else None
             autoregressive_losses = []
             teacher_forcing_losses = []
             for history, future, video_user_info in dataloader_valid:
@@ -1755,6 +1756,16 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                 equivalence['full_output_validation']['max_rel_error'],
             )
         )
+    if (args.multimodal_mode == 'cached-patch-selection'
+            and args.cached_patch_preload):
+        preload_videos = cfg.dataset_video_split[args.test_dataset][
+            args.evaluation_split
+        ]
+        pipeline.preload_cached_patch_features(preload_videos)
+        print(
+            '[cached-patch-selection] preloaded videos outside latency timing:',
+            preload_videos,
+        )
     if args.speculative_gamma is not None:
         selector = (
             RecentKSelector(k=args.selector_recent_k)
@@ -1906,6 +1917,29 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
                         latency_summary['measured_calls'],
                     )
                 )
+        if args.multimodal_mode == 'cached-patch-selection':
+            counts = pipeline.patch_selection_history
+            stats = {
+                'policy': args.cached_patch_policy,
+                'motion_threshold_deg': args.cached_patch_motion_threshold_deg,
+                'calls': len(counts),
+                'selected_patches_mean': (
+                    sum(counts) / len(counts) if counts else None
+                ),
+                'selected_patches_min': min(counts) if counts else None,
+                'selected_patches_max': max(counts) if counts else None,
+                'one_patch_calls': sum(count == 1 for count in counts),
+                'two_patch_calls': sum(count == 2 for count in counts),
+                'visual_tokens_per_call': 1,
+            }
+            stats_path = (
+                args.cached_patch_stats_output_path
+                or os.path.join(results_dir, 'cached_patch_selector_stats.json')
+            )
+            os.makedirs(os.path.dirname(os.path.abspath(stats_path)), exist_ok=True)
+            with open(stats_path, 'w', encoding='utf-8') as handle:
+                json.dump(stats, handle, indent=2)
+            print('Cached patch selector statistics saved at', stats_path)
 
 
 def run(args):
@@ -2186,11 +2220,34 @@ def run(args):
             else:
                 print('\033[33mWarning:\033[0m --multimodal-mode patch-selection was set without --patch-selection-weights; '
                       'using a freshly-initialized (UNTRAINED) patch selection module.')
+    elif args.multimodal_mode == 'cached-patch-selection':
+        patch_selection_module = CachedViewportPatchSelector(
+            policy=args.cached_patch_policy,
+            grid_rows=cfg.default_patch_grid[0],
+            grid_cols=cfg.default_patch_grid[1],
+            motion_threshold_deg=args.cached_patch_motion_threshold_deg,
+        ).to(args.device)
+        print(
+            'Cached viewport patch selector:',
+            patch_selection_module.configuration(),
+        )
+
+    cached_patch_features_dir = (
+        args.cached_patch_features_dir
+        or cfg.dataset_patch_features.get(args.train_dataset)
+    )
+    cached_patch_cache_device = (
+        args.device
+        if args.cached_patch_cache_device == 'model'
+        else args.cached_patch_cache_device
+    )
 
     pipeline = Pipeline(plm, fut_window=args.fut_window, device=args.device, embed_size=embed_size, frequency=args.dataset_frequency,
                          multimodal_mode=args.multimodal_mode, dataset=args.train_dataset,
                          patch_selection_module=patch_selection_module,
-                         patch_top_k=args.patch_top_k, patch_threshold=args.patch_threshold)
+                         patch_top_k=args.patch_top_k, patch_threshold=args.patch_threshold,
+                         cached_patch_features_dir=cached_patch_features_dir,
+                         cached_patch_cache_device=cached_patch_cache_device)
     # print_trainable_parameters(pipeline)
 
     if args.compile:
@@ -2356,10 +2413,11 @@ if __name__ == '__main__':
         help='Dataset/DataLoader ordering seed. Defaults to --seed for compatibility.',
     )
     parser.add_argument('--multimodal', action="store_true", dest='using_multimodal', help='(deprecated) using multimodal image features; equivalent to --multimodal-mode baseline.')
-    parser.add_argument('--multimodal-mode', action='store', dest='multimodal_mode', choices=['baseline', 'all-patch', 'patch-selection'],
+    parser.add_argument('--multimodal-mode', action='store', dest='multimodal_mode', choices=['baseline', 'all-patch', 'patch-selection', 'cached-patch-selection'],
                         help="(Optional) Multimodal mode: 'baseline' (single cached ViT CLS-token feature per frame), "
                              "'all-patch' (all patch-grid patches through frozen ViT), or "
                              "'patch-selection' (patch_selection module picks a subset of patches). "
+                             "'cached-patch-selection' uses offline patch features and one pooled visual token. "
                              "Defaults to 'baseline' if --multimodal is set, otherwise no multimodal features are used.")
     parser.add_argument('--patch-top-k', action='store', dest='patch_top_k', type=int,
                         help='(Optional) For --multimodal-mode patch-selection: select exactly this many patches per frame.')
@@ -2381,6 +2439,31 @@ if __name__ == '__main__':
     parser.add_argument('--kinematic-horizontal-fov-deg', type=float, default=110.0)
     parser.add_argument('--kinematic-vertical-fov-deg', type=float, default=90.0)
     parser.add_argument('--kinematic-prediction-points', type=int, default=5)
+    parser.add_argument(
+        '--cached-patch-policy', choices=['k1', 'adaptive', 'k2'],
+        default='adaptive',
+        help='Selection rule for --multimodal-mode cached-patch-selection.',
+    )
+    parser.add_argument(
+        '--cached-patch-motion-threshold-deg', type=float, default=12.0,
+        help='One-step angular-motion threshold at which adaptive policy uses K=2.',
+    )
+    parser.add_argument(
+        '--cached-patch-features-dir', type=str, default=None,
+        help='Directory produced by dataset.extract_patch_features_cache.',
+    )
+    parser.add_argument(
+        '--cached-patch-cache-device', default='model',
+        help="Device for precomputed patch tensors; 'model' uses --device.",
+    )
+    parser.add_argument(
+        '--cached-patch-preload', action='store_true',
+        help='Preload evaluation-split patch tensors before latency measurement.',
+    )
+    parser.add_argument(
+        '--cached-patch-stats-output-path', type=str, default=None,
+        help='Optional JSON output path for cached selector usage statistics.',
+    )
     parser.add_argument(
         '--multimodal-projector-checkpoint', type=str, default=None,
         help=(
@@ -2692,6 +2775,18 @@ if __name__ == '__main__':
             parser.error('kinematic uncertainty values must be non-negative')
         if args.kinematic_prediction_points <= 0:
             parser.error('--kinematic-prediction-points must be positive')
+    if args.cached_patch_motion_threshold_deg < 0:
+        parser.error('--cached-patch-motion-threshold-deg must be non-negative')
+    if args.multimodal_mode == 'cached-patch-selection':
+        if args.train_patch_selector_only:
+            parser.error('cached patch selectors are evaluation-only')
+        if args.patch_selection_weights:
+            parser.error('cached patch selectors do not use selector weights')
+    elif args.cached_patch_preload:
+        parser.error(
+            '--cached-patch-preload requires '
+            '--multimodal-mode cached-patch-selection'
+        )
     if args.patch_selector_bce_weight < 0:
         parser.error('--patch-selector-bce-weight must be non-negative')
     if args.patch_selector_st_temperature <= 0:
