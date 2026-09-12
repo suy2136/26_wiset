@@ -21,6 +21,7 @@ from analysis.evaluate_cached_patch_selectors_compact import (
     run_case,
     write_rows,
 )
+from analysis.evaluate_cached_patch_followups_compact import selector_command
 from analysis.evaluate_vp_fixed_spec_patch_token_sweep import (
     SPEC_GAMMA,
     SPEC_THRESHOLD,
@@ -29,6 +30,8 @@ from analysis.evaluate_vp_fixed_spec_patch_token_sweep import (
 from analysis.evaluate_vp_inference_module_pipeline import (
     finite,
     set_option,
+    speculative_command,
+    token_command,
     trace_metrics,
     write_json,
 )
@@ -36,6 +39,7 @@ from analysis.evaluate_vp_inference_module_pipeline import (
 
 SEEDS = (1, 2, 3)
 QUALITY_CASE = "full_gated_k1_t6_skip0_cache_token_k8_spec_g6_t0p4"
+PATCH_CASE = "patch_gated_k1_t6_skip0_cache"
 QUALITY_PATCH = {
     "policy": "gated-k1",
     "threshold": 6.0,
@@ -43,6 +47,33 @@ QUALITY_PATCH = {
     "projector_cache": True,
 }
 TOKEN_K = 8
+CONFIGURATIONS = (
+    {
+        "case": "pure_nbs_compact", "family": "baseline",
+        "label": "NBS compact only", "kind": "baseline",
+        "seed1_source": "compact",
+    },
+    {
+        "case": PATCH_CASE, "family": "patch",
+        "label": "+ Patch gated-k1/T6/skip0/cache", "kind": "patch",
+        "seed1_source": None,
+    },
+    {
+        "case": "token_recent_k8", "family": "token",
+        "label": "+ Token K=8", "kind": "token",
+        "seed1_source": "compact",
+    },
+    {
+        "case": "spec_g6_t0p4", "family": "speculative",
+        "label": "+ Spec G=6/T=0.4", "kind": "speculative",
+        "seed1_source": "compact",
+    },
+    {
+        "case": QUALITY_CASE, "family": "full_stack",
+        "label": "+ Patch + Token + Spec", "kind": "full_stack",
+        "seed1_source": "fixed",
+    },
+)
 
 
 def parser():
@@ -67,14 +98,24 @@ def load_csv(path):
         return list(csv.DictReader(stream))
 
 
-def seed1_row(args, case, family, label):
-    source = args.seed1_run_dir / "fixed_spec_patch_token_sweep.csv"
+def seed1_row(args, config):
+    source_kind = config["seed1_source"]
+    if source_kind is None:
+        return None
+    source = (
+        args.compact_run_dir / "vp_module_sweep_results.csv"
+        if source_kind == "compact"
+        else args.seed1_run_dir / "fixed_spec_patch_token_sweep.csv"
+    )
     matches = [
         row for row in load_csv(source)
-        if row.get("case") == case and row.get("status") == "complete"
+        if row.get("case") == config["case"]
+        and row.get("status") == "complete"
     ]
     if len(matches) != 1:
-        raise ValueError(f"seed-1 source must contain one complete {case}")
+        raise ValueError(
+            f"seed-1 source must contain one complete {config['case']}: {source}"
+        )
     row = dict(matches[0])
     for key in (
         "mae", "rmse", "latency_mean_ms", "latency_p50_ms",
@@ -84,9 +125,9 @@ def seed1_row(args, case, family, label):
         if value is not None:
             row[key] = value
     row.update({
-        "case": case,
-        "family": family,
-        "label": label,
+        "case": config["case"],
+        "family": config["family"],
+        "label": config["label"],
         "evaluation_seed": 1,
         "source": "reused_seed1",
         "status": "complete",
@@ -109,9 +150,12 @@ def validate_inputs(args):
         path = args.cache_dir / f"video{video}_patch_features.pt"
         if not path.is_file():
             raise FileNotFoundError(f"test-video patch cache absent: {path}")
-    source = args.seed1_run_dir / "fixed_spec_patch_token_sweep.csv"
-    if not source.is_file():
-        raise FileNotFoundError(f"seed-1 result absent: {source}")
+    for source in (
+        args.seed1_run_dir / "fixed_spec_patch_token_sweep.csv",
+        args.compact_run_dir / "vp_module_sweep_results.csv",
+    ):
+        if not source.is_file():
+            raise FileNotFoundError(f"seed-1 result absent: {source}")
     return compact
 
 
@@ -122,15 +166,25 @@ def apply_evaluation_seed(command, seed):
     return command
 
 
-def baseline_command(args, compact, result_dir, seed):
-    command = common_command(args, compact, result_dir)
-    return apply_evaluation_seed(command, seed)
-
-
-def quality_command(args, compact, result_dir, seed):
-    command = full_stack_command(
-        args, compact, result_dir, QUALITY_PATCH, TOKEN_K
-    )
+def evaluation_command(args, compact, result_dir, seed, kind):
+    if kind == "baseline":
+        command = common_command(args, compact, result_dir)
+    elif kind == "patch":
+        command = selector_command(
+            args, compact, result_dir, QUALITY_PATCH
+        )
+    elif kind == "token":
+        command = token_command(args, compact, result_dir, TOKEN_K)
+    elif kind == "speculative":
+        command = speculative_command(
+            args, compact, result_dir, SPEC_GAMMA, SPEC_THRESHOLD
+        )
+    elif kind == "full_stack":
+        command = full_stack_command(
+            args, compact, result_dir, QUALITY_PATCH, TOKEN_K
+        )
+    else:
+        raise ValueError(f"unknown evaluation kind: {kind}")
     return apply_evaluation_seed(command, seed)
 
 
@@ -165,7 +219,8 @@ def run_one(args, case, family, label, seed, command):
 
 def summarize(rows):
     output = []
-    for case in ("pure_nbs_compact", QUALITY_CASE):
+    for config in CONFIGURATIONS:
+        case = config["case"]
         selected = [
             row for row in rows
             if row["case"] == case and row["status"] == "complete"
@@ -174,7 +229,7 @@ def summarize(rows):
             raise RuntimeError(f"{case} does not have complete seeds 1, 2, 3")
         item = {
             "case": case,
-            "label": selected[0]["label"],
+            "label": config["label"],
             "seed_count": len(selected),
             "evaluation_seeds": "1,2,3",
         }
@@ -187,16 +242,15 @@ def summarize(rows):
             item[f"{target}_mean"] = statistics.mean(values)
             item[f"{target}_std"] = statistics.stdev(values)
         output.append(item)
-    baseline, quality = output
-    quality["mae_change_percent_vs_nbs"] = (
-        quality["mae_mean"] / baseline["mae_mean"] - 1.0
-    ) * 100.0
-    quality["latency_reduction_percent_vs_nbs"] = (
-        1.0 - quality["latency_mean_ms_mean"]
-        / baseline["latency_mean_ms_mean"]
-    ) * 100.0
-    baseline["mae_change_percent_vs_nbs"] = 0.0
-    baseline["latency_reduction_percent_vs_nbs"] = 0.0
+    baseline = output[0]
+    for item in output:
+        item["mae_change_percent_vs_nbs"] = (
+            item["mae_mean"] / baseline["mae_mean"] - 1.0
+        ) * 100.0
+        item["latency_reduction_percent_vs_nbs"] = (
+            1.0 - item["latency_mean_ms_mean"]
+            / baseline["latency_mean_ms_mean"]
+        ) * 100.0
     return output
 
 
@@ -209,7 +263,7 @@ def plot_summary(rows, output):
         print("matplotlib unavailable; skipped summary PNG", flush=True)
         return
     labels = [row["label"] for row in rows]
-    colors = ["#3274B4", "#7554B8"]
+    colors = ["#3274B4", "#4B9B69", "#DF9F2D", "#B65A6A", "#7554B8"]
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.6))
     axes[0].barh(
         labels, [row["mae_mean"] for row in rows],
@@ -226,7 +280,7 @@ def plot_summary(rows, output):
     axes[1].invert_yaxis()
     axes[1].set_title("3-seed mean inference latency")
     axes[1].set_xlabel("Milliseconds, mean +/- sample std")
-    fig.suptitle("NBS compact vs quality-first fixed-spec full stack")
+    fig.suptitle("VP inference-module ablation: 3-seed mean")
     fig.tight_layout()
     fig.savefig(output, dpi=180, bbox_inches="tight")
     plt.close(fig)
@@ -242,10 +296,12 @@ def write_manifest(args):
         "evaluation_seeds": list(SEEDS),
         "lora_seed": 1,
         "quality_case": QUALITY_CASE,
+        "patch_case": PATCH_CASE,
         "patch": QUALITY_PATCH,
         "token_k": TOKEN_K,
         "spec_gamma": SPEC_GAMMA,
         "spec_threshold": SPEC_THRESHOLD,
+        "configurations": CONFIGURATIONS,
     }
     if path.is_file() and args.resume:
         old = json.loads(path.read_text(encoding="utf-8"))
@@ -269,25 +325,31 @@ def main(argv=None):
         compact = validate_inputs(args)
         write_manifest(args)
         rows = [
-            seed1_row(args, "pure_nbs_compact", "baseline", "NBS compact only"),
-            seed1_row(args, QUALITY_CASE, "full_stack", "Quality-first full stack"),
+            row for row in (seed1_row(args, config) for config in CONFIGURATIONS)
+            if row is not None
         ]
     else:
         rows = []
 
-    configurations = (
-        ("pure_nbs_compact", "baseline", "NBS compact only", baseline_command),
-        (QUALITY_CASE, "full_stack", "Quality-first full stack", quality_command),
-    )
-    for seed in (2, 3):
-        for case, family, label, builder in configurations:
+    for seed in SEEDS:
+        for config in CONFIGURATIONS:
+            if seed == 1 and config["seed1_source"] is not None:
+                continue
+            case, family, label = (
+                config["case"], config["family"], config["label"]
+            )
             result_dir = args.output_dir / f"seed_{seed}" / case
-            command = builder(args, compact, result_dir, seed)
+            command = evaluation_command(
+                args, compact, result_dir, seed, config["kind"]
+            )
             rows.append(run_one(args, case, family, label, seed, command))
             if not args.dry_run:
                 write_rows(args.output_dir / "per_seed_results.csv", rows)
     if args.dry_run:
-        print("Dry run: 4 evaluations (2 cases x seeds 2,3)", flush=True)
+        print(
+            "Dry run: 11 evaluations (Patch seeds 1,2,3; four other "
+            "cases seeds 2,3)", flush=True,
+        )
         return
 
     failed = [

@@ -24,6 +24,7 @@ def args():
 class VPFixedSpecQualityMultiseedTest(unittest.TestCase):
     def test_exact_quality_configuration(self):
         self.assertEqual(module.SEEDS, (1, 2, 3))
+        self.assertEqual(len(module.CONFIGURATIONS), 5)
         self.assertEqual(module.TOKEN_K, 8)
         self.assertEqual(module.SPEC_GAMMA, 6)
         self.assertEqual(module.SPEC_THRESHOLD, 0.4)
@@ -33,11 +34,11 @@ class VPFixedSpecQualityMultiseedTest(unittest.TestCase):
         })
 
     def test_commands_keep_lora_seed_and_change_evaluation_seed(self):
-        baseline = module.baseline_command(
-            args(), Path("compact"), Path("result"), 3
+        baseline = module.evaluation_command(
+            args(), Path("compact"), Path("result"), 3, "baseline"
         )
-        quality = module.quality_command(
-            args(), Path("compact"), Path("result"), 2
+        quality = module.evaluation_command(
+            args(), Path("compact"), Path("result"), 2, "full_stack"
         )
         for command, seed in ((baseline, "3"), (quality, "2")):
             self.assertEqual(command[command.index("--seed") + 1], seed)
@@ -55,6 +56,23 @@ class VPFixedSpecQualityMultiseedTest(unittest.TestCase):
         )
         self.assertEqual(quality[quality.index("--selector-recent-k") + 1], "8")
         self.assertEqual(quality[quality.index("--speculative-gamma") + 1], "6")
+
+    def test_independent_module_commands_are_actually_independent(self):
+        commands = {
+            kind: module.evaluation_command(
+                args(), Path("compact"), Path("result"), 2, kind
+            )
+            for kind in ("patch", "token", "speculative")
+        }
+        self.assertIn("--multimodal-mode", commands["patch"])
+        self.assertNotIn("--selector-recent-k", commands["patch"])
+        self.assertNotIn("--speculative-gamma", commands["patch"])
+        self.assertIn("--selector-recent-k", commands["token"])
+        self.assertNotIn("--multimodal-mode", commands["token"])
+        self.assertNotIn("--speculative-gamma", commands["token"])
+        self.assertIn("--speculative-gamma", commands["speculative"])
+        self.assertNotIn("--multimodal-mode", commands["speculative"])
+        self.assertNotIn("--selector-recent-k", commands["speculative"])
 
     def test_generated_tag_and_wrapper_contract_match_run_plm(self):
         tree = ast.parse((ROOT / "run_plm.py").read_text(encoding="utf-8"))
@@ -85,7 +103,8 @@ class VPFixedSpecQualityMultiseedTest(unittest.TestCase):
 
     def test_summary_uses_all_three_seeds(self):
         rows = []
-        for case in ("pure_nbs_compact", module.QUALITY_CASE):
+        for config in module.CONFIGURATIONS:
+            case = config["case"]
             for seed, mae, latency in ((1, 10.0, 100.0), (2, 11.0, 90.0), (3, 12.0, 80.0)):
                 rows.append({
                     "case": case, "label": case, "status": "complete",
@@ -93,7 +112,7 @@ class VPFixedSpecQualityMultiseedTest(unittest.TestCase):
                     "latency_mean_ms": latency,
                 })
         summary = module.summarize(rows)
-        self.assertEqual(len(summary), 2)
+        self.assertEqual(len(summary), 5)
         self.assertEqual(summary[0]["seed_count"], 3)
         self.assertEqual(summary[0]["mae_mean"], 11.0)
         self.assertEqual(summary[0]["latency_mean_ms_mean"], 90.0)
