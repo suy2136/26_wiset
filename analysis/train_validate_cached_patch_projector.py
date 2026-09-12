@@ -24,6 +24,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--device', default='cuda:0')
     result.add_argument('--rank-budget', type=int, default=512)
     result.add_argument('--physical-rank', type=int, default=32)
+    result.add_argument('--epochs', type=int, default=1)
     result.add_argument('--lr', type=float, default=5e-5)
     result.add_argument(
         '--policy',
@@ -99,7 +100,7 @@ def build_command(args) -> list[str]:
         str(args.validation_samples),
         '--multimodal-projector-validation-policy', args.validation_policy,
         '--multimodal-projector-log-every', str(args.log_every),
-        '--epochs', '1', '--bs', '1', '--grad-accum-steps', '1',
+        '--epochs', str(args.epochs), '--bs', '1', '--grad-accum-steps', '1',
         '--lr', str(args.lr), '--weight-decay', '0.0001',
         '--seed', '1', '--lora-seed', '1', '--data-seed', '1',
     ]
@@ -136,6 +137,8 @@ def main() -> None:
     args.projector_checkpoint = absolute(args.projector_checkpoint)
     args.cache_dir = absolute(args.cache_dir)
     args.output_dir = absolute(args.output_dir)
+    if args.epochs <= 0:
+        raise ValueError('--epochs must be positive')
     if not args.dry_run:
         require_checkpoint(args.nbs_checkpoint)
         if not args.projector_checkpoint.exists():

@@ -49,11 +49,12 @@ class CachedPatchProjectorTrainingTests(unittest.TestCase):
         self.assertTrue(all(not parameter.requires_grad
                             for parameter in model.other.parameters()))
 
-    def test_runner_is_one_epoch_and_disables_projector_cache(self):
+    def test_runner_accepts_explicit_epochs_and_disables_projector_cache(self):
         source = (ROOT / 'analysis' /
                   'train_validate_cached_patch_projector.py').read_text(
                       encoding='utf-8')
-        self.assertIn("'--epochs', '1'", source)
+        self.assertIn("'--epochs', str(args.epochs)", source)
+        self.assertIn("result.add_argument('--epochs'", source)
         self.assertIn("'--train-multimodal-projector-only'", source)
         self.assertNotIn("'--cached-patch-projector-cache'", source)
         self.assertIn("'--cached-patch-policy', args.policy", source)
@@ -61,6 +62,13 @@ class CachedPatchProjectorTrainingTests(unittest.TestCase):
         self.assertIn("'--multimodal-projector-validation-policy'", source)
         self.assertIn("default='cpu'", source)
         self.assertIn('TRAIN_VIDEOS + VALID_VIDEOS', source)
+
+    def test_training_tracks_best_validation_epoch(self):
+        source = (ROOT / 'run_plm.py').read_text(encoding='utf-8')
+        self.assertIn("for epoch in range(1, args.epochs + 1)", source)
+        self.assertIn("best_valid_mae = float('inf')", source)
+        self.assertIn("'is_best_valid_mae': int(is_best)", source)
+        self.assertIn("torch.save(projector_state, best_path)", source)
 
     def test_saved_projector_format_matches_loader_aliases(self):
         if torch is None:

@@ -526,8 +526,8 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
         )
     if args.bs != 1:
         raise ValueError('projector-only VP training currently requires --bs 1')
-    if args.epochs != 1:
-        raise ValueError('this guarded pipeline requires exactly --epochs 1')
+    if args.epochs <= 0:
+        raise ValueError('projector-only training requires positive --epochs')
 
     output_dir = os.path.abspath(args.multimodal_projector_output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -621,80 +621,99 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
         ),
         flush=True,
     )
-    clear_runtime_state()
-    total_loss = 0.0
-    total_samples = 0
-    optimized_samples = 0
-    skipped_no_visual = 0
-    for batch_index, (history, future, video_user_info) in enumerate(
-            dataloader_train, start=1):
-        history = normalize_data(history.to(args.device), args.train_dataset)
-        future = normalize_data(future.to(args.device), args.train_dataset)
-        optimizer.zero_grad(set_to_none=True)
-        loss = pipeline(history, future, video_user_info, teacher_forcing=True)
-        if not torch.isfinite(loss):
-            raise FloatingPointError(f'non-finite projector training loss: {loss}')
-        total_loss += float(loss.detach())
-        total_samples += 1
-        # Gated selectors may intentionally emit no visual token. Such a
-        # sample has no projector graph and therefore is not an update.
-        if not loss.requires_grad:
-            skipped_no_visual += 1
-            continue
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            projector.parameters(), 1.0, error_if_nonfinite=True
-        )
-        if not torch.isfinite(grad_norm):
-            raise FloatingPointError('non-finite projector gradient norm')
-        optimizer.step()
-        optimized_samples += 1
-        if (batch_index % args.multimodal_projector_log_every == 0
-                or batch_index == len(dataloader_train)):
-            print(
-                '[projector-only] train {}/{} mean_mse={:.6f} '
-                'optimized={} skipped-no-visual={}'.format(
-                    batch_index, len(dataloader_train),
-                    total_loss / total_samples, optimized_samples,
-                    skipped_no_visual,
-                ),
-                flush=True,
-            )
-    if total_samples == 0 or optimized_samples == 0:
-        raise ValueError(
-            'projector-only training had no usable cached-patch samples'
-        )
-
-    final_valid = run_validation()
-
-    projector_state = {
-        key: value.detach().cpu()
-        for key, value in projector.state_dict().items()
-    }
     best_path = os.path.join(output_dir, 'best_multimodal_projector.pth')
     latest_path = os.path.join(output_dir, 'latest_multimodal_projector.pth')
-    torch.save(projector_state, best_path)
-    torch.save(projector_state, latest_path)
-    row = {
-        'epoch': 1,
-        'train_mse': total_loss / total_samples,
-        'train_samples': total_samples,
-        'optimized_samples': optimized_samples,
-        'skipped_no_visual_samples': skipped_no_visual,
-        'initial_valid_mse': initial_valid['mse'],
-        'initial_valid_mae_deg': initial_valid['mae_deg'],
-        'valid_mse': final_valid['mse'],
-        'valid_mae_deg': final_valid['mae_deg'],
-        'valid_mae_delta_deg': (
-            final_valid['mae_deg'] - initial_valid['mae_deg']
-        ),
-        'valid_samples': final_valid['samples'],
-    }
     history_path = os.path.join(output_dir, 'projector_training_history.csv')
-    with open(history_path, 'w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row))
-        writer.writeheader()
-        writer.writerow(row)
+    history_rows = []
+    best_valid_mae = float('inf')
+    best_epoch = None
+    for epoch in range(1, args.epochs + 1):
+        clear_runtime_state()
+        total_loss = 0.0
+        total_samples = 0
+        optimized_samples = 0
+        skipped_no_visual = 0
+        for batch_index, (history, future, video_user_info) in enumerate(
+                dataloader_train, start=1):
+            history = normalize_data(history.to(args.device), args.train_dataset)
+            future = normalize_data(future.to(args.device), args.train_dataset)
+            optimizer.zero_grad(set_to_none=True)
+            loss = pipeline(history, future, video_user_info, teacher_forcing=True)
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f'non-finite projector training loss: {loss}'
+                )
+            total_loss += float(loss.detach())
+            total_samples += 1
+            if not loss.requires_grad:
+                skipped_no_visual += 1
+                continue
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                projector.parameters(), 1.0, error_if_nonfinite=True
+            )
+            if not torch.isfinite(grad_norm):
+                raise FloatingPointError('non-finite projector gradient norm')
+            optimizer.step()
+            optimized_samples += 1
+            if (batch_index % args.multimodal_projector_log_every == 0
+                    or batch_index == len(dataloader_train)):
+                print(
+                    '[projector-only] epoch {}/{} train {}/{} mean_mse={:.6f} '
+                    'optimized={} skipped-no-visual={}'.format(
+                        epoch, args.epochs, batch_index, len(dataloader_train),
+                        total_loss / total_samples, optimized_samples,
+                        skipped_no_visual,
+                    ),
+                    flush=True,
+                )
+        if total_samples == 0 or optimized_samples == 0:
+            raise ValueError(
+                'projector-only training had no usable cached-patch samples'
+            )
+
+        final_valid = run_validation()
+        projector_state = {
+            key: value.detach().cpu()
+            for key, value in projector.state_dict().items()
+        }
+        torch.save(projector_state, latest_path)
+        is_best = final_valid['mae_deg'] < best_valid_mae
+        if is_best:
+            best_valid_mae = final_valid['mae_deg']
+            best_epoch = epoch
+            torch.save(projector_state, best_path)
+        row = {
+            'epoch': epoch,
+            'train_mse': total_loss / total_samples,
+            'train_samples': total_samples,
+            'optimized_samples': optimized_samples,
+            'skipped_no_visual_samples': skipped_no_visual,
+            'initial_valid_mse': initial_valid['mse'],
+            'initial_valid_mae_deg': initial_valid['mae_deg'],
+            'valid_mse': final_valid['mse'],
+            'valid_mae_deg': final_valid['mae_deg'],
+            'valid_mae_delta_deg': (
+                final_valid['mae_deg'] - initial_valid['mae_deg']
+            ),
+            'valid_samples': final_valid['samples'],
+            'is_best_valid_mae': int(is_best),
+        }
+        history_rows.append(row)
+        with open(history_path, 'w', newline='', encoding='utf-8') as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerows(history_rows)
+        print(
+            '[projector-only] epoch {}/{} train_mse={:.6f} '
+            'valid_mse={:.6f} valid_mae_deg={:.6f} best_epoch={} '
+            'optimized={}/{}'.format(
+                epoch, args.epochs, row['train_mse'], row['valid_mse'],
+                row['valid_mae_deg'], best_epoch, optimized_samples,
+                total_samples,
+            ),
+            flush=True,
+        )
 
     for record in source_files:
         record['sha256_after'] = _sha256_file(record['path'])
@@ -702,7 +721,7 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
     if not all(record['unchanged'] for record in source_files):
         raise RuntimeError('a read-only source changed during projector training')
     manifest = {
-        'experiment': 'cached_patch_projector_only_one_epoch',
+        'experiment': 'cached_patch_projector_only',
         'nbs_checkpoint': os.path.abspath(resume_dir),
         'initial_projector': projector_report,
         'trainable_parameter_names': trainable_names,
@@ -719,7 +738,10 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
             args.cached_patch_motion_threshold_deg
         ),
         'cached_patch_projector_cache_forced_off_during_grad': True,
-        'metrics': row,
+        'epochs': int(args.epochs),
+        'best_epoch': int(best_epoch),
+        'best_valid_mae_deg': float(best_valid_mae),
+        'metrics': history_rows,
         'source_checkpoint_integrity': source_files,
         'outputs': {
             'best_projector': best_path,
@@ -730,14 +752,6 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
     }
     _write_json_atomic(
         os.path.join(output_dir, 'projector_training_manifest.json'), manifest
-    )
-    print(
-        '[projector-only] epoch 1/1 train_mse={:.6f} '
-        'valid_mse={:.6f} valid_mae_deg={:.6f} optimized={}/{}'.format(
-            row['train_mse'], row['valid_mse'], row['valid_mae_deg'],
-            optimized_samples, total_samples,
-        ),
-        flush=True,
     )
     print('Projector-only training complete:', output_dir, flush=True)
     return manifest
@@ -3189,8 +3203,8 @@ if __name__ == '__main__':
             parser.error(
                 '--train-multimodal-projector-only requires cached-patch-selection'
             )
-        if args.epochs != 1:
-            parser.error('--train-multimodal-projector-only requires --epochs 1')
+        if args.epochs <= 0:
+            parser.error('--train-multimodal-projector-only requires positive --epochs')
         if args.cached_patch_projector_cache:
             parser.error(
                 'projector-only training cannot use --cached-patch-projector-cache'
