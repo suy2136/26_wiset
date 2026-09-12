@@ -67,6 +67,7 @@ def build_command(args, experiment):
     token_offsets = tuple(experiment.get("token_offsets", (2, 6, 7)))
     speculative_steps = int(experiment.get("speculative_steps", 3))
     speculative_drafter = experiment.get("speculative_drafter", "repeat-last")
+    evaluation_rng_mode = getattr(args, "evaluation_rng_mode", "continuous")
     command = [
         sys.executable, "run_plm.py", "--test", "--nbs-v19", "--fp16",
         "--seed", str(args.data_seed), "--lora-seed", "1",
@@ -82,6 +83,7 @@ def build_command(args, experiment):
         "--video", args.video, "--fixed-order",
         "--device", args.device, "--device-out", args.device,
         "--nbs-compact-inference",
+        "--evaluation-rng-mode", evaluation_rng_mode,
         "--temporal-selector", "event-aware" if temporal else "none",
         "--token-selector", "intra-timestep" if token else "none",
         "--selector-history-steps", "20",
@@ -92,6 +94,8 @@ def build_command(args, experiment):
         "--speculative-state-tolerance", "0.25",
         "--speculative-return-tolerance", "0.01",
     ]
+    if evaluation_rng_mode == "per-episode":
+        command.extend(["--run-tag", "per_episode_reseed"])
     if temporal:
         command.extend([
             "--event-max-events", str(event_max_events),
@@ -213,6 +217,11 @@ def parse_args(argv=None):
     parser.add_argument("--video", default="video1")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--evaluation-rng-mode",
+        choices=("continuous", "per-episode"),
+        default="continuous",
+    )
+    parser.add_argument(
         "--data-seed", type=int, default=1,
         help=(
             "evaluation replicate seed; controls inference randomness and is "
@@ -256,6 +265,7 @@ def main(argv=None):
         "rank_config": str(args.rank_config), "seed": args.data_seed,
         "lora_seed": 1, "data_seed": args.data_seed,
         "trace": args.trace, "trace_num": args.trace_num, "video": args.video,
+        "evaluation_rng_mode": args.evaluation_rng_mode,
         "experiments": [item["name"] for item in EXPERIMENTS],
     }
     rows = load_resume(args.output, signature) if args.resume else []
@@ -277,6 +287,7 @@ def main(argv=None):
             "rank_budget": args.rank_budget,
             "physical_rank": args.physical_rank,
             "data_seed": args.data_seed,
+            "evaluation_rng_mode": args.evaluation_rng_mode,
             "configured_temporal": bool(experiment.get("temporal")),
             "configured_token": bool(experiment.get("token")),
             "configured_speculative": bool(experiment.get("speculative")),

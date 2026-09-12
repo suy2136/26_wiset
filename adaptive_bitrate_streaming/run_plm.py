@@ -21,7 +21,10 @@ from baseline_special.utils.utils import load_traces
 from baseline_special.utils.constants import BITRATE_LEVELS
 from plm_special.trainer import Trainer, ensure_trainable_parameters_fp32
 from plm_special.evaluate import evaluate_on_env
-from plm_special.test import test_on_env
+from plm_special.test import test_on_env as test_on_env_continuous
+from plm_special.test_per_episode_reseed import (
+    test_on_env as test_on_env_per_episode,
+)
 from plm_special.data.dataset import ExperienceDataset
 from plm_special.models.rl_policy import OfflineRLPolicy
 from plm_special.models.event_selection import EventAwareDataSelector
@@ -727,6 +730,13 @@ def test(args, model, exp_dataset_info, env_settings, model_dir, result_dir, tes
     model.eval()
     print('Load model from:', model_dir)
     target_return = exp_dataset_info.max_return * args.target_return_scale
+    evaluation_rng_mode = getattr(args, 'evaluation_rng_mode', 'continuous')
+    test_on_env = (
+        test_on_env_per_episode
+        if evaluation_rng_mode == 'per-episode'
+        else test_on_env_continuous
+    )
+    print('Evaluation RNG mode:', evaluation_rng_mode)
     results = test_on_env(args, model, result_dir, env_settings, target_return, args.trace_num, test_process_reward_fn, seed=args.seed)
     print(results)
     compaction_validation = getattr(
@@ -1234,6 +1244,15 @@ if __name__ == '__main__':
     parser.add_argument(
         '--run-tag',
         help='optional filesystem-safe tag isolating model/result directories',
+    )
+    parser.add_argument(
+        '--evaluation-rng-mode',
+        choices=('continuous', 'per-episode'),
+        default='continuous',
+        help=(
+            'continuous preserves the historical evaluator; per-episode '
+            'restarts the RNG stream with seed + episode index'
+        ),
     )
     parser.add_argument('--rank', type=int, help='rank of low-rank matrices. if set to -1, low-rank matrices will not be enabled', default=-1)
     parser.add_argument(
