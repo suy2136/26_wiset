@@ -35,6 +35,13 @@ def parser() -> argparse.ArgumentParser:
             'validation. Use k1 to update the projector on every sample.'
         ),
     )
+    result.add_argument(
+        '--validation-policy',
+        choices=('k1', 'adaptive', 'k2', 'cross',
+                 'gated-k1', 'gated-adaptive'),
+        default='gated-k1',
+        help='Target inference policy used for pre/post validation.',
+    )
     result.add_argument('--validation-samples', type=int, default=128)
     result.add_argument('--log-every', type=int, default=100)
     result.add_argument(
@@ -90,6 +97,7 @@ def build_command(args) -> list[str]:
         '--multimodal-projector-output-dir', str(output_dir),
         '--multimodal-projector-validation-samples',
         str(args.validation_samples),
+        '--multimodal-projector-validation-policy', args.validation_policy,
         '--multimodal-projector-log-every', str(args.log_every),
         '--epochs', '1', '--bs', '1', '--grad-accum-steps', '1',
         '--lr', str(args.lr), '--weight-decay', '0.0001',

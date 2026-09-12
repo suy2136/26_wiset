@@ -570,29 +570,39 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
         clear_runtime_state()
         total_mse = total_mae = 0.0
         sample_count = 0
-        with torch.no_grad():
-            for history, future, video_user_info in dataloader_valid:
-                history = normalize_data(
-                    history.to(args.device), args.train_dataset
-                )
-                normalized_future = normalize_data(
-                    future.to(args.device), args.train_dataset
-                )
-                prediction = pipeline.auto_regressive(
-                    history, normalized_future, video_user_info
-                )
-                total_mse += float(
-                    pipeline.loss_fct(prediction, normalized_future)
-                )
-                total_mae += float(
-                    _rotation_aware_mae_degrees(
-                        prediction, normalized_future
+        selector = pipeline.patch_selection_module
+        training_policy = selector.policy
+        validation_policy = (
+            args.multimodal_projector_validation_policy or training_policy
+        )
+        selector.policy = validation_policy
+        try:
+            with torch.no_grad():
+                for history, future, video_user_info in dataloader_valid:
+                    history = normalize_data(
+                        history.to(args.device), args.train_dataset
                     )
-                )
-                sample_count += 1
-                limit = args.multimodal_projector_validation_samples
-                if limit and sample_count >= limit:
-                    break
+                    normalized_future = normalize_data(
+                        future.to(args.device), args.train_dataset
+                    )
+                    prediction = pipeline.auto_regressive(
+                        history, normalized_future, video_user_info
+                    )
+                    total_mse += float(
+                        pipeline.loss_fct(prediction, normalized_future)
+                    )
+                    total_mae += float(
+                        _rotation_aware_mae_degrees(
+                            prediction, normalized_future
+                        )
+                    )
+                    sample_count += 1
+                    limit = args.multimodal_projector_validation_samples
+                    if limit and sample_count >= limit:
+                        break
+        finally:
+            selector.policy = training_policy
+            clear_runtime_state()
         if sample_count == 0:
             raise ValueError('projector validation received an empty dataloader')
         return {
@@ -700,6 +710,10 @@ def train_multimodal_projector_only(args, pipeline, dataloader_train,
         ),
         'frozen_parameter_policy': 'all parameters except embed_multimodal',
         'cached_patch_policy': args.cached_patch_policy,
+        'cached_patch_validation_policy': (
+            args.multimodal_projector_validation_policy
+            or args.cached_patch_policy
+        ),
         'cached_patch_motion_threshold_deg': (
             args.cached_patch_motion_threshold_deg
         ),
@@ -2806,6 +2820,13 @@ if __name__ == '__main__':
     parser.add_argument(
         '--multimodal-projector-validation-samples', type=int, default=128,
         help='Autoregressive validation samples; 0 evaluates the complete split.',
+    )
+    parser.add_argument(
+        '--multimodal-projector-validation-policy',
+        choices=['k1', 'adaptive', 'k2', 'cross',
+                 'gated-k1', 'gated-adaptive'],
+        default=None,
+        help='Optional cached-patch policy used only for validation.',
     )
     parser.add_argument(
         '--multimodal-projector-log-every', type=int, default=100,
