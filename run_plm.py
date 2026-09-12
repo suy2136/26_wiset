@@ -479,6 +479,255 @@ def freeze_pipeline_for_selector_training(pipeline):
     return trainable
 
 
+def freeze_pipeline_for_projector_training(pipeline):
+    """Freeze the complete VP stack except the cached-feature projector."""
+    projector = getattr(pipeline, 'embed_multimodal', None)
+    if projector is None:
+        raise ValueError('projector-only training requires embed_multimodal')
+    for parameter in pipeline.parameters():
+        parameter.requires_grad_(False)
+    for parameter in projector.parameters():
+        parameter.requires_grad_(True)
+        if parameter.is_floating_point() and parameter.dtype != torch.float32:
+            parameter.data = parameter.data.float()
+
+    trainable = [
+        name for name, parameter in pipeline.named_parameters()
+        if parameter.requires_grad
+    ]
+    expected = {'embed_multimodal.weight', 'embed_multimodal.bias'}
+    if set(trainable) != expected:
+        raise RuntimeError(
+            'projector-only freeze audit failed: trainable={}'.format(trainable)
+        )
+    return trainable
+
+
+def train_multimodal_projector_only(args, pipeline, dataloader_train,
+                                     dataloader_valid, projector_report):
+    """Fine-tune only embed_multimodal from offline cached patch features."""
+    if args.multimodal_mode != 'cached-patch-selection':
+        raise ValueError(
+            '--train-multimodal-projector-only requires '
+            '--multimodal-mode cached-patch-selection'
+        )
+    if not args.use_adalora or args.adalora_allocator != 'nbs':
+        raise ValueError('projector-only training requires a frozen NBS checkpoint')
+    if not args.multimodal_projector_output_dir:
+        raise ValueError(
+            '--train-multimodal-projector-only requires '
+            '--multimodal-projector-output-dir'
+        )
+    if projector_report is None:
+        raise ValueError(
+            '--train-multimodal-projector-only requires an initial '
+            '--multimodal-projector-checkpoint'
+        )
+    if args.bs != 1:
+        raise ValueError('projector-only VP training currently requires --bs 1')
+    if args.epochs != 1:
+        raise ValueError('this guarded pipeline requires exactly --epochs 1')
+
+    output_dir = os.path.abspath(args.multimodal_projector_output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+    trainable_names = freeze_pipeline_for_projector_training(pipeline)
+    projector = pipeline.embed_multimodal
+    pipeline.eval()  # frozen LLM dropout must stay disabled
+    optimizer = AdamW(projector.parameters(), lr=args.lr,
+                      weight_decay=args.weight_decay)
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups
+        for parameter in group['params']
+    }
+    if optimizer_ids != {id(parameter) for parameter in projector.parameters()}:
+        raise RuntimeError('projector optimizer contains non-projector parameters')
+
+    source_files = []
+    resume_dir = _resolve_checkpoint_alias(args.resume_path)
+    for filename in ('adapter_model.bin', 'modules_except_plm.bin',
+                     'nash_rank_allocator.pt'):
+        path = os.path.join(resume_dir, filename)
+        if os.path.isfile(path):
+            source_files.append({
+                'path': os.path.abspath(path),
+                'size_bytes': os.path.getsize(path),
+                'sha256_before': _sha256_file(path),
+            })
+    source_projector = projector_report['source_path']
+    if not any(item['path'] == source_projector for item in source_files):
+        source_files.append({
+            'path': source_projector,
+            'size_bytes': os.path.getsize(source_projector),
+            'sha256_before': _sha256_file(source_projector),
+        })
+
+    def clear_runtime_state():
+        reset = getattr(pipeline, 'reset_cached_patch_runtime_state', None)
+        if callable(reset):
+            reset()
+
+    def run_validation():
+        clear_runtime_state()
+        total_mse = total_mae = 0.0
+        sample_count = 0
+        with torch.no_grad():
+            for history, future, video_user_info in dataloader_valid:
+                history = normalize_data(
+                    history.to(args.device), args.train_dataset
+                )
+                normalized_future = normalize_data(
+                    future.to(args.device), args.train_dataset
+                )
+                prediction = pipeline.auto_regressive(
+                    history, normalized_future, video_user_info
+                )
+                total_mse += float(
+                    pipeline.loss_fct(prediction, normalized_future)
+                )
+                total_mae += float(
+                    _rotation_aware_mae_degrees(
+                        prediction, normalized_future
+                    )
+                )
+                sample_count += 1
+                limit = args.multimodal_projector_validation_samples
+                if limit and sample_count >= limit:
+                    break
+        if sample_count == 0:
+            raise ValueError('projector validation received an empty dataloader')
+        return {
+            'mse': total_mse / sample_count,
+            'mae_deg': total_mae / sample_count,
+            'samples': sample_count,
+        }
+
+    initial_valid = run_validation()
+    print(
+        '[projector-only] initial validation mse={:.6f} mae_deg={:.6f} '
+        'samples={}'.format(
+            initial_valid['mse'], initial_valid['mae_deg'],
+            initial_valid['samples'],
+        ),
+        flush=True,
+    )
+    clear_runtime_state()
+    total_loss = 0.0
+    total_samples = 0
+    optimized_samples = 0
+    skipped_no_visual = 0
+    for batch_index, (history, future, video_user_info) in enumerate(
+            dataloader_train, start=1):
+        history = normalize_data(history.to(args.device), args.train_dataset)
+        future = normalize_data(future.to(args.device), args.train_dataset)
+        optimizer.zero_grad(set_to_none=True)
+        loss = pipeline(history, future, video_user_info, teacher_forcing=True)
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f'non-finite projector training loss: {loss}')
+        total_loss += float(loss.detach())
+        total_samples += 1
+        # Gated selectors may intentionally emit no visual token. Such a
+        # sample has no projector graph and therefore is not an update.
+        if not loss.requires_grad:
+            skipped_no_visual += 1
+            continue
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            projector.parameters(), 1.0, error_if_nonfinite=True
+        )
+        if not torch.isfinite(grad_norm):
+            raise FloatingPointError('non-finite projector gradient norm')
+        optimizer.step()
+        optimized_samples += 1
+        if (batch_index % args.multimodal_projector_log_every == 0
+                or batch_index == len(dataloader_train)):
+            print(
+                '[projector-only] train {}/{} mean_mse={:.6f} '
+                'optimized={} skipped-no-visual={}'.format(
+                    batch_index, len(dataloader_train),
+                    total_loss / total_samples, optimized_samples,
+                    skipped_no_visual,
+                ),
+                flush=True,
+            )
+    if total_samples == 0 or optimized_samples == 0:
+        raise ValueError(
+            'projector-only training had no usable cached-patch samples'
+        )
+
+    final_valid = run_validation()
+
+    projector_state = {
+        key: value.detach().cpu()
+        for key, value in projector.state_dict().items()
+    }
+    best_path = os.path.join(output_dir, 'best_multimodal_projector.pth')
+    latest_path = os.path.join(output_dir, 'latest_multimodal_projector.pth')
+    torch.save(projector_state, best_path)
+    torch.save(projector_state, latest_path)
+    row = {
+        'epoch': 1,
+        'train_mse': total_loss / total_samples,
+        'train_samples': total_samples,
+        'optimized_samples': optimized_samples,
+        'skipped_no_visual_samples': skipped_no_visual,
+        'initial_valid_mse': initial_valid['mse'],
+        'initial_valid_mae_deg': initial_valid['mae_deg'],
+        'valid_mse': final_valid['mse'],
+        'valid_mae_deg': final_valid['mae_deg'],
+        'valid_mae_delta_deg': (
+            final_valid['mae_deg'] - initial_valid['mae_deg']
+        ),
+        'valid_samples': final_valid['samples'],
+    }
+    history_path = os.path.join(output_dir, 'projector_training_history.csv')
+    with open(history_path, 'w', newline='', encoding='utf-8') as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row))
+        writer.writeheader()
+        writer.writerow(row)
+
+    for record in source_files:
+        record['sha256_after'] = _sha256_file(record['path'])
+        record['unchanged'] = record['sha256_before'] == record['sha256_after']
+    if not all(record['unchanged'] for record in source_files):
+        raise RuntimeError('a read-only source changed during projector training')
+    manifest = {
+        'experiment': 'cached_patch_projector_only_one_epoch',
+        'nbs_checkpoint': os.path.abspath(resume_dir),
+        'initial_projector': projector_report,
+        'trainable_parameter_names': trainable_names,
+        'trainable_parameter_count': sum(
+            parameter.numel() for parameter in projector.parameters()
+        ),
+        'frozen_parameter_policy': 'all parameters except embed_multimodal',
+        'cached_patch_policy': args.cached_patch_policy,
+        'cached_patch_motion_threshold_deg': (
+            args.cached_patch_motion_threshold_deg
+        ),
+        'cached_patch_projector_cache_forced_off_during_grad': True,
+        'metrics': row,
+        'source_checkpoint_integrity': source_files,
+        'outputs': {
+            'best_projector': best_path,
+            'latest_projector': latest_path,
+            'history': history_path,
+        },
+        **_seed_metadata(args),
+    }
+    _write_json_atomic(
+        os.path.join(output_dir, 'projector_training_manifest.json'), manifest
+    )
+    print(
+        '[projector-only] epoch 1/1 train_mse={:.6f} '
+        'valid_mse={:.6f} valid_mae_deg={:.6f} optimized={}/{}'.format(
+            row['train_mse'], row['valid_mse'], row['valid_mae_deg'],
+            optimized_samples, total_samples,
+        ),
+        flush=True,
+    )
+    print('Projector-only training complete:', output_dir, flush=True)
+    return manifest
+
+
 def _patch_selector_labels(future, grid_rows, grid_cols):
     labels = [
         viewport_sequence_to_patch_labels(
@@ -869,6 +1118,18 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
                 'for the immutable NBS-v19 source checkpoint'
             )
         train_patch_selector_only(
+            args, pipeline, dataloader_train, dataloader_valid,
+            projector_report,
+        )
+        return
+
+    if args.train_multimodal_projector_only:
+        if not args.resume or not args.resume_path:
+            raise ValueError(
+                '--train-multimodal-projector-only requires --resume '
+                '--resume-path for the immutable NBS-v19 source checkpoint'
+            )
+        train_multimodal_projector_only(
             args, pipeline, dataloader_train, dataloader_valid,
             projector_report,
         )
@@ -2532,6 +2793,25 @@ if __name__ == '__main__':
         help='Separate directory for selector-only weights, history, and manifest.',
     )
     parser.add_argument(
+        '--train-multimodal-projector-only', action='store_true',
+        help=(
+            'Freeze NBS/LLM/selectors and fine-tune only embed_multimodal from '
+            'offline cached patch features. This guarded mode requires one epoch.'
+        ),
+    )
+    parser.add_argument(
+        '--multimodal-projector-output-dir', type=str, default=None,
+        help='Separate output directory for projector-only weights and reports.',
+    )
+    parser.add_argument(
+        '--multimodal-projector-validation-samples', type=int, default=128,
+        help='Autoregressive validation samples; 0 evaluates the complete split.',
+    )
+    parser.add_argument(
+        '--multimodal-projector-log-every', type=int, default=100,
+        help='Print projector-only training progress every N samples.',
+    )
+    parser.add_argument(
         '--patch-selector-budget-penalty', type=float, default=1.0,
         help=(
             'Weight of the differentiable expected-patch-count penalty used '
@@ -2854,6 +3134,25 @@ if __name__ == '__main__':
         parser.error('--patch-selector-validation-samples must be non-negative')
     if args.train_patch_selector_only and not args.adapt:
         parser.error('--train-patch-selector-only requires --adapt')
+    if args.train_multimodal_projector_only:
+        if not args.adapt:
+            parser.error('--train-multimodal-projector-only requires --adapt')
+        if args.multimodal_mode != 'cached-patch-selection':
+            parser.error(
+                '--train-multimodal-projector-only requires cached-patch-selection'
+            )
+        if args.epochs != 1:
+            parser.error('--train-multimodal-projector-only requires --epochs 1')
+        if args.cached_patch_projector_cache:
+            parser.error(
+                'projector-only training cannot use --cached-patch-projector-cache'
+            )
+    if args.multimodal_projector_validation_samples < 0:
+        parser.error(
+            '--multimodal-projector-validation-samples must be non-negative'
+        )
+    if args.multimodal_projector_log_every <= 0:
+        parser.error('--multimodal-projector-log-every must be positive')
     if (args.selector_objective == 'nbs-prediction'
             and not args.train_patch_selector_only):
         parser.error(

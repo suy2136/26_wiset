@@ -548,6 +548,14 @@ class Pipeline(nn.Module):
         """Gather cached patch features and pool them into one visual token."""
         video_index, image_index = self._resolve_frame_index(video_user_position)
         stream_key = self._cached_patch_stream_key(video_user_position)
+        # Projector-only fine-tuning needs a fresh autograd graph for every
+        # sample. Reusing either cache below would return a detached/stale
+        # visual token (or reuse an already-freed graph).
+        projector_training = (
+            torch.is_grad_enabled()
+            and any(parameter.requires_grad
+                    for parameter in self.embed_multimodal.parameters())
+        )
         indices = self.patch_selection_module.select_indices(
             history_viewports.to(self.device)
         )
@@ -572,7 +580,10 @@ class Pipeline(nn.Module):
         else:
             self._cached_patch_skip_streaks[stream_key] = 0
 
-        stream_entry = self._cached_patch_stream_tokens.get(stream_key)
+        stream_entry = (
+            None if projector_training
+            else self._cached_patch_stream_tokens.get(stream_key)
+        )
         if stream_entry is not None:
             calls_since_refresh, previous = stream_entry
             if calls_since_refresh + 1 < self.cached_patch_refresh_interval:
@@ -586,8 +597,12 @@ class Pipeline(nn.Module):
 
         index_tuple = tuple(int(index) for index in indices.tolist())
         projector_key = (video_index, image_index, index_tuple)
-        mapped = self._cached_patch_projected.get(projector_key)
-        if self.cached_patch_projector_cache and mapped is not None:
+        mapped = (
+            None if projector_training
+            else self._cached_patch_projected.get(projector_key)
+        )
+        if (not projector_training and self.cached_patch_projector_cache
+                and mapped is not None):
             self._cached_patch_projected.move_to_end(projector_key)
             self.cached_patch_runtime_stats['projector_cache_hits'] += 1
         else:
@@ -598,19 +613,28 @@ class Pipeline(nn.Module):
                 # Pool before projection. Linear(mean(x)) == mean(Linear(x)),
                 # while this performs only one 768->LLM projection.
                 pooled = features.float().mean(dim=0, keepdim=True).to(self.device)
-                mapped = self.embed_multimodal(pooled).unsqueeze(0).detach()
+            mapped = self.embed_multimodal(pooled).unsqueeze(0)
+            if not projector_training:
+                mapped = mapped.detach()
             self.cached_patch_runtime_stats['projector_cache_misses'] += 1
-            if self.cached_patch_projector_cache:
+            if not projector_training and self.cached_patch_projector_cache:
                 self._cached_patch_projected[projector_key] = mapped
                 self._cached_patch_projected.move_to_end(projector_key)
                 while (len(self._cached_patch_projected)
                        > self.cached_patch_projector_cache_max_entries):
                     self._cached_patch_projected.popitem(last=False)
 
-        self._cached_patch_stream_tokens[stream_key] = (0, mapped)
+        if not projector_training:
+            self._cached_patch_stream_tokens[stream_key] = (0, mapped)
         self.patch_selection_history.append(int(indices.numel()))
         self.cached_patch_visual_token_history.append(1)
         return mapped
+
+    def reset_cached_patch_runtime_state(self):
+        """Clear stateful selector caches between train/validation passes."""
+        self._cached_patch_projected.clear()
+        self._cached_patch_stream_tokens.clear()
+        self._cached_patch_skip_streaks.clear()
 
     @staticmethod
     def _cached_patch_stream_key(video_user_position):
