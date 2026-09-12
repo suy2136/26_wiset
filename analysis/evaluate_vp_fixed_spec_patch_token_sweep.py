@@ -151,7 +151,7 @@ def spec_token_command(args, compact, result_dir, recent_k):
         "--selector-recent-k", str(recent_k),
         "--speculative-gamma", str(SPEC_GAMMA),
         "--speculative-threshold", str(SPEC_THRESHOLD),
-        "--inference-tag", "spec_token_sweep",
+        "--inference-tag", "full_stack",
         *trace_option(result_dir),
     ])
     return command
@@ -159,7 +159,7 @@ def spec_token_command(args, compact, result_dir, recent_k):
 
 def full_stack_command(args, compact, result_dir, patch_config, recent_k):
     command = selector_command(args, compact, result_dir, patch_config)
-    set_option(command, "--inference-tag", "fixed_spec_full_stack")
+    set_option(command, "--inference-tag", "full_stack")
     command.extend([
         "--selector-recent-k", str(recent_k),
         "--speculative-gamma", str(SPEC_GAMMA),

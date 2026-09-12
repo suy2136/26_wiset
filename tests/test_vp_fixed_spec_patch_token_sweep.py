@@ -1,4 +1,5 @@
 import argparse
+import ast
 import importlib.util
 from pathlib import Path
 import unittest
@@ -34,6 +35,7 @@ class VPFixedSpecPatchTokenSweepTest(unittest.TestCase):
         self.assertEqual(command[command.index("--selector-recent-k") + 1], "10")
         self.assertEqual(command[command.index("--speculative-gamma") + 1], "6")
         self.assertEqual(command[command.index("--speculative-threshold") + 1], "0.4")
+        self.assertEqual(command[command.index("--inference-tag") + 1], "full_stack")
         self.assertNotIn("--multimodal-mode", command)
 
         patch = dict(sweep.PATCH_CASES)["gated_k1_t3_skip1_cache"]
@@ -43,6 +45,31 @@ class VPFixedSpecPatchTokenSweepTest(unittest.TestCase):
         self.assertEqual(full[full.index("--selector-recent-k") + 1], "8")
         self.assertEqual(full[full.index("--speculative-gamma") + 1], "6")
         self.assertEqual(full[full.index("--cached-patch-policy") + 1], "gated-k1")
+        self.assertEqual(full[full.index("--inference-tag") + 1], "full_stack")
+
+    def test_generated_inference_tags_are_accepted_by_run_plm_parser(self):
+        tree = ast.parse((ROOT / "run_plm.py").read_text(encoding="utf-8"))
+        accepted = None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            first = node.args[0]
+            if not isinstance(first, ast.Constant) or first.value != "--inference-tag":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg == "choices" and isinstance(
+                    keyword.value, (ast.List, ast.Tuple)
+                ):
+                    accepted = {
+                        item.value for item in keyword.value.elts
+                        if isinstance(item, ast.Constant)
+                    }
+        self.assertIsNotNone(accepted)
+        self.assertIn("full_stack", accepted)
+        command = sweep.spec_token_command(
+            args(), Path("compact"), Path("result"), 8
+        )
+        self.assertIn(command[command.index("--inference-tag") + 1], accepted)
 
     def test_selection_uses_fastest_admissible_token(self):
         rows = [
