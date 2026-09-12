@@ -89,6 +89,21 @@ class VPFixedSpecPatchTokenSweepTest(unittest.TestCase):
         )
         self.assertIn("def patch_selection_history(self):", source)
         self.assertIn("def cached_patch_visual_token_history(self):", source)
+        self.assertIn("def cached_patch_runtime_stats(self):", source)
+
+    def test_wrapper_covers_all_post_wrap_patch_statistics(self):
+        run_source = (ROOT / "run_plm.py").read_text(encoding="utf-8")
+        wrapper_source = (
+            ROOT / "models" / "speculative_pipeline.py"
+        ).read_text(encoding="utf-8")
+        required = (
+            "patch_selection_history",
+            "cached_patch_visual_token_history",
+            "cached_patch_runtime_stats",
+        )
+        for attribute in required:
+            self.assertIn(f"pipeline.{attribute}", run_source)
+            self.assertIn(f"def {attribute}(self):", wrapper_source)
 
 
 if __name__ == "__main__":

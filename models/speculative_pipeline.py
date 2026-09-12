@@ -113,6 +113,11 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
         """Expose visual-token statistics for run_plm's post-test report."""
         return getattr(self.pipeline, "cached_patch_visual_token_history", [])
 
+    @property
+    def cached_patch_runtime_stats(self):
+        """Expose cached-patch cache/reuse counters to the report writer."""
+        return getattr(self.pipeline, "cached_patch_runtime_stats", {})
+
     def set_selector(self, selector: Optional[BaseSelector]) -> None:
         if selector is not None and not isinstance(selector, BaseSelector):
             raise TypeError("selector must be a BaseSelector instance or None")
