@@ -25,6 +25,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument('--rank-budget', type=int, default=512)
     result.add_argument('--physical-rank', type=int, default=32)
     result.add_argument('--lr', type=float, default=5e-5)
+    result.add_argument(
+        '--policy',
+        choices=('k1', 'adaptive', 'k2', 'cross',
+                 'gated-k1', 'gated-adaptive'),
+        default='gated-k1',
+        help=(
+            'Cached patch policy used for both projector training and '
+            'validation. Use k1 to update the projector on every sample.'
+        ),
+    )
     result.add_argument('--validation-samples', type=int, default=128)
     result.add_argument('--log-every', type=int, default=100)
     result.add_argument(
@@ -69,7 +79,7 @@ def build_command(args) -> list[str]:
         '--adalora-rank-budget', str(args.rank_budget),
         '--experiment-tag', 'nbs_v19',
         '--multimodal-mode', 'cached-patch-selection',
-        '--cached-patch-policy', 'gated-k1',
+        '--cached-patch-policy', args.policy,
         '--cached-patch-motion-threshold-deg', '6',
         '--cached-patch-max-skip-calls', '0',
         '--cached-patch-features-dir', str(absolute(args.cache_dir)),
