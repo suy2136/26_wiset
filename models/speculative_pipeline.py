@@ -103,6 +103,16 @@ class LlamaSpeculativeBlockVerifyPipeline(nn.Module):
         self.accepted_per_iteration: List[int] = []
         self.proposed_per_iteration: List[int] = []
 
+    @property
+    def patch_selection_history(self):
+        """Expose cached-patch statistics owned by the wrapped pipeline."""
+        return getattr(self.pipeline, "patch_selection_history", [])
+
+    @property
+    def cached_patch_visual_token_history(self):
+        """Expose visual-token statistics for run_plm's post-test report."""
+        return getattr(self.pipeline, "cached_patch_visual_token_history", [])
+
     def set_selector(self, selector: Optional[BaseSelector]) -> None:
         if selector is not None and not isinstance(selector, BaseSelector):
             raise TypeError("selector must be a BaseSelector instance or None")
