@@ -57,6 +57,8 @@ class CachedPatchProjectorTrainingTests(unittest.TestCase):
         self.assertIn("'--train-multimodal-projector-only'", source)
         self.assertNotIn("'--cached-patch-projector-cache'", source)
         self.assertIn("'--cached-patch-policy', 'gated-k1'", source)
+        self.assertIn("default='cpu'", source)
+        self.assertIn('TRAIN_VIDEOS + VALID_VIDEOS', source)
 
     def test_saved_projector_format_matches_loader_aliases(self):
         if torch is None:
