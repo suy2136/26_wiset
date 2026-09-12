@@ -54,3 +54,14 @@ def seed_data_worker(worker_id):
     worker_seed = torch.initial_seed() % (2 ** 32)
     random.seed(worker_seed)
     np.random.seed(worker_seed)
+
+
+def set_global_seed(seed, include_cuda=True):
+    """Reset Python, NumPy, and torch RNGs without preserving prior state."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if include_cuda and torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)

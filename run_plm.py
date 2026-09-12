@@ -46,6 +46,7 @@ from utils.seed_utils import (
     make_data_generator,
     resolve_experiment_seeds,
     seed_data_worker,
+    set_global_seed,
 )
 
 
@@ -1855,6 +1856,9 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
         evaluation_suffix += f'_inference_{args.inference_tag}'
     if args.nbs_inference_mode == 'compact':
         evaluation_suffix += '_nbs_compact'
+    evaluation_rng_mode = getattr(args, 'evaluation_rng_mode', 'continuous')
+    if evaluation_rng_mode == 'per-episode':
+        evaluation_suffix += '_rng_per_episode'
     result_path = os.path.join(
         results_dir, file_prefix + evaluation_suffix + '_results.csv'
     )
@@ -2065,8 +2069,18 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
         pipeline.eval()
         print(f'[inference] RecentK selector enabled: k={args.selector_recent_k}')
     test_step = 0
+    evaluation_episode_key = None
+    evaluation_episode_index = -1
     with torch.no_grad():
         for test_step, (history, future, video_user_info) in enumerate(dataloader_test, start=1):
+            current_episode_key = (
+                int(video_user_info[0]), int(video_user_info[1])
+            )
+            if (evaluation_rng_mode == 'per-episode'
+                    and current_episode_key != evaluation_episode_key):
+                evaluation_episode_index += 1
+                set_global_seed(args.data_seed + evaluation_episode_index)
+                evaluation_episode_key = current_episode_key
             history, future = history.to(args.device), future.to(args.device)
             history = normalize_data(history, args.train_dataset)
             timed_call = measure_latency and test_step > latency_warmup_steps
@@ -2226,6 +2240,10 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             with open(stats_path, 'w', encoding='utf-8') as handle:
                 json.dump(stats, handle, indent=2)
             print('Cached patch selector statistics saved at', stats_path)
+    print(
+        'Evaluation RNG mode:', evaluation_rng_mode,
+        'episodes reseeded:', max(0, evaluation_episode_index + 1),
+    )
 
 
 def run(args):
@@ -2639,6 +2657,15 @@ if __name__ == '__main__':
     parser.add_argument(
         '--results-output-dir', type=str, default=None,
         help='Optional explicit result directory for evaluation-only ablations.',
+    )
+    parser.add_argument(
+        '--evaluation-rng-mode',
+        choices=['continuous', 'per-episode'],
+        default='continuous',
+        help=(
+            'continuous preserves historical VP evaluation; per-episode '
+            'restarts RNGs for each video-user trajectory'
+        ),
     )
     parser.add_argument('--device', action='store', dest='device', help='the device (cuda or cpu) to run experiment.')
     parser.add_argument('--device-out', action='store', dest='device_out', help='the device (cuda or cpu) to place the split of model near the output.')
