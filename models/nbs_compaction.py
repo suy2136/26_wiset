@@ -73,10 +73,21 @@ class CompactLoRALinear(nn.Module):
             torch.as_tensor(adapter_scale, device=lora_b.device, dtype=lora_b.dtype),
         )
         self.lora_dropout = copy.deepcopy(dropout)
+        # Preserve the mixed-precision safety policy installed on the source
+        # AdaLoRA projection.  Compact inference replaces SVDLinear modules,
+        # so failing to copy this state silently bypasses their FP16 guard.
+        self._abr_fp16_selective_clamp = bool(
+            getattr(source, "_abr_fp16_selective_clamp", False)
+        )
+        self._abr_fp16_clamp_threshold = float(
+            getattr(source, "_abr_fp16_clamp_threshold", 60000.0)
+        )
+        self._nbs_module_name = getattr(source, "_nbs_module_name", None)
 
     def forward(self, x):
         base_weight = self.weight.T if self.fan_in_fan_out else self.weight
-        result = F.linear(x.to(base_weight.dtype), base_weight, self.bias)
+        base_input = x.to(base_weight.dtype)
+        result = F.linear(base_input, base_weight, self.bias)
         adapter_input = self.lora_dropout(x.to(self.lora_a.dtype))
         delta = (
             F.linear(F.linear(adapter_input, self.lora_a), self.lora_b)
@@ -84,7 +95,53 @@ class CompactLoRALinear(nn.Module):
         )
         # Match ABR's mixed-precision AdaLoRA bridge: accumulate the base and
         # LoRA residual in FP32, then cross the PLM boundary in the base dtype.
-        return (result.float() + delta.float()).to(result.dtype)
+        result_fp32 = result.float() + delta.float()
+        self._nbs_last_input_absmax = base_input.detach().float().abs().amax()
+        self._nbs_last_input_finite = torch.isfinite(
+            base_input.detach().float()
+        ).all()
+        self._nbs_last_base_absmax = result.detach().float().abs().amax()
+        self._nbs_last_base_finite = torch.isfinite(
+            result.detach().float()
+        ).all()
+        self._nbs_last_delta_absmax = delta.detach().float().abs().amax()
+        self._nbs_last_delta_finite = torch.isfinite(
+            delta.detach().float()
+        ).all()
+        self._nbs_last_precast_absmax = result_fp32.detach().abs().amax()
+        self._nbs_last_precast_finite = torch.isfinite(result_fp32.detach()).all()
+        self._nbs_output_dtype = result.dtype
+
+        dtype_limit = torch.finfo(result.dtype).max
+        if (
+            self._abr_fp16_selective_clamp
+            and result.dtype == torch.float16
+        ):
+            threshold = min(self._abr_fp16_clamp_threshold, float(dtype_limit))
+            finite = torch.isfinite(result_fp32)
+            result_fp32 = torch.where(
+                finite & (result_fp32.abs() > threshold),
+                result_fp32.clamp(-threshold, threshold),
+                result_fp32,
+            )
+            # Finite range overflow has now been repaired.  NaN/Inf remains
+            # marked unhealthy and will be rejected by RLPolicy.
+            if bool(finite.all().item()):
+                self._nbs_last_precast_absmax = result_fp32.detach().abs().amax()
+                self._nbs_last_precast_finite = torch.isfinite(
+                    result_fp32.detach()
+                ).all()
+
+        # Contain irrecoverable values so downstream layers do not obscure the
+        # first faulty compact projection.  Health metadata above still makes
+        # RLPolicy reject this forward rather than silently accepting it.
+        contained = torch.nan_to_num(
+            result_fp32,
+            nan=0.0,
+            posinf=float(dtype_limit),
+            neginf=-float(dtype_limit),
+        ).clamp(-float(dtype_limit), float(dtype_limit))
+        return contained.to(result.dtype)
 
 
 def _parameter_tensor(container, adapter_name):

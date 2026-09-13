@@ -41,6 +41,27 @@ class NBSCompactionInferenceTest(unittest.TestCase):
         expected = expected.float() + (x @ lora_a.T @ lora_b.T).float() * 0.75
         torch.testing.assert_close(layer(x), expected)
 
+    @unittest.skipUnless(torch is not None, "torch is not installed")
+    def test_compact_fp16_projection_clamps_finite_overflow(self):
+        from models.nbs_compaction import CompactLoRALinear
+
+        source = _SourceLinear().half()
+        source.weight.data.zero_()
+        source.bias.data.zero_()
+        source._abr_fp16_selective_clamp = True
+        source._abr_fp16_clamp_threshold = 60000.0
+        layer = CompactLoRALinear(
+            source,
+            torch.full((1, 4), 300.0, dtype=torch.float16),
+            torch.full((3, 1), 300.0, dtype=torch.float16),
+            adapter_scale=1.0,
+            dropout=nn.Identity(),
+        )
+        output = layer(torch.ones((1, 4), dtype=torch.float16))
+        self.assertTrue(bool(torch.isfinite(output).all().item()))
+        self.assertLessEqual(float(output.abs().max().item()), 60000.0)
+        self.assertTrue(bool(layer._nbs_last_precast_finite.item()))
+
     def test_f_runner_switches_dense_and_compact_modes(self):
         from adaptive_bitrate_streaming.analysis.run_nbs_v19_f_compaction_validation import (
             build_test_command,

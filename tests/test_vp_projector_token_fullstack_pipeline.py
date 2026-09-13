@@ -23,7 +23,11 @@ class VPProjectorTokenPipelineTest(unittest.TestCase):
             ("projector_2ep_lr2e-5", 2, 2e-5),
             ("projector_3ep_lr2e-5", 3, 2e-5),
         ))
-        self.assertEqual(pipeline.TOKEN_K_VALUES, (2, 4, 6, 8, 10, 12, 15))
+        self.assertEqual(pipeline.TOKEN_K_VALUES, (2, 4, 6, 8, 10))
+        self.assertTrue(all(
+            value <= pipeline.VP_HISTORY_LENGTH
+            for value in pipeline.TOKEN_K_VALUES
+        ))
 
     def test_token_sweep_uses_validation(self):
         command = pipeline.full_command(

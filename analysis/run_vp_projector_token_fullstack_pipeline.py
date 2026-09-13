@@ -29,7 +29,10 @@ TRAINING_CANDIDATES = (
     ("projector_2ep_lr2e-5", 2, 2e-5),
     ("projector_3ep_lr2e-5", 3, 2e-5),
 )
-TOKEN_K_VALUES = (2, 4, 6, 8, 10, 12, 15)
+# VP history has exactly 10 positions.  Larger K values are invalid rather
+# than "keep everything" and are therefore excluded before launching a run.
+TOKEN_K_VALUES = (2, 4, 6, 8, 10)
+VP_HISTORY_LENGTH = 10
 SEEDS = (1, 2, 3)
 PATCH_CONFIG = {
     "policy": "gated-k1", "threshold": 6.0,
@@ -201,6 +204,11 @@ def full_command(args, projector, result_dir, token_k, split, seed):
 
 
 def sweep_token_k(args, projector):
+    invalid = [value for value in TOKEN_K_VALUES if value > VP_HISTORY_LENGTH]
+    if invalid:
+        raise ValueError(
+            f"Token K exceeds VP history length {VP_HISTORY_LENGTH}: {invalid}"
+        )
     rows = []
     root = args.output_dir / "token_k_validation"
     for token_k in TOKEN_K_VALUES:

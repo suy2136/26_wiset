@@ -38,6 +38,31 @@ class ABRReseedLatestModulesTest(unittest.TestCase):
             "0",
         )
 
+    def test_reseed_pipeline_enables_compact_fp16_safeguards(self):
+        source = Path(pipeline.__file__).read_text(encoding="utf-8")
+        self.assertIn("args.fp16_numeric_safeguards = True", source)
+        self.assertIn("args.fp16_selective_clamp = True", source)
+        self.assertIn("args.fp16_selective_clamp_threshold = 60000.0", source)
+
+        command_args = argparse.Namespace(
+            data_seed=3, base_model_dir=Path("base"),
+            checkpoint_dir=Path("checkpoint"), exp_pool_path=Path("pool"),
+            physical_rank=32, rank_budget=1536,
+            rank_config=Path("rank.json"), trace="fcc-test", trace_num=100,
+            video="video1", device="cuda:0", evaluation_rng_mode="per-episode",
+            fp16_numeric_safeguards=True, fp16_selective_clamp=True,
+            fp16_selective_clamp_threshold=60000.0,
+        )
+        command = pipeline.sweep.best5.build_command(
+            command_args, pipeline.TEMPORAL
+        )
+        self.assertIn("--fp16-numeric-safeguards", command)
+        self.assertIn("--fp16-selective-clamp", command)
+        self.assertEqual(
+            command[command.index("--fp16-selective-clamp-threshold") + 1],
+            "60000.0",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

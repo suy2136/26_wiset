@@ -165,6 +165,11 @@ def validate_manifest(args):
 def main(argv=None):
     args = parse_args(argv)
     args.evaluation_rng_mode = "per-episode"
+    # Compact inference replaces PEFT SVDLinear modules.  Keep the same
+    # finite-range guard active across both dense and compact NBS paths.
+    args.fp16_numeric_safeguards = True
+    args.fp16_selective_clamp = True
+    args.fp16_selective_clamp_threshold = 60000.0
     args.confirmation_seeds = list(SEEDS)
     args.combined_finalists = 1
     args.output_dir.mkdir(parents=True, exist_ok=True)

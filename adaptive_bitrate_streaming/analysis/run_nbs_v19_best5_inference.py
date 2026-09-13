@@ -96,6 +96,14 @@ def build_command(args, experiment):
     ]
     if evaluation_rng_mode == "per-episode":
         command.extend(["--run-tag", "per_episode_reseed"])
+    if getattr(args, "fp16_numeric_safeguards", False):
+        command.append("--fp16-numeric-safeguards")
+    if getattr(args, "fp16_selective_clamp", False):
+        command.extend([
+            "--fp16-selective-clamp",
+            "--fp16-selective-clamp-threshold",
+            str(getattr(args, "fp16_selective_clamp_threshold", 60000.0)),
+        ])
     if temporal:
         command.extend([
             "--event-max-events", str(event_max_events),
