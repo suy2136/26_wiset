@@ -70,7 +70,8 @@ def build_command(args, experiment):
     evaluation_rng_mode = getattr(args, "evaluation_rng_mode", "continuous")
     command = [
         sys.executable, "run_plm.py", "--test", "--nbs-v19", "--fp16",
-        "--seed", str(args.data_seed), "--lora-seed", "1",
+        "--seed", str(args.data_seed),
+        "--lora-seed", str(getattr(args, "lora_seed", 1)),
         "--data-seed", str(args.data_seed),
         "--plm-type", "llama", "--plm-size", "base",
         "--plm-dir", str(args.base_model_dir.resolve()),
