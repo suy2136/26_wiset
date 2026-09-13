@@ -66,6 +66,21 @@ class ABRReseedLatestModulesTest(unittest.TestCase):
         )
         self.assertIn("--fp16-attention-fp32-scores", command)
 
+    def test_recompute_all_mode_is_available_and_isolated(self):
+        parsed = pipeline.parse_args([
+            "--checkpoint-dir", "checkpoint",
+            "--base-model-dir", "base",
+            "--exp-pool-path", "pool",
+            "--recompute-all",
+        ])
+        self.assertTrue(parsed.recompute_all)
+        source = Path(pipeline.__file__).read_text(encoding="utf-8")
+        self.assertIn(
+            'selected_specs = TARGET_SPECS if args.recompute_all else RUN_SPECS',
+            source,
+        )
+        self.assertIn('"per_episode_reseed_fp32_attention"', source)
+
 
 if __name__ == "__main__":
     unittest.main()

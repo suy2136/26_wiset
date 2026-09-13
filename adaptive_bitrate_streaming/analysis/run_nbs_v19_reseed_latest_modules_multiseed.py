@@ -132,6 +132,13 @@ def parse_args(argv=None):
     parser.add_argument("--video", default="video1")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--recompute-all", action="store_true",
+        help=(
+            "evaluate Pure NBS and all four module settings afresh instead "
+            "of reusing the earlier pure-NBS rows"
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
@@ -144,6 +151,11 @@ def manifest_signature(args):
         "exp_pool_path": str(args.exp_pool_path.resolve()),
         "reseed_pure_runs": str(args.reseed_pure_runs.resolve()),
         "evaluation_rng_mode": "per-episode",
+        "run_tag": args.run_tag,
+        "recompute_all": bool(args.recompute_all),
+        "fp16_numeric_safeguards": True,
+        "fp16_selective_clamp_threshold": 60000.0,
+        "fp16_attention_fp32_scores": True,
         "seeds": list(SEEDS),
         "specs": [sweep.configured_fields(spec) | {"name": spec["name"]}
                   for spec in TARGET_SPECS],
@@ -171,6 +183,10 @@ def main(argv=None):
     args.fp16_selective_clamp = True
     args.fp16_selective_clamp_threshold = 60000.0
     args.fp16_attention_fp32_scores = True
+    args.run_tag = (
+        "per_episode_reseed_fp32_attention"
+        if args.recompute_all else "per_episode_reseed"
+    )
     args.confirmation_seeds = list(SEEDS)
     args.combined_finalists = 1
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -185,17 +201,21 @@ def main(argv=None):
         if not args.exp_pool_path.is_file():
             raise FileNotFoundError(f"experience pool not found: {args.exp_pool_path}")
         validate_manifest(args)
-        rows = reusable_baselines(args)
+        rows = [] if args.recompute_all else reusable_baselines(args)
         if args.resume:
             prior = sweep.load_rows(runs_path)
-            rows.extend(
-                row for row in prior
-                if row.get("experiment") != BASELINE["name"]
-            )
+            if args.recompute_all:
+                rows.extend(prior)
+            else:
+                rows.extend(
+                    row for row in prior
+                    if row.get("experiment") != BASELINE["name"]
+                )
         sweep.write_rows(runs_path, rows)
 
+    selected_specs = TARGET_SPECS if args.recompute_all else RUN_SPECS
     for seed in SEEDS:
-        rows = sweep.run_specs(args, RUN_SPECS, seed, runs_path, rows)
+        rows = sweep.run_specs(args, selected_specs, seed, runs_path, rows)
     if args.dry_run:
         return
     summary = summarize(rows)

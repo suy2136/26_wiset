@@ -95,7 +95,10 @@ def build_command(args, experiment):
         "--speculative-return-tolerance", "0.01",
     ]
     if evaluation_rng_mode == "per-episode":
-        command.extend(["--run-tag", "per_episode_reseed"])
+        command.extend([
+            "--run-tag",
+            getattr(args, "run_tag", "per_episode_reseed"),
+        ])
     if getattr(args, "fp16_numeric_safeguards", False):
         command.append("--fp16-numeric-safeguards")
     if getattr(args, "fp16_selective_clamp", False):
