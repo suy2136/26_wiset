@@ -53,6 +53,19 @@ def read_adapter_config(checkpoint: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def active_rank(value) -> int:
+    """Return active rank from LoRA integer ranks or AdaLoRA mask lists."""
+    if isinstance(value, list):
+        if not all(isinstance(item, (bool, int)) for item in value):
+            raise TypeError(f"unsupported rank mask values: {value!r}")
+        if not all(int(item) in (0, 1) for item in value):
+            raise ValueError(f"rank mask must contain only booleans/0/1: {value!r}")
+        return sum(bool(item) for item in value)
+    if isinstance(value, bool):
+        return int(value)
+    return int(value)
+
+
 def checkpoint_description(method: str, checkpoint: Path) -> dict:
     required = [checkpoint / "modules_except_plm.bin"]
     if not any(
@@ -73,7 +86,9 @@ def checkpoint_description(method: str, checkpoint: Path) -> dict:
         )
     rank_pattern = config.get("rank_pattern") or {}
     if rank_pattern:
-        active_rank_total = sum(int(value) for value in rank_pattern.values())
+        active_rank_total = sum(
+            active_rank(value) for value in rank_pattern.values()
+        )
         rank_pattern_count = len(rank_pattern)
     else:
         target_modules = config.get("target_modules") or []
@@ -106,7 +121,9 @@ def write_fixed_rank_config(description: dict, checkpoint: Path,
         return None
     path = output_dir / f"{description['method']}_rank_pattern.json"
     payload = {
-        "rank_pattern": {str(key): int(value) for key, value in rank_pattern.items()},
+        "rank_pattern": {
+            str(key): active_rank(value) for key, value in rank_pattern.items()
+        },
         "total_rank_budget": description["active_rank_total"],
         "source_checkpoint": str(checkpoint),
     }

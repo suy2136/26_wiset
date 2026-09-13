@@ -29,11 +29,20 @@ class FixedLoraFastFallbackPipelineTest(unittest.TestCase):
     def test_checkpoint_budget_is_recorded_without_rejecting_preliminary(self):
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = self.make_checkpoint(
-                temporary, "ADALORA", 8, {"a": 320, "b": 325}, 32
+                temporary,
+                "ADALORA",
+                8,
+                {"a": [True] * 320, "b": [True] * 325},
+                32,
             )
             description = pipeline.checkpoint_description("shapley", checkpoint)
         self.assertEqual(description["active_rank_total"], 645)
         self.assertEqual(description["budget_note"], "preliminary_nonmatching_645")
+
+    def test_active_rank_accepts_integer_and_mask_encodings(self):
+        self.assertEqual(pipeline.active_rank(8), 8)
+        self.assertEqual(pipeline.active_rank([True, False, True]), 2)
+        self.assertEqual(pipeline.active_rank([1, 0, 1, 1]), 3)
 
     def test_command_uses_fast_fallback_and_no_acceleration_modules(self):
         with tempfile.TemporaryDirectory() as temporary:
