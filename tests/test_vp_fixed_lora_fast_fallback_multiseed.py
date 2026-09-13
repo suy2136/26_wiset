@@ -93,6 +93,14 @@ class FixedLoraFastFallbackPipelineTest(unittest.TestCase):
             source,
         )
 
+    def test_nonvisual_dataset_loading_does_not_require_top_level_opencv(self):
+        source = (pipeline.REPO_ROOT / "dataset" / "load_dataset.py").read_text(
+            encoding="utf-8"
+        )
+        prefix = source.split("def pack_data", 1)[0]
+        self.assertNotIn("import cv2", prefix)
+        self.assertIn("if for_track:\n        try:\n            import cv2", source)
+
 
 if __name__ == "__main__":
     unittest.main()

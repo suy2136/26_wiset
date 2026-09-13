@@ -1,5 +1,4 @@
 import os
-import cv2
 import numpy as np
 from torch.utils.data import Dataset
 from config import cfg
@@ -96,6 +95,13 @@ def pack_data(dataset_dir, video_user_pairs, frequency, dataset, for_track=False
         
     pack_content_features = {video: {} for video, _ in video_user_pairs}
     if for_track:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise ImportError(
+                "OpenCV is required only when loading raw image tracks "
+                "(for_track=True); install opencv-python-headless for that mode"
+            ) from exc
         image_data_total_path = cfg.dataset_images[dataset]
         for video, user in video_user_pairs:
             image_data_path = os.path.join(image_data_total_path, f'video{video}_images')
