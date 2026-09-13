@@ -330,7 +330,10 @@ def summarize_final(rows):
                        "mean_selected_token_count", "mean_target_forward_count",
                        "mean_token_reduction_percent", "draft_acceptance_rate",
                        "selected_patches_mean", "visual_tokens_per_call"):
-            values = [float(row[metric]) for row in group if row.get(metric) != ""]
+            values = [
+                float(row[metric]) for row in group
+                if row.get(metric) not in (None, "")
+            ]
             if len(values) == 3:
                 summary[f"{metric}_mean"] = statistics.mean(values)
                 summary[f"{metric}_std"] = statistics.stdev(values)

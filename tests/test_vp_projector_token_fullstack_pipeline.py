@@ -58,6 +58,28 @@ class VPProjectorTokenPipelineTest(unittest.TestCase):
             "baseline", "patch", "token", "speculative", "full_stack",
         ])
 
+    def test_summary_accepts_metrics_missing_from_some_cases(self):
+        rows = []
+        for case, _, kind in pipeline.FINAL_CASES:
+            for seed in pipeline.SEEDS:
+                row = {
+                    "case": case, "evaluation_seed": seed,
+                    "status": "complete", "mae": 17.0 + seed / 100,
+                    "rmse": 31.0, "latency_mean_ms": 200.0,
+                }
+                if kind in ("token", "full_stack"):
+                    row["mean_selected_token_count"] = 8.0
+                if kind in ("patch", "full_stack"):
+                    row["selected_patches_mean"] = 0.2
+                rows.append(row)
+
+        summary = pipeline.summarize_final(rows)
+
+        self.assertEqual(len(summary), 5)
+        self.assertNotIn("mean_selected_token_count_mean", summary[0])
+        self.assertEqual(summary[2]["mean_selected_token_count_mean"], 8.0)
+        self.assertEqual(summary[1]["selected_patches_mean_mean"], 0.2)
+
     def test_manifest_migrates_only_oversized_legacy_k_values(self):
         with tempfile.TemporaryDirectory() as directory:
             configured = args()
