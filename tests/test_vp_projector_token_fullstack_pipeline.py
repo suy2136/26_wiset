@@ -1,5 +1,7 @@
 import argparse
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
 from analysis import run_vp_projector_token_fullstack_pipeline as pipeline
@@ -55,6 +57,37 @@ class VPProjectorTokenPipelineTest(unittest.TestCase):
         self.assertEqual([item[2] for item in pipeline.FINAL_CASES], [
             "baseline", "patch", "token", "speculative", "full_stack",
         ])
+
+    def test_manifest_migrates_only_oversized_legacy_k_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            configured = args()
+            configured.output_dir = Path(directory)
+            configured.existing_one_epoch_projector = Path("one_epoch")
+            configured.resume = True
+            signature = {
+                "nbs_checkpoint": "nbs", "compact_checkpoint": "compact",
+                "initial_projector": "initial",
+                "existing_one_epoch_projector": "one_epoch",
+                "cache_dir": "cache",
+                "training_candidates": [list(item) for item in pipeline.TRAINING_CANDIDATES],
+                "token_k_values": [2, 4, 6, 8, 10, 12, 15],
+                "patch": pipeline.PATCH_CONFIG,
+                "spec": {"gamma": 6, "threshold": 0.4},
+                "selection_split": "valid", "final_split": "test",
+                "seeds": list(pipeline.SEEDS),
+            }
+            (configured.output_dir / "pipeline_manifest.json").write_text(
+                json.dumps({"signature": signature}), encoding="utf-8"
+            )
+            pipeline.write_manifest(configured)
+            migrated = json.loads(
+                (configured.output_dir / "pipeline_manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                migrated["signature"]["token_k_values"], [2, 4, 6, 8, 10]
+            )
 
 
 if __name__ == "__main__":

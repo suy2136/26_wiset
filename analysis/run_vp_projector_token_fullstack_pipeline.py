@@ -361,7 +361,19 @@ def write_manifest(args):
     path = args.output_dir / "pipeline_manifest.json"
     if path.is_file() and args.resume:
         old = json.loads(path.read_text(encoding="utf-8"))
-        if old.get("signature") != json.loads(json.dumps(signature)):
+        expected = json.loads(json.dumps(signature))
+        previous = old.get("signature")
+        # Older runs included K=12/15 even though VP history has length 10.
+        # Permit this one-way correction so completed K<=10 evaluations can
+        # be resumed; every other configuration field must still match.
+        if isinstance(previous, dict):
+            previous = dict(previous)
+            values = previous.get("token_k_values")
+            if isinstance(values, list):
+                previous["token_k_values"] = [
+                    value for value in values if value <= VP_HISTORY_LENGTH
+                ]
+        if previous != expected:
             raise ValueError("resume manifest differs from current configuration")
     elif path.exists() and not args.resume:
         raise FileExistsError(f"output exists: {path}; use --resume")
