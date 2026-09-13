@@ -2254,7 +2254,7 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             with open(stats_path, 'w', encoding='utf-8') as handle:
                 json.dump(stats, handle, indent=2)
             print('Cached patch selector statistics saved at', stats_path)
-        if args.nbs_inference_mode == 'compact':
+        if args.nbs_inference_mode == 'compact' or args.vp_fp16_fallback:
             from models.vp_numeric_safety import vp_numeric_safety_report
             safety_report = vp_numeric_safety_report(pipeline)
             if safety_report['enabled_models']:
@@ -2585,6 +2585,18 @@ def run(args):
                          cached_patch_projector_cache_max_entries=args.cached_patch_projector_cache_max_entries,
                          cached_patch_refresh_interval=args.cached_patch_refresh_interval,
                          cached_patch_max_skip_calls=args.cached_patch_max_skip_calls)
+    if args.vp_fp16_fallback:
+        from models.vp_numeric_safety import enable_vp_fp16_fallback
+        enabled_models = enable_vp_fp16_fallback(pipeline)
+        if enabled_models != 1:
+            raise RuntimeError(
+                '--vp-fp16-fallback expected exactly one VP Llama model, '
+                f'found {enabled_models}'
+            )
+        print(
+            'VP numeric safety: normal FP16 fast path; retry non-finite '
+            'predictions with prescaled Q/K, then FP32 attention'
+        )
     # print_trainable_parameters(pipeline)
 
     if args.compile:
@@ -2700,6 +2712,14 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', dest='fp16', help='(Optional) Load the plm weights in fp16 (no quantization, no adapters). '
                                                                           'Intended for frozen-plm pilots where only the multimodal/patch-selection '
                                                                           'modules need gradients; see Pipeline for the fp32<->fp16 bridging at the plm boundary.')
+    parser.add_argument(
+        '--vp-fp16-fallback', action='store_true',
+        help=(
+            'Opt in to the VP normal-FP16 fast path with retry-only numeric '
+            'safety: prescaled Q/K after a non-finite prediction, followed '
+            'by FP32 attention only if the first retry is still non-finite.'
+        ),
+    )
     parser.add_argument('--gradient-checkpointing', action='store_true', dest='gradient_checkpointing',
                         help='(Optional) Enable gradient checkpointing on the plm to trade compute for activation memory. '
                              'Pure memory-saving trick (no effect on results); use only if you hit OOM.')
