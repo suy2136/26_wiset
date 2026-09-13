@@ -44,6 +44,18 @@ class FixedLoraFastFallbackPipelineTest(unittest.TestCase):
         self.assertEqual(pipeline.active_rank([True, False, True]), 2)
         self.assertEqual(pipeline.active_rank([1, 0, 1, 1]), 3)
 
+    def test_subset_methods_preserve_requested_execution_order(self):
+        args = pipeline.parser().parse_args([
+            "--methods", "shapley", "adalora",
+            "--shapley-checkpoint", "shapley_ckpt",
+            "--adalora-checkpoint", "adalora_ckpt",
+            "--output-dir", "output",
+        ])
+        specs = pipeline.selected_method_specs(args)
+        self.assertEqual([spec[0] for spec in specs], ["shapley", "adalora"])
+        self.assertIsNone(args.uniform_checkpoint)
+        self.assertIsNone(args.eva_checkpoint)
+
     def test_command_uses_fast_fallback_and_no_acceleration_modules(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

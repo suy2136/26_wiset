@@ -29,13 +29,19 @@ METHODS = (
     ("adalora", "AdaLoRA (preliminary data-seed 2)", "adalora_checkpoint", 2),
     ("shapley", "ShapLoRA (preliminary rank 645)", "shapley_checkpoint", 1),
 )
+METHOD_BY_NAME = {spec[0]: spec for spec in METHODS}
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--methods", nargs="+", choices=tuple(METHOD_BY_NAME),
+        default=[spec[0] for spec in METHODS],
+        help="Methods to evaluate, in execution order (default: all).",
+    )
     for method, _, argument, _ in METHODS:
         result.add_argument(
-            f"--{argument.replace('_', '-')}", type=Path, required=True,
+            f"--{argument.replace('_', '-')}", type=Path,
             help=f"Existing {method} checkpoint directory (read only).",
         )
     result.add_argument("--output-dir", type=Path, required=True)
@@ -44,6 +50,17 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--resume", action="store_true")
     result.add_argument("--dry-run", action="store_true")
     return result
+
+
+def selected_method_specs(args) -> list[tuple]:
+    specs = [METHOD_BY_NAME[name] for name in args.methods]
+    for method, _, argument, _ in specs:
+        if getattr(args, argument) is None:
+            raise ValueError(
+                f"--{argument.replace('_', '-')} is required when "
+                f"--methods includes {method}"
+            )
+    return specs
 
 
 def read_adapter_config(checkpoint: Path) -> dict:
@@ -163,9 +180,9 @@ def build_command(args, description: dict, checkpoint: Path, seed: int,
     return command
 
 
-def summarize(rows: list[dict]) -> list[dict]:
+def summarize(rows: list[dict], method_specs=METHODS) -> list[dict]:
     summaries = []
-    for method, label, _, training_data_seed in METHODS:
+    for method, label, _, training_data_seed in method_specs:
         group = [
             row for row in rows
             if row.get("method") == method and row.get("status") == "complete"
@@ -253,14 +270,15 @@ def write_manifest(args, descriptions: list[dict]) -> None:
 
 def main(argv=None) -> None:
     args = parser().parse_args(argv)
-    for _, _, argument, _ in METHODS:
+    method_specs = selected_method_specs(args)
+    for _, _, argument, _ in method_specs:
         setattr(args, argument, absolute(getattr(args, argument)))
     args.output_dir = absolute(args.output_dir)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     descriptions = []
     checkpoints = {}
-    for method, _, argument, _ in METHODS:
+    for method, _, argument, _ in method_specs:
         checkpoint = getattr(args, argument)
         checkpoints[method] = checkpoint
         descriptions.append(checkpoint_description(method, checkpoint))
@@ -330,9 +348,13 @@ def main(argv=None) -> None:
                 raise RuntimeError(row["error"])
 
     if args.dry_run:
-        print("Dry run: 4 fixed checkpoints x 3 seeds = 12 evaluations")
+        print(
+            f"Dry run: {len(method_specs)} fixed checkpoints x "
+            f"{len(SEEDS)} seeds = "
+            f"{len(method_specs) * len(SEEDS)} evaluations"
+        )
         return
-    summaries = summarize(rows)
+    summaries = summarize(rows, method_specs)
     write_rows(args.output_dir / "three_seed_summary.csv", summaries)
     (args.output_dir / "three_seed_summary.json").write_text(
         json.dumps(summaries, indent=2), encoding="utf-8"
