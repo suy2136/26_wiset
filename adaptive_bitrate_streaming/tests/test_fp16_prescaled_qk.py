@@ -1,7 +1,12 @@
 import argparse
 import math
 from pathlib import Path
+import sys
 import unittest
+
+ABR_ROOT = Path(__file__).resolve().parents[1]
+if str(ABR_ROOT) not in sys.path:
+    sys.path.insert(0, str(ABR_ROOT))
 
 from adaptive_bitrate_streaming.analysis import (
     run_nbs_v19_best5_inference as best5,
