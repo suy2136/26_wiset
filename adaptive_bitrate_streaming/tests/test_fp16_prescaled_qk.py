@@ -21,7 +21,9 @@ if torch is not None:
     from adaptive_bitrate_streaming.plm_special.models.low_rank import (
         _fp16_prescaled_qk_scores,
     )
-    from adaptive_bitrate_streaming.plm_special.models.rl_policy import RLPolicy
+    from adaptive_bitrate_streaming.plm_special.models.rl_policy import (
+        OfflineRLPolicy,
+    )
 
 
 if torch is not None:
@@ -44,8 +46,8 @@ if torch is not None:
 
 
     class _Policy:
-        _require_finite = RLPolicy._require_finite
-        _run_plm = RLPolicy._run_plm
+        _require_finite = OfflineRLPolicy._require_finite
+        _run_plm = OfflineRLPolicy._run_plm
         residual = False
         which_layer = -1
 
