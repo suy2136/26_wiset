@@ -110,6 +110,8 @@ def build_command(args, experiment):
         ])
     if getattr(args, "fp16_attention_fp32_scores", False):
         command.append("--fp16-attention-fp32-scores")
+    if getattr(args, "fp16_attention_prescaled_qk", False):
+        command.append("--fp16-attention-prescaled-qk")
     compaction_rtol = getattr(args, "nbs_compaction_rtol", None)
     compaction_atol = getattr(args, "nbs_compaction_atol", None)
     if compaction_rtol is not None:

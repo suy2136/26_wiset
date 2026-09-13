@@ -225,6 +225,30 @@ def test_on_env(args, model, results_dir, env_settings, target_return, max_ep_nu
             else validation['logits_validation']['max_rel_error']
         ),
     })
+    attention_modules = [
+        module for module in model.plm.modules()
+        if hasattr(module, '_abr_attention_score_mode')
+    ]
+    attention_modes = sorted({
+        module._abr_attention_score_mode for module in attention_modules
+    })
+    test_log.update({
+        'attention_score_mode': (
+            attention_modes[0] if len(attention_modes) == 1
+            else ','.join(attention_modes) if attention_modes else 'upstream'
+        ),
+        'fp16_prescaled_qk_layer_calls': sum(
+            int(getattr(module, '_abr_fp16_prescaled_attention_calls', 0))
+            for module in attention_modules
+        ),
+        'fp16_prescaled_qk_fallback_plm_calls': int(getattr(
+            model, 'fp16_prescaled_qk_fallback_calls', 0
+        )),
+        'fp32_attention_score_layer_calls': sum(
+            int(getattr(module, '_abr_fp32_attention_score_calls', 0))
+            for module in attention_modules
+        ),
+    })
     selector_metrics = model.get_selector_metrics()
     event_selector_calls = (
         selector_metrics['temporal_selector_calls']

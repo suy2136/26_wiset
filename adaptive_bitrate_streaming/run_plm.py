@@ -143,6 +143,9 @@ def save_model(args, model, save_dir, role='checkpoint'):
             'fp16_selective_clamp_threshold': getattr(
                 args, 'fp16_selective_clamp_threshold', None
             ),
+            'fp16_attention_prescaled_qk': bool(getattr(
+                args, 'fp16_attention_prescaled_qk', False
+            )),
             'skip_nonfinite_batches': bool(getattr(
                 args, 'skip_nonfinite_batches', False
             )),
@@ -1046,6 +1049,7 @@ def run(args):
                 fp16_selective_clamp=args.fp16_selective_clamp,
                 fp16_clamp_threshold=args.fp16_selective_clamp_threshold,
                 fp16_attention_fp32_scores=args.fp16_attention_fp32_scores,
+                fp16_attention_prescaled_qk=args.fp16_attention_prescaled_qk,
                 nbs_allocation_audit=args.nbs_allocation_audit,
             )
 
@@ -1243,6 +1247,14 @@ if __name__ == '__main__':
         help=(
             'keep Llama weights/outputs in FP16 but compute QK attention '
             'scores and softmax in FP32'
+        ),
+    )
+    parser.add_argument(
+        '--fp16-attention-prescaled-qk', action='store_true',
+        help=(
+            'keep QK score formation in FP16 while applying the standard '
+            '1/sqrt(head_dim) scale to Q and K before their matrix product; '
+            'retry only a non-finite PLM call with FP32 scores'
         ),
     )
     parser.add_argument(
@@ -1487,6 +1499,11 @@ if __name__ == '__main__':
         parser.error('--fp16-selective-clamp-threshold must be in (0, 65504]')
     if args.fp16_selective_clamp and not args.fp16_numeric_safeguards:
         parser.error('--fp16-selective-clamp requires --fp16-numeric-safeguards')
+    if args.fp16_attention_fp32_scores and args.fp16_attention_prescaled_qk:
+        parser.error(
+            '--fp16-attention-fp32-scores and '
+            '--fp16-attention-prescaled-qk are mutually exclusive'
+        )
 
     if args.nbs_compact_inference is None:
         args.nbs_compact_inference = bool(args.test and args.nbs_v19)

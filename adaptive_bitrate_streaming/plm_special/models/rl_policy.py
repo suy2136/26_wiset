@@ -303,41 +303,66 @@ class OfflineRLPolicy(nn.Module):
         """Bridge FP32 ABR embeddings to the PLM dtype for every call path."""
         plm_inputs = inputs_embeds.to(self._plm_compute_dtype())
         self._require_finite(plm_inputs, 'plm_inputs')
-        # Some inference paths stop before the final Llama layer.  Clear stale
-        # adapter health from a previous call so only modules executed by this
-        # call can invalidate it.
-        health_attributes = (
-            '_nbs_last_input_absmax', '_nbs_last_input_finite',
-            '_nbs_last_base_absmax', '_nbs_last_base_finite',
-            '_nbs_last_delta_absmax', '_nbs_last_delta_finite',
-            '_nbs_last_precast_absmax', '_nbs_last_precast_finite',
-        )
-        for module in self.plm.modules():
-            for attribute in health_attributes:
-                if hasattr(module, attribute):
-                    delattr(module, attribute)
-        outputs = self.plm(
-            inputs_embeds=plm_inputs,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-            stop_layer_idx=self.which_layer,
-        )
-        adapter_issues = self._adalora_overflow_candidates()
-        if adapter_issues:
-            details = {
-                'stage': 'adalora_projection',
-                'adalora_overflow_candidates': adapter_issues,
-            }
-            self.last_nonfinite_inference = details
-            raise NonFiniteInferenceError(details)
-        # The task-head boundary is inexpensive to keep in FP32 and avoids a
-        # final FP16 residual addition overflowing otherwise-finite PLM output.
-        hidden = outputs['last_hidden_state'].float()
-        self._require_finite(hidden, 'plm_hidden')
-        if self.residual:
-            hidden = hidden + plm_inputs.float()
-            self._require_finite(hidden, 'plm_hidden_after_residual')
-        return hidden
+
+        def forward_once():
+            # Some inference paths stop before the final Llama layer.  Clear
+            # stale adapter health so this attempt is diagnosed independently.
+            health_attributes = (
+                '_nbs_last_input_absmax', '_nbs_last_input_finite',
+                '_nbs_last_base_absmax', '_nbs_last_base_finite',
+                '_nbs_last_delta_absmax', '_nbs_last_delta_finite',
+                '_nbs_last_precast_absmax', '_nbs_last_precast_finite',
+            )
+            for module in self.plm.modules():
+                for attribute in health_attributes:
+                    if hasattr(module, attribute):
+                        delattr(module, attribute)
+            outputs = self.plm(
+                inputs_embeds=plm_inputs,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                stop_layer_idx=self.which_layer,
+            )
+            adapter_issues = self._adalora_overflow_candidates()
+            if adapter_issues:
+                details = {
+                    'stage': 'adalora_projection',
+                    'adalora_overflow_candidates': adapter_issues,
+                }
+                self.last_nonfinite_inference = details
+                raise NonFiniteInferenceError(details)
+            # The task-head boundary is inexpensive to keep in FP32 and avoids
+            # a final FP16 residual addition overflowing finite PLM output.
+            hidden = outputs['last_hidden_state'].float()
+            self._require_finite(hidden, 'plm_hidden')
+            if self.residual:
+                hidden = hidden + plm_inputs.float()
+                self._require_finite(hidden, 'plm_hidden_after_residual')
+            return hidden
+
+        prescaled_modules = [
+            module for module in self.plm.modules()
+            if getattr(module, '_abr_attention_score_mode', None)
+            == 'fp16_prescaled'
+        ]
+        try:
+            return forward_once()
+        except NonFiniteInferenceError:
+            if not prescaled_modules:
+                raise
+            # Recovery is intentionally outside the normal attention path:
+            # no per-layer CUDA synchronization is added to successful FP16
+            # calls.  Only this failed PLM invocation is recomputed in FP32.
+            self.fp16_prescaled_qk_fallback_calls = (
+                int(getattr(self, 'fp16_prescaled_qk_fallback_calls', 0)) + 1
+            )
+            for module in prescaled_modules:
+                module._abr_force_fp32_attention_scores = True
+            try:
+                return forward_once()
+            finally:
+                for module in prescaled_modules:
+                    module._abr_force_fp32_attention_scores = False
 
     def _run_action_head(self, hidden):
         """Bridge PLM outputs back to the FP32 ABR task head."""

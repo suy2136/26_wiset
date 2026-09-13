@@ -34,7 +34,16 @@ TARGET_MODULES = {
 LORA_METHODS = ('uniform', 'nbs', 'adalora', 'shapley', 'eva')
 
 
-def _llama_fp32_attention_forward(
+def _fp16_prescaled_qk_scores(query_states, key_states, head_dim):
+    """Form scaled QK scores without materializing the unscaled FP16 dot product."""
+    operand_scale = math.sqrt(math.sqrt(head_dim))
+    return torch.matmul(
+        query_states / operand_scale,
+        (key_states / operand_scale).transpose(2, 3),
+    )
+
+
+def _llama_safe_attention_forward(
     self,
     hidden_states,
     attention_mask=None,
@@ -44,12 +53,12 @@ def _llama_fp32_attention_forward(
     use_cache=False,
     padding_mask=None,
 ):
-    """Transformers 4.34 Llama attention with FP32 QK scores.
+    """Transformers 4.34 Llama attention with selectable safe QK scores.
 
     The upstream implementation casts the softmax to FP32 only after the
     FP16 QK matmul.  Large finite Q/K values can therefore overflow before
-    that cast.  Weights, value aggregation, and outputs remain in the model
-    dtype; only score formation and softmax use FP32.
+    that cast.  The selected mode either pre-scales FP16 operands or forms
+    scores in FP32; weights, value aggregation, and outputs stay unchanged.
     """
     from transformers.models.llama.modeling_llama import (
         apply_rotary_pos_emb, repeat_kv,
@@ -107,11 +116,26 @@ def _llama_fp32_attention_forward(
     key_states = repeat_kv(key_states, self.num_key_value_groups)
     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    # Critical difference from Transformers 4.34.1: cast Q and K before the
-    # matrix multiplication, not merely during the subsequent softmax.
-    attn_weights = torch.matmul(
-        query_states.float(), key_states.transpose(2, 3).float()
-    ) / math.sqrt(self.head_dim)
+    force_fp32 = bool(getattr(self, '_abr_force_fp32_attention_scores', False))
+    score_mode = getattr(self, '_abr_attention_score_mode', 'fp32')
+    if score_mode == 'fp16_prescaled' and not force_fp32:
+        # Algebraically equivalent to (Q @ K.T) / sqrt(head_dim), while
+        # avoiding the large unscaled FP16 intermediate that can overflow.
+        attn_weights = _fp16_prescaled_qk_scores(
+            query_states, key_states, self.head_dim
+        )
+        self._abr_fp16_prescaled_attention_calls = (
+            int(getattr(self, '_abr_fp16_prescaled_attention_calls', 0)) + 1
+        )
+    else:
+        # FP32 is either the explicitly selected mode or a one-call recovery
+        # requested by RLPolicy after a non-finite prescaled forward.
+        attn_weights = torch.matmul(
+            query_states.float(), key_states.transpose(2, 3).float()
+        ) / math.sqrt(self.head_dim)
+        self._abr_fp32_attention_score_calls = (
+            int(getattr(self, '_abr_fp32_attention_score_calls', 0)) + 1
+        )
     expected_weights = (bsz, self.num_heads, q_len, kv_seq_len)
     if attn_weights.size() != expected_weights:
         raise ValueError(
@@ -125,7 +149,12 @@ def _llama_fp32_attention_forward(
                 f"attention mask should be {expected_mask}, got "
                 f"{tuple(attention_mask.size())}"
             )
-        attn_weights = attn_weights + attention_mask.float()
+        mask = (
+            attention_mask.float()
+            if attn_weights.dtype == torch.float32
+            else attention_mask.to(attn_weights.dtype)
+        )
+        attn_weights = attn_weights + mask
     attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
     attention_probabilities = attn_weights.to(value_states.dtype)
     attn_output = torch.matmul(attention_probabilities, value_states)
@@ -151,9 +180,6 @@ def _llama_fp32_attention_forward(
         )
     else:
         attn_output = self.o_proj(attn_output)
-    self._abr_fp32_attention_score_calls = (
-        int(getattr(self, '_abr_fp32_attention_score_calls', 0)) + 1
-    )
     return (
         attn_output,
         attn_weights if output_attentions else None,
@@ -166,7 +192,23 @@ def _patch_llama_fp32_attention_scores(model):
     for module in model.modules():
         if module.__class__.__name__ != 'LlamaAttention':
             continue
-        module.forward = MethodType(_llama_fp32_attention_forward, module)
+        module.forward = MethodType(_llama_safe_attention_forward, module)
+        module._abr_attention_score_mode = 'fp32'
+        module._abr_force_fp32_attention_scores = False
+        module._abr_fp32_attention_score_calls = 0
+        patched += 1
+    return patched
+
+
+def _patch_llama_fp16_prescaled_qk(model):
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != 'LlamaAttention':
+            continue
+        module.forward = MethodType(_llama_safe_attention_forward, module)
+        module._abr_attention_score_mode = 'fp16_prescaled'
+        module._abr_force_fp32_attention_scores = False
+        module._abr_fp16_prescaled_attention_calls = 0
         module._abr_fp32_attention_score_calls = 0
         patched += 1
     return patched
@@ -473,6 +515,7 @@ def peft_model(
     fp16_selective_clamp=False,
     fp16_clamp_threshold=60000.0,
     fp16_attention_fp32_scores=False,
+    fp16_attention_prescaled_qk=False,
     nbs_allocation_audit=False,
 ):
     if lora_method is None:
@@ -565,7 +608,19 @@ def peft_model(
         )
 
     model = get_peft_model(plm, config)
-    if fp16_attention_fp32_scores:
+    if fp16_attention_fp32_scores and fp16_attention_prescaled_qk:
+        raise ValueError(
+            'FP32 attention scores and FP16 prescaled QK are mutually exclusive'
+        )
+    if fp16_attention_prescaled_qk:
+        patched_attention = _patch_llama_fp16_prescaled_qk(model)
+        if patched_attention == 0:
+            raise ValueError('no LlamaAttention modules found for FP16 prescaled QK')
+        print(
+            'FP16 inference safeguard: prescaled QK attention enabled for',
+            patched_attention, 'layers',
+        )
+    elif fp16_attention_fp32_scores:
         patched_attention = _patch_llama_fp32_attention_scores(model)
         if plm_type == 'llama' and patched_attention == 0:
             raise RuntimeError('no LlamaAttention modules found for FP32 scores')
