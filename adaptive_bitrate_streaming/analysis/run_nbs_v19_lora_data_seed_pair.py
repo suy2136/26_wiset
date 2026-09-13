@@ -152,6 +152,14 @@ def parse_args(argv=None):
     parser.add_argument("--trace-num", type=int, default=100)
     parser.add_argument("--video", default="video1")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--nbs-compaction-rtol", type=float, default=0.05,
+        help="compact-logit relative tolerance (historical data-seed-3 value)",
+    )
+    parser.add_argument(
+        "--nbs-compaction-atol", type=float, default=0.01,
+        help="compact-logit absolute tolerance (historical data-seed-3 value)",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -167,6 +175,8 @@ def signature(args, rng_mode):
         "evaluation_rng_mode": rng_mode,
         "attention_mode": "legacy_fp16_scores",
         "fp16_attention_fp32_scores": False,
+        "nbs_compaction_rtol": args.nbs_compaction_rtol,
+        "nbs_compaction_atol": args.nbs_compaction_atol,
         "rank_budget": args.rank_budget,
         "physical_rank": args.physical_rank,
         "checkpoint_lora_seed": args.checkpoint_lora_seed,

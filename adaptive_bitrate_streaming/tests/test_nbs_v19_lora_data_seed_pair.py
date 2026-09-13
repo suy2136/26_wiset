@@ -48,6 +48,7 @@ class NBSLoraDataSeedPairTest(unittest.TestCase):
             rank_config=Path("rank.json"), trace="fcc-test", trace_num=100,
             video="video1", device="cuda:0", fp16_numeric_safeguards=False,
             fp16_selective_clamp=False, fp16_attention_fp32_scores=False,
+            nbs_compaction_rtol=0.05, nbs_compaction_atol=0.01,
         )
         for spec in pipeline.TARGET_SPECS:
             command = pipeline.sweep.best5.build_command(args, spec)
@@ -55,6 +56,12 @@ class NBSLoraDataSeedPairTest(unittest.TestCase):
             self.assertNotIn("--fp16-numeric-safeguards", command)
             self.assertEqual(command[command.index("--data-seed") + 1], "3")
             self.assertEqual(command[command.index("--lora-seed") + 1], "1")
+            self.assertEqual(
+                command[command.index("--nbs-compaction-rtol") + 1], "0.05"
+            )
+            self.assertEqual(
+                command[command.index("--nbs-compaction-atol") + 1], "0.01"
+            )
 
     def test_summary_averages_two_trained_checkpoints(self):
         rows = []

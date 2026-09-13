@@ -110,6 +110,12 @@ def build_command(args, experiment):
         ])
     if getattr(args, "fp16_attention_fp32_scores", False):
         command.append("--fp16-attention-fp32-scores")
+    compaction_rtol = getattr(args, "nbs_compaction_rtol", None)
+    compaction_atol = getattr(args, "nbs_compaction_atol", None)
+    if compaction_rtol is not None:
+        command.extend(["--nbs-compaction-rtol", str(compaction_rtol)])
+    if compaction_atol is not None:
+        command.extend(["--nbs-compaction-atol", str(compaction_atol)])
     if temporal:
         command.extend([
             "--event-max-events", str(event_max_events),
