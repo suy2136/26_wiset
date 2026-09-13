@@ -104,6 +104,8 @@ def build_command(args, experiment):
             "--fp16-selective-clamp-threshold",
             str(getattr(args, "fp16_selective_clamp_threshold", 60000.0)),
         ])
+    if getattr(args, "fp16_attention_fp32_scores", False):
+        command.append("--fp16-attention-fp32-scores")
     if temporal:
         command.extend([
             "--event-max-events", str(event_max_events),

@@ -1,5 +1,6 @@
 import atexit
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -7,6 +8,7 @@ from types import MethodType
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from peft import AdaLoraConfig, LoraConfig, get_peft_model, TaskType
 
 
@@ -30,6 +32,144 @@ TARGET_MODULES = {
 }
 
 LORA_METHODS = ('uniform', 'nbs', 'adalora', 'shapley', 'eva')
+
+
+def _llama_fp32_attention_forward(
+    self,
+    hidden_states,
+    attention_mask=None,
+    position_ids=None,
+    past_key_value=None,
+    output_attentions=False,
+    use_cache=False,
+    padding_mask=None,
+):
+    """Transformers 4.34 Llama attention with FP32 QK scores.
+
+    The upstream implementation casts the softmax to FP32 only after the
+    FP16 QK matmul.  Large finite Q/K values can therefore overflow before
+    that cast.  Weights, value aggregation, and outputs remain in the model
+    dtype; only score formation and softmax use FP32.
+    """
+    from transformers.models.llama.modeling_llama import (
+        apply_rotary_pos_emb, repeat_kv,
+    )
+
+    bsz, q_len, _ = hidden_states.size()
+    if self.config.pretraining_tp > 1:
+        key_value_slicing = (
+            self.num_key_value_heads * self.head_dim
+        ) // self.config.pretraining_tp
+        query_slices = self.q_proj.weight.split(
+            (self.num_heads * self.head_dim) // self.config.pretraining_tp,
+            dim=0,
+        )
+        key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+        value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+        query_states = torch.cat([
+            F.linear(hidden_states, query_slices[index])
+            for index in range(self.config.pretraining_tp)
+        ], dim=-1)
+        key_states = torch.cat([
+            F.linear(hidden_states, key_slices[index])
+            for index in range(self.config.pretraining_tp)
+        ], dim=-1)
+        value_states = torch.cat([
+            F.linear(hidden_states, value_slices[index])
+            for index in range(self.config.pretraining_tp)
+        ], dim=-1)
+    else:
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+    query_states = query_states.view(
+        bsz, q_len, self.num_heads, self.head_dim
+    ).transpose(1, 2)
+    key_states = key_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+    value_states = value_states.view(
+        bsz, q_len, self.num_key_value_heads, self.head_dim
+    ).transpose(1, 2)
+
+    kv_seq_len = key_states.shape[-2]
+    if past_key_value is not None:
+        kv_seq_len += past_key_value[0].shape[-2]
+    cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+    query_states, key_states = apply_rotary_pos_emb(
+        query_states, key_states, cos, sin, position_ids
+    )
+    if past_key_value is not None:
+        key_states = torch.cat([past_key_value[0], key_states], dim=2)
+        value_states = torch.cat([past_key_value[1], value_states], dim=2)
+    next_past_key_value = (key_states, value_states) if use_cache else None
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+    # Critical difference from Transformers 4.34.1: cast Q and K before the
+    # matrix multiplication, not merely during the subsequent softmax.
+    attn_weights = torch.matmul(
+        query_states.float(), key_states.transpose(2, 3).float()
+    ) / math.sqrt(self.head_dim)
+    expected_weights = (bsz, self.num_heads, q_len, kv_seq_len)
+    if attn_weights.size() != expected_weights:
+        raise ValueError(
+            f"attention weights should be {expected_weights}, got "
+            f"{tuple(attn_weights.size())}"
+        )
+    if attention_mask is not None:
+        expected_mask = (bsz, 1, q_len, kv_seq_len)
+        if attention_mask.size() != expected_mask:
+            raise ValueError(
+                f"attention mask should be {expected_mask}, got "
+                f"{tuple(attention_mask.size())}"
+            )
+        attn_weights = attn_weights + attention_mask.float()
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32)
+    attention_probabilities = attn_weights.to(value_states.dtype)
+    attn_output = torch.matmul(attention_probabilities, value_states)
+    expected_output = (bsz, self.num_heads, q_len, self.head_dim)
+    if attn_output.size() != expected_output:
+        raise ValueError(
+            f"attention output should be {expected_output}, got "
+            f"{tuple(attn_output.size())}"
+        )
+    attn_output = attn_output.transpose(1, 2).contiguous().reshape(
+        bsz, q_len, self.hidden_size
+    )
+    if self.config.pretraining_tp > 1:
+        chunks = attn_output.split(
+            self.hidden_size // self.config.pretraining_tp, dim=2
+        )
+        output_slices = self.o_proj.weight.split(
+            self.hidden_size // self.config.pretraining_tp, dim=1
+        )
+        attn_output = sum(
+            F.linear(chunks[index], output_slices[index])
+            for index in range(self.config.pretraining_tp)
+        )
+    else:
+        attn_output = self.o_proj(attn_output)
+    self._abr_fp32_attention_score_calls = (
+        int(getattr(self, '_abr_fp32_attention_score_calls', 0)) + 1
+    )
+    return (
+        attn_output,
+        attn_weights if output_attentions else None,
+        next_past_key_value,
+    )
+
+
+def _patch_llama_fp32_attention_scores(model):
+    patched = 0
+    for module in model.modules():
+        if module.__class__.__name__ != 'LlamaAttention':
+            continue
+        module.forward = MethodType(_llama_fp32_attention_forward, module)
+        module._abr_fp32_attention_score_calls = 0
+        patched += 1
+    return patched
 
 
 _RANGE_AUDIT_PATH = os.environ.get('ABR_LORA_RANGE_AUDIT_PATH')
@@ -332,6 +472,7 @@ def peft_model(
     eva_state=None,
     fp16_selective_clamp=False,
     fp16_clamp_threshold=60000.0,
+    fp16_attention_fp32_scores=False,
     nbs_allocation_audit=False,
 ):
     if lora_method is None:
@@ -424,6 +565,14 @@ def peft_model(
         )
 
     model = get_peft_model(plm, config)
+    if fp16_attention_fp32_scores:
+        patched_attention = _patch_llama_fp32_attention_scores(model)
+        if plm_type == 'llama' and patched_attention == 0:
+            raise RuntimeError('no LlamaAttention modules found for FP32 scores')
+        print(
+            'FP16 inference safeguard: FP32 attention scores enabled for',
+            patched_attention, 'modules',
+        )
     if module_count is None:
         module_count = sum(
             1 for module in model.modules()

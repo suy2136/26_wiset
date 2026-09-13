@@ -43,6 +43,7 @@ class ABRReseedLatestModulesTest(unittest.TestCase):
         self.assertIn("args.fp16_numeric_safeguards = True", source)
         self.assertIn("args.fp16_selective_clamp = True", source)
         self.assertIn("args.fp16_selective_clamp_threshold = 60000.0", source)
+        self.assertIn("args.fp16_attention_fp32_scores = True", source)
 
         command_args = argparse.Namespace(
             data_seed=3, base_model_dir=Path("base"),
@@ -52,6 +53,7 @@ class ABRReseedLatestModulesTest(unittest.TestCase):
             video="video1", device="cuda:0", evaluation_rng_mode="per-episode",
             fp16_numeric_safeguards=True, fp16_selective_clamp=True,
             fp16_selective_clamp_threshold=60000.0,
+            fp16_attention_fp32_scores=True,
         )
         command = pipeline.sweep.best5.build_command(
             command_args, pipeline.TEMPORAL
@@ -62,6 +64,7 @@ class ABRReseedLatestModulesTest(unittest.TestCase):
             command[command.index("--fp16-selective-clamp-threshold") + 1],
             "60000.0",
         )
+        self.assertIn("--fp16-attention-fp32-scores", command)
 
 
 if __name__ == "__main__":

@@ -1045,6 +1045,7 @@ def run(args):
                 eva_state=eva_state,
                 fp16_selective_clamp=args.fp16_selective_clamp,
                 fp16_clamp_threshold=args.fp16_selective_clamp_threshold,
+                fp16_attention_fp32_scores=args.fp16_attention_fp32_scores,
                 nbs_allocation_audit=args.nbs_allocation_audit,
             )
 
@@ -1236,6 +1237,13 @@ if __name__ == '__main__':
     parser.add_argument(
         '--fp16-selective-clamp-threshold', type=float, default=60000.0,
         help='absolute finite-value threshold for the opt-in FP16 clamp',
+    )
+    parser.add_argument(
+        '--fp16-attention-fp32-scores', action='store_true',
+        help=(
+            'keep Llama weights/outputs in FP16 but compute QK attention '
+            'scores and softmax in FP32'
+        ),
     )
     parser.add_argument(
         '--skip-nonfinite-batches', action='store_true',

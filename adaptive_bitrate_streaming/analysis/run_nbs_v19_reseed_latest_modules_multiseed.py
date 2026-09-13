@@ -170,6 +170,7 @@ def main(argv=None):
     args.fp16_numeric_safeguards = True
     args.fp16_selective_clamp = True
     args.fp16_selective_clamp_threshold = 60000.0
+    args.fp16_attention_fp32_scores = True
     args.confirmation_seeds = list(SEEDS)
     args.combined_finalists = 1
     args.output_dir.mkdir(parents=True, exist_ok=True)
