@@ -31,6 +31,7 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "eva_b512_data2" && \
       "$VARIANT" != "uniform_r8_data1" && \
       "$VARIANT" != "adalora_b512_data1" && \
+      "$VARIANT" != "shapley_b512_data1" && \
       "$VARIANT" != "eva_b512_data1" && \
       "$VARIANT" != "shapley_b512_data2" && \
       "$VARIANT" != "plain" ]]; then
@@ -45,6 +46,7 @@ VALIDATION_INTERVAL="${VALIDATION_INTERVAL:-500}"
 EVAL_PROGRESS_INTERVAL="${EVAL_PROGRESS_INTERVAL:-500}"
 SAVE_PERIODIC_CHECKPOINTS="${SAVE_PERIODIC_CHECKPOINTS:-0}"
 SKIP_VISUALIZATION="${SKIP_VISUALIZATION:-0}"
+SKIP_EVALUATION="${SKIP_EVALUATION:-0}"
 LATENCY_WARMUP_STEPS="${LATENCY_WARMUP_STEPS:-5}"
 GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-32}"
 LEARNING_RATE="${LEARNING_RATE:-0.0002}"
@@ -90,6 +92,10 @@ if [[ "$SAVE_PERIODIC_CHECKPOINTS" != "0" && "$SAVE_PERIODIC_CHECKPOINTS" != "1"
 fi
 if [[ "$SKIP_VISUALIZATION" != "0" && "$SKIP_VISUALIZATION" != "1" ]]; then
   echo "SKIP_VISUALIZATION must be 0 or 1."
+  exit 2
+fi
+if [[ "$SKIP_EVALUATION" != "0" && "$SKIP_EVALUATION" != "1" ]]; then
+  echo "SKIP_EVALUATION must be 0 or 1."
   exit 2
 fi
 
@@ -750,9 +756,13 @@ elif [[ "$VARIANT" == "adalora_b512_data2" || \
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
-elif [[ "$VARIANT" == "shapley_b512_data2" ]]; then
+  if [[ "$VARIANT" == "adalora_b512_data1" ]]; then
+    EXTRA_ARGS+=(--save-final-adalora-model)
+  fi
+elif [[ "$VARIANT" == "shapley_b512_data2" || \
+        "$VARIANT" == "shapley_b512_data1" ]]; then
   use_v19_schedule
-  MODEL_TAG="llama_base_low_rank_adalora_shapley_b512_data2"
+  MODEL_TAG="llama_base_low_rank_adalora_${VARIANT}"
   ADALORA_ALLOCATOR_MODE="shapley"
   DISPLAY_NAME="Shapley AdaLoRA (init32-target8-budget512, LoRA seed1, data seed2)"
   RANK=8
@@ -760,7 +770,12 @@ elif [[ "$VARIANT" == "shapley_b512_data2" ]]; then
   ADALORA_INIT_RANK=32
   SEED=1
   LORA_SEED=1
-  DATA_SEED=2
+  if [[ "$VARIANT" == "shapley_b512_data1" ]]; then
+    DATA_SEED=1
+    DISPLAY_NAME="Shapley AdaLoRA (init32-target8-budget512, LoRA seed1, data seed1)"
+  else
+    DATA_SEED=2
+  fi
   BEST_MODEL_NAME="best_ar_model"
   SHAPLEY_PERMUTATIONS="${SHAPLEY_PERMUTATIONS:-1}"
   SHAPLEY_VALIDATION_BATCHES="${SHAPLEY_VALIDATION_BATCHES:-1}"
@@ -777,7 +792,7 @@ elif [[ "$VARIANT" == "shapley_b512_data2" ]]; then
     --shapley-validation-batches "$SHAPLEY_VALIDATION_BATCHES"
     --shapley-truncate-fraction "$SHAPLEY_TRUNCATE_FRACTION"
     --shapley-value-mode "$SHAPLEY_VALUE_MODE"
-    --experiment-tag shapley_b512_data2
+    --experiment-tag "$VARIANT"
     --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
     --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
   )
@@ -819,7 +834,7 @@ fi
 if [[ "${VP_B512_SMOKE:-0}" == "1" ]]; then
   case "$VARIANT" in
     uniform_r8_data2|adalora_b512_data2|eva_b512_data2|shapley_b512_data2|\
-    uniform_r8_data1|adalora_b512_data1|eva_b512_data1)
+    uniform_r8_data1|adalora_b512_data1|eva_b512_data1|shapley_b512_data1)
       EPOCHS=1
       CHECKPOINT_INTERVAL=10
       VALIDATION_INTERVAL=5
@@ -1059,6 +1074,11 @@ elif [[ -z "${NBS_DIAGNOSTICS:-}" ]] && ! adapter_checkpoint_complete "$BEST_MOD
   write_status "training" "failed_missing_best_model" 3
   echo "Training exited but best_model was not found: $BEST_MODEL"
   exit 3
+fi
+if [[ "$SKIP_EVALUATION" == "1" ]]; then
+  write_status "evaluation" "skipped" 0
+  echo "[$DISPLAY_NAME] evaluation skipped by SKIP_EVALUATION=1"
+  exit 0
 fi
 if [[ -n "${NBS_DIAGNOSTICS:-}" ]]; then
   CHECKPOINT_ROLES=(best_ar best_post_nbs final_nbs)

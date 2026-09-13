@@ -192,6 +192,31 @@ def enable_vp_fp16_fallback(model):
     return enabled
 
 
+def enable_vp_fp16_prescaled_qk(model):
+    """Use FP16 pre-scaled Q/K by default, retaining FP32 retry safety."""
+    enabled = 0
+    for module in model.modules():
+        if module.__class__.__name__ != "LlamaNetworkingHeadModel":
+            continue
+        for attention in module.model.modules():
+            if attention.__class__.__name__ != "LlamaAttention":
+                continue
+            attention.forward = MethodType(
+                _safe_llama_attention_forward, attention
+            )
+            attention._vp_safe_attention_mode = "fp16_prescaled"
+        module._vp_fp16_prescaled_qk_enabled = True
+        module._vp_fp16_fallback_enabled = True
+        module.vp_fp16_fallback_calls = int(
+            getattr(module, "vp_fp16_fallback_calls", 0)
+        )
+        module.vp_fp32_fallback_calls = int(
+            getattr(module, "vp_fp32_fallback_calls", 0)
+        )
+        enabled += 1
+    return enabled
+
+
 def vp_numeric_safety_report(model):
     targets = [
         module for module in model.modules()
@@ -200,6 +225,10 @@ def vp_numeric_safety_report(model):
     ]
     return {
         "enabled_models": len(targets),
+        "fp16_prescaled_qk_enabled_models": sum(
+            int(getattr(module, "_vp_fp16_prescaled_qk_enabled", False))
+            for module in targets
+        ),
         "fp16_prescaled_qk_fallback_calls": sum(
             int(getattr(module, "vp_fp16_fallback_calls", 0))
             for module in targets

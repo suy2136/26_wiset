@@ -87,11 +87,12 @@ class LlamaNetworkingHeadModel(LlamaForCausalLM):
             )
             if not prediction_finite:
                 from models.vp_numeric_safety import vp_safe_retry
-                self.vp_fp16_fallback_calls = int(
-                    getattr(self, "vp_fp16_fallback_calls", 0)
-                ) + 1
-                with vp_safe_retry(self.model, "fp16_prescaled"):
-                    outputs, prediction = forward_once()
+                if not getattr(self, "_vp_fp16_prescaled_qk_enabled", False):
+                    self.vp_fp16_fallback_calls = int(
+                        getattr(self, "vp_fp16_fallback_calls", 0)
+                    ) + 1
+                    with vp_safe_retry(self.model, "fp16_prescaled"):
+                        outputs, prediction = forward_once()
                 if not bool(torch.isfinite(prediction.detach()).all().item()):
                     self.vp_fp32_fallback_calls = int(
                         getattr(self, "vp_fp32_fallback_calls", 0)

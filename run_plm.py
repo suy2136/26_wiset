@@ -1123,6 +1123,9 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
     final_shapley_model_path = os.path.join(
         checkpoint_root, 'final_shapley_model'
     )
+    final_adalora_model_path = os.path.join(
+        checkpoint_root, 'final_adalora_model'
+    )
     console_log = open(os.path.join(models_dir, file_prefix + '_console.log'), 'w')
     sys.stdout = ConsoleLogger(sys.__stdout__, console_log)
 
@@ -1809,6 +1812,24 @@ def adapt(args, pipeline, dataloader_train, dataloader_valid, models_dir, grad_a
             },
         )
         print('Final Shapley AdaLoRA model saved at', final_shapley_model_path)
+    elif (args.rank != -1 and args.use_adalora and
+          args.adalora_allocator == 'peft' and
+          args.save_final_adalora_model):
+        timed_checkpoint(
+            save_model,
+            args,
+            pipeline,
+            final_adalora_model_path,
+            metadata={
+                'checkpoint_role': 'final_adalora',
+                'optimizer_step': int(opt_step),
+                'validation_loss': last_valid_loss,
+                'teacher_forcing_validation_loss': (
+                    last_teacher_forcing_valid_loss
+                ),
+            },
+        )
+        print('Final stock AdaLoRA model saved at', final_adalora_model_path)
 
     if allocation_audit_dir is not None:
         training_finished_wall = datetime.datetime.now(datetime.timezone.utc)
@@ -2254,7 +2275,7 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             with open(stats_path, 'w', encoding='utf-8') as handle:
                 json.dump(stats, handle, indent=2)
             print('Cached patch selector statistics saved at', stats_path)
-        if args.nbs_inference_mode == 'compact' or args.vp_fp16_fallback:
+        if args.nbs_inference_mode == 'compact' or args.vp_fp16_fallback or args.vp_fp16_prescaled_qk:
             from models.vp_numeric_safety import vp_numeric_safety_report
             safety_report = vp_numeric_safety_report(pipeline)
             if safety_report['enabled_models']:
@@ -2586,16 +2607,30 @@ def run(args):
                          cached_patch_refresh_interval=args.cached_patch_refresh_interval,
                          cached_patch_max_skip_calls=args.cached_patch_max_skip_calls)
     if args.vp_fp16_fallback:
-        from models.vp_numeric_safety import enable_vp_fp16_fallback
+        from models.vp_numeric_safety import (
+            enable_vp_fp16_fallback,
+        )
         enabled_models = enable_vp_fp16_fallback(pipeline)
         if enabled_models != 1:
             raise RuntimeError(
-                '--vp-fp16-fallback expected exactly one VP Llama model, '
+                'VP FP16 safety expected exactly one VP Llama model, '
                 f'found {enabled_models}'
             )
         print(
             'VP numeric safety: normal FP16 fast path; retry non-finite '
             'predictions with prescaled Q/K, then FP32 attention'
+        )
+    elif args.vp_fp16_prescaled_qk:
+        from models.vp_numeric_safety import enable_vp_fp16_prescaled_qk
+        enabled_models = enable_vp_fp16_prescaled_qk(pipeline)
+        if enabled_models != 1:
+            raise RuntimeError(
+                'VP FP16 safety expected exactly one VP Llama model, '
+                f'found {enabled_models}'
+            )
+        print(
+            'VP numeric safety: FP16 prescaled Q/K default; retry '
+            'non-finite predictions with FP32 attention'
         )
     # print_trainable_parameters(pipeline)
 
@@ -2718,6 +2753,13 @@ if __name__ == '__main__':
             'Opt in to the VP normal-FP16 fast path with retry-only numeric '
             'safety: prescaled Q/K after a non-finite prediction, followed '
             'by FP32 attention only if the first retry is still non-finite.'
+        ),
+    )
+    parser.add_argument(
+        '--vp-fp16-prescaled-qk', action='store_true',
+        help=(
+            'Opt in to FP16 pre-scaled Q/K attention for every VP forward; '
+            'retry only non-finite predictions with FP32 attention.'
         ),
     )
     parser.add_argument('--gradient-checkpointing', action='store_true', dest='gradient_checkpointing',
@@ -3081,6 +3123,13 @@ if __name__ == '__main__':
             'nonzero slot; active-only updates only currently active mask slots.'
         ),
     )
+    parser.add_argument(
+        '--save-final-adalora-model', action='store_true',
+        help=(
+            'Additionally save the final stock-AdaLoRA state in a separate '
+            'checkpoint. Existing best-checkpoint behavior is unchanged.'
+        ),
+    )
     parser.add_argument('--adalora-diagnostics-path', type=str, default=None,
                         help='CSV path for durable per-allocation NBS statistics and rank trajectory. '
                              'Defaults to the current training artifact directory.')
@@ -3109,7 +3158,7 @@ if __name__ == '__main__':
                                  'uniform_r8_data2', 'adalora_b512_data2',
                                  'eva_b512_data2', 'shapley_b512_data2',
                                  'uniform_r8_data1', 'adalora_b512_data1',
-                                 'eva_b512_data1'],
+                                 'eva_b512_data1', 'shapley_b512_data1'],
                         default=None,
                         help='Optional suffix that isolates model/result directories for an experiment variant.')
     parser.add_argument(
