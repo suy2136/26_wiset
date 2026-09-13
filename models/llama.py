@@ -55,25 +55,54 @@ class LlamaNetworkingHeadModel(LlamaForCausalLM):
             base_dtype = self.model.layers[0].self_attn.k_proj.weight.dtype
             inputs_embeds = inputs_embeds.to(base_dtype)
 
-        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        def forward_once():
+            # decoder outputs consists of
+            # (dec_features, layer_state, dec_hidden, dec_attn)
+            current_outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+            hidden_states = current_outputs[0].float()
+            if teacher_forcing:
+                current_prediction = self.networking_head.teacher_forcing(
+                    hidden_states
+                )
+            else:
+                current_prediction = self.networking_head(hidden_states)
+            return current_outputs, current_prediction
 
-        hidden_states = outputs[0].float()  # bridge back to fp32 for the (fp32) networking head when the base model runs in fp16
-
-        if teacher_forcing:
-            prediction = self.networking_head.teacher_forcing(hidden_states)
-        else:
-            prediction = self.networking_head(hidden_states)
+        outputs, prediction = forward_once()
+        if getattr(self, "_vp_fp16_fallback_enabled", False):
+            # Check the tiny task-head output rather than every hidden tensor or
+            # every compact projection.  This preserves the normal fast path.
+            prediction_finite = bool(
+                torch.isfinite(prediction.detach()).all().item()
+            )
+            if not prediction_finite:
+                from models.vp_numeric_safety import vp_safe_retry
+                self.vp_fp16_fallback_calls = int(
+                    getattr(self, "vp_fp16_fallback_calls", 0)
+                ) + 1
+                with vp_safe_retry(self.model, "fp16_prescaled"):
+                    outputs, prediction = forward_once()
+                if not bool(torch.isfinite(prediction.detach()).all().item()):
+                    self.vp_fp32_fallback_calls = int(
+                        getattr(self, "vp_fp32_fallback_calls", 0)
+                    ) + 1
+                    with vp_safe_retry(self.model, "fp32"):
+                        outputs, prediction = forward_once()
+                if not bool(torch.isfinite(prediction.detach()).all().item()):
+                    raise FloatingPointError(
+                        "non-finite VP prediction after prescaled-Q/K and "
+                        "FP32-attention retries"
+                    )
 
         loss = None
 

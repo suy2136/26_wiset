@@ -2254,6 +2254,18 @@ def test(args, pipeline, dataloader_test, models_dir, results_dir):
             with open(stats_path, 'w', encoding='utf-8') as handle:
                 json.dump(stats, handle, indent=2)
             print('Cached patch selector statistics saved at', stats_path)
+        if args.nbs_inference_mode == 'compact':
+            from models.vp_numeric_safety import vp_numeric_safety_report
+            safety_report = vp_numeric_safety_report(pipeline)
+            if safety_report['enabled_models']:
+                safety_path = os.path.join(
+                    results_dir, 'vp_numeric_safety.json'
+                )
+                os.makedirs(os.path.dirname(safety_path), exist_ok=True)
+                with open(safety_path, 'w', encoding='utf-8') as handle:
+                    json.dump(safety_report, handle, indent=2)
+                print('VP numeric-safety report saved at', safety_path)
+                print('VP numeric-safety fallback counts:', safety_report)
     print(
         'Evaluation RNG mode:', evaluation_rng_mode,
         'episodes reseeded:', max(0, evaluation_episode_index + 1),

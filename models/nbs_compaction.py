@@ -83,6 +83,10 @@ class CompactLoRALinear(nn.Module):
             getattr(source, "_abr_fp16_clamp_threshold", 60000.0)
         )
         self._nbs_module_name = getattr(source, "_nbs_module_name", None)
+        # VP keeps the original compact-LoRA forward as its normal inference
+        # path.  This flag is enabled only while a failed end-to-end VP call is
+        # being retried by models.vp_numeric_safety.
+        self._vp_detailed_safety_active = False
 
     def forward(self, x):
         base_weight = self.weight.T if self.fan_in_fan_out else self.weight
@@ -96,6 +100,12 @@ class CompactLoRALinear(nn.Module):
         # Match ABR's mixed-precision AdaLoRA bridge: accumulate the base and
         # LoRA residual in FP32, then cross the PLM boundary in the base dtype.
         result_fp32 = result.float() + delta.float()
+        if not self._vp_detailed_safety_active:
+            return result_fp32.to(result.dtype)
+
+        # The diagnostics below are deliberately a retry-only slow path.  In
+        # particular, avoid 64 sets of reductions and finite checks during a
+        # healthy VP forward.
         self._nbs_last_input_absmax = base_input.detach().float().abs().amax()
         self._nbs_last_input_finite = torch.isfinite(
             base_input.detach().float()
@@ -467,6 +477,11 @@ def _apply_compaction_specs(model, specs, adapter_name, mask_source):
         "compact_rank_total": sum(row["compact_rank"] for row in report_layers.values()),
         "layers": dict(report_layers),
     }
+    # Enable one inexpensive end-to-end output check and retry-only numerical
+    # safety on the VP Llama model.  ABR has its own independently configured
+    # safety path under adaptive_bitrate_streaming/ and is not changed here.
+    from models.vp_numeric_safety import enable_vp_fp16_fallback
+    enable_vp_fp16_fallback(model)
     return model.nbs_compaction_report
 
 
