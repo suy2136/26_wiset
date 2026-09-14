@@ -1,15 +1,16 @@
-"""Search VP inference modules on seed 1 and confirm one full stack on 1/2/3.
+"""Search VP inference modules on data/evaluation seed 2 and confirm on 1/2/3.
 
 The supplied compact NBS checkpoint, cached patch features, and projector are
 strictly read-only.  Every artifact is written below ``--output-dir``.  All
-evaluations use continuous VP RNG and FP16 prescaled Q/K, matching the fixed
-VP comparison protocol.
+evaluations use continuous VP RNG and the FP16 fast path with prescaled-Q/K
+fallback only for anomalous outputs, matching the fixed VP protocol.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import math
 from pathlib import Path
@@ -32,28 +33,34 @@ from analysis.evaluate_vp_inference_module_pipeline import (
 )
 
 
-SEARCH_SEED = 1
-CONFIRMATION_SEEDS = (2, 3)
+SEARCH_SEED = 2
+CONFIRMATION_SEEDS = (1, 3)
 ALL_SEEDS = (1, 2, 3)
-TOKEN_K_VALUES = (2, 4, 6, 8, 10, 12)
-SPECULATIVE_CONFIGS = tuple(
-    (gamma, threshold)
-    for gamma in (3, 5, 6, 8)
-    for threshold in (0.3, 0.4, 0.5)
+TOKEN_K_VALUES = (4, 6, 10)
+SPECULATIVE_CONFIGS = (
+    (4, 0.3), (4, 0.4), (6, 0.3), (8, 0.3), (8, 0.4),
 )
-PATCH_CASES = tuple(
-    (
-        f"patch_gated_k1_t{threshold}_skip{max_skip}_cache",
-        {
-            "policy": "gated-k1",
-            "threshold": float(threshold),
-            "max_skip": max_skip,
-            "projector_cache": True,
-        },
-    )
-    for threshold in (3, 6, 9, 12)
-    for max_skip in (0, 1, 2)
+PATCH_CASES = (
+    ("patch_gated_k1_t3_skip0_cache", {
+        "policy": "gated-k1", "threshold": 3.0, "max_skip": 0,
+        "projector_cache": True,
+    }),
+    ("patch_gated_k1_t6_skip1_cache", {
+        "policy": "gated-k1", "threshold": 6.0, "max_skip": 1,
+        "projector_cache": True,
+    }),
+    ("patch_gated_k1_t9_skip1_cache", {
+        "policy": "gated-k1", "threshold": 9.0, "max_skip": 1,
+        "projector_cache": True,
+    }),
 )
+MAX_FULL_STACK_CANDIDATES = 4
+EXCLUDED_SERVER1_CASES = {
+    "patch": "gated-k1/T6/skip0/cache",
+    "token": "K=8",
+    "speculative": "G=6/T=0.4",
+    "full_stack": "T6/skip0 + K8 + G6/T0.4",
+}
 
 
 def parser() -> argparse.ArgumentParser:
@@ -104,7 +111,7 @@ def write_json(path: Path, payload) -> None:
 
 def signature(args) -> dict:
     return {
-        "pipeline": "vp_data2_module_search_v1",
+        "pipeline": "vp_data2_module_search_v2",
         "compact_checkpoint": str(args.compact_checkpoint),
         "projector_checkpoint": str(args.projector_checkpoint),
         "cache_dir": str(args.cache_dir),
@@ -113,10 +120,12 @@ def signature(args) -> dict:
         "search_seed": SEARCH_SEED,
         "confirmation_seeds": list(CONFIRMATION_SEEDS),
         "evaluation_rng_mode": "continuous",
-        "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
+        "attention_score_mode": "fp16_fast_with_prescaled_qk_fallback",
         "patch_cases": [{"case": name, **config} for name, config in PATCH_CASES],
         "token_k_values": list(TOKEN_K_VALUES),
         "speculative_configs": [list(item) for item in SPECULATIVE_CONFIGS],
+        "excluded_server1_cases": EXCLUDED_SERVER1_CASES,
+        "max_full_stack_candidates": MAX_FULL_STACK_CANDIDATES,
         "max_mae_increase_ratio": args.max_mae_increase_ratio,
         "final_quality_slack_ratio": args.final_quality_slack_ratio,
     }
@@ -164,7 +173,7 @@ def fixed_protocol(command: list[str], seed: int) -> list[str]:
         item for item in command
         if item not in ("--vp-fp16-fallback", "--vp-fp16-prescaled-qk")
     ]
-    command.append("--vp-fp16-prescaled-qk")
+    command.append("--vp-fp16-fallback")
     set_option(command, "--seed", seed)
     set_option(command, "--lora-seed", 1)
     set_option(command, "--data-seed", seed)
@@ -249,6 +258,39 @@ def stack_case(patch: dict, token: dict, speculative: dict) -> str:
     )
 
 
+def full_stack_combinations(selected: dict) -> list[tuple[dict, dict, dict]]:
+    """Return at most four diverse quality/speed representative combinations."""
+    groups = (
+        selected["patch"], selected["token"], selected["speculative"],
+    )
+    combinations = list(itertools.product(*groups))
+    if len(combinations) <= MAX_FULL_STACK_CANDIDATES:
+        return combinations
+
+    preferred_indices = (
+        (0, 0, 0),       # all quality representatives
+        (-1, -1, -1),    # all speed representatives
+        (0, -1, -1),     # quality patch, faster token/spec
+        (-1, 0, 0),      # faster patch, quality token/spec
+    )
+    chosen = []
+    seen = set()
+    for indices in preferred_indices:
+        candidate = tuple(group[index] for group, index in zip(groups, indices))
+        identity = tuple(row["case"] for row in candidate)
+        if identity not in seen:
+            chosen.append(candidate)
+            seen.add(identity)
+    for candidate in combinations:
+        if len(chosen) >= MAX_FULL_STACK_CANDIDATES:
+            break
+        identity = tuple(row["case"] for row in candidate)
+        if identity not in seen:
+            chosen.append(candidate)
+            seen.add(identity)
+    return chosen[:MAX_FULL_STACK_CANDIDATES]
+
+
 def choose_final(rows: list[dict], quality_slack: float) -> dict:
     candidates = [
         row for row in rows
@@ -279,7 +321,7 @@ def summarize_final(rows: list[dict], case: str) -> dict:
     output = {
         "case": case, "seed_count": 3, "evaluation_seeds": "1,2,3",
         "evaluation_rng_mode": "continuous",
-        "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
+        "attention_score_mode": "fp16_fast_with_prescaled_qk_fallback",
     }
     for key in group[0]:
         if key in {"case", "family", "evaluation_seed", "status", "error"}:
@@ -363,27 +405,25 @@ def main(argv=None) -> None:
     }
     write_json(args.output_dir / "selected_independent_candidates.json", selected)
 
-    for patch in selected["patch"]:
-        for token in selected["token"]:
-            for speculative in selected["speculative"]:
-                case = stack_case(patch, token, speculative)
-                directory = result_directory(args, case, SEARCH_SEED)
-                config = {
-                    "patch_case": patch["case"],
-                    "recent_k": int(token["recent_k"]),
-                    "gamma": int(speculative["gamma"]),
-                    "acceptance_threshold": float(
-                        speculative["acceptance_threshold"]
-                    ),
-                }
-                run_candidate(
-                    args, rows, case, "full_stack", config, SEARCH_SEED,
-                    full_stack_command(
-                        args, args.compact_checkpoint, directory,
-                        patch_config(patch), config["recent_k"], config["gamma"],
-                        config["acceptance_threshold"],
-                    ),
-                )
+    for patch, token, speculative in full_stack_combinations(selected):
+        case = stack_case(patch, token, speculative)
+        directory = result_directory(args, case, SEARCH_SEED)
+        config = {
+            "patch_case": patch["case"],
+            "recent_k": int(token["recent_k"]),
+            "gamma": int(speculative["gamma"]),
+            "acceptance_threshold": float(
+                speculative["acceptance_threshold"]
+            ),
+        }
+        run_candidate(
+            args, rows, case, "full_stack", config, SEARCH_SEED,
+            full_stack_command(
+                args, args.compact_checkpoint, directory,
+                patch_config(patch), config["recent_k"], config["gamma"],
+                config["acceptance_threshold"],
+            ),
+        )
 
     final = choose_final(rows, args.final_quality_slack_ratio)
     write_json(args.output_dir / "selected_final_candidate.json", final)
