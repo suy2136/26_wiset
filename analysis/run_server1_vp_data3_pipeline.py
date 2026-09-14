@@ -179,16 +179,26 @@ def latest_training_checkpoint(method: str) -> Path | None:
     return candidate if checkpoint_complete(candidate) else None
 
 
-def inspect_exact_budget(method: str, checkpoint: Path) -> dict:
+def inspect_budget(method: str, checkpoint: Path) -> dict:
+    """Validate checkpoint structure and report budget mismatch without blocking."""
     inspection_method = "adalora" if method == "nbs" else method
     description = vp_lora.checkpoint_description(inspection_method, checkpoint)
     active = int(description["active_rank_total"])
-    if active != TARGET_BUDGET:
-        raise ValueError(
-            f"{method} active rank is {active}, expected exactly {TARGET_BUDGET}: {checkpoint}"
+    matched = active == TARGET_BUDGET
+    if not matched:
+        print(
+            f"[{method}] WARNING: active rank is {active}, target is "
+            f"{TARGET_BUDGET}; evaluation will continue and record the mismatch: "
+            f"{checkpoint}",
+            file=sys.stderr,
+            flush=True,
         )
     description["method"] = method
-    description["budget_note"] = "matched_512"
+    description["target_rank_budget"] = TARGET_BUDGET
+    description["budget_match"] = matched
+    description["budget_note"] = (
+        "matched_512" if matched else f"nonmatching_{active}_target_512"
+    )
     return description
 
 
@@ -197,12 +207,12 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
     saved = state["checkpoints"].get(key)
     if saved:
         checkpoint = Path(saved)
-        inspect_exact_budget(method, checkpoint)
+        inspect_budget(method, checkpoint)
         return checkpoint
     if args.resume:
         recovered = latest_training_checkpoint(method)
         if recovered is not None:
-            inspect_exact_budget(method, recovered)
+            inspect_budget(method, recovered)
             state["checkpoints"][key] = str(recovered.resolve())
             atomic_json(state_path, state)
             print(f"[{method}] recovered completed checkpoint: {recovered}", flush=True)
@@ -225,7 +235,7 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
     checkpoint = latest_training_checkpoint(method)
     if checkpoint is None:
         raise FileNotFoundError(f"final checkpoint not found for {variant}")
-    inspect_exact_budget(method, checkpoint)
+    inspect_budget(method, checkpoint)
     state["checkpoints"][key] = str(checkpoint.resolve())
     atomic_json(state_path, state)
     return checkpoint
@@ -246,7 +256,7 @@ def load_rows(path: Path) -> list[dict]:
 
 
 def evaluate_lora_method(args, method: str, checkpoint: Path) -> dict:
-    description = inspect_exact_budget(method, checkpoint)
+    description = inspect_budget(method, checkpoint)
     eval_description = dict(description)
     if method == "nbs":
         eval_description["method"] = "adalora"
@@ -298,7 +308,10 @@ def evaluate_lora_method(args, method: str, checkpoint: Path) -> dict:
         "seed_count": 3, "evaluation_seeds": "1,2,3",
         "evaluation_rng_mode": "continuous",
         "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
-        "active_rank_total": TARGET_BUDGET,
+        "active_rank_total": int(group[0]["active_rank_total"]),
+        "target_rank_budget": TARGET_BUDGET,
+        "budget_match": str(group[0]["budget_match"]).lower() == "true",
+        "budget_note": group[0]["budget_note"],
     }
     for metric in ("mae", "rmse", "latency_mean_ms"):
         values = [float(row[metric]) for row in group]
@@ -350,11 +363,11 @@ def module_command(args, compact: Path, kind: str, seed: int, result_dir: Path,
 
 
 def compact_nbs(args, source: Path) -> Path:
-    inspect_exact_budget("nbs", source)
+    inspect_budget("nbs", source)
     compact = args.output_dir / "nbs_compact/compact_checkpoint"
     required = (
         compact / "compact_adapter.pt", compact / "modules_except_plm.bin",
-        compact / "equivalence_report.json",
+        compact / "compaction_metadata.json", compact / "equivalence_report.json",
     )
     if all(path.is_file() for path in required):
         report = json.loads(required[-1].read_text(encoding="utf-8"))
@@ -375,7 +388,15 @@ def compact_nbs(args, source: Path) -> Path:
     return compact
 
 
-def summarize_module_rows(rows: list[dict]) -> list[dict]:
+def compact_active_rank(compact: Path) -> int | None:
+    metadata = compact / "compaction_metadata.json"
+    if not metadata.is_file():
+        return None
+    value = json.loads(metadata.read_text(encoding="utf-8")).get("compact_rank_total")
+    return int(value) if value is not None else None
+
+
+def summarize_module_rows(rows: list[dict], actual_rank: int | None) -> list[dict]:
     summaries = []
     for case, label, _ in MODULE_CASES:
         group = [row for row in rows if row.get("case") == case and row.get("status") == "complete"]
@@ -386,6 +407,14 @@ def summarize_module_rows(rows: list[dict]) -> list[dict]:
             "seed_count": 3, "evaluation_seeds": "1,2,3",
             "evaluation_rng_mode": "continuous",
             "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
+            "active_rank_total": actual_rank if actual_rank is not None else "unknown",
+            "target_rank_budget": TARGET_BUDGET,
+            "budget_match": actual_rank == TARGET_BUDGET if actual_rank is not None else "unknown",
+            "budget_note": (
+                "matched_512" if actual_rank == TARGET_BUDGET
+                else f"nonmatching_{actual_rank}_target_512"
+                if actual_rank is not None else "compact_rank_unknown"
+            ),
         }
         for metric in (
             "mae", "rmse", "latency_mean_ms", "mean_initial_token_count",
@@ -456,7 +485,7 @@ def evaluate_modules(args, compact: Path) -> list[dict]:
                 raise RuntimeError(row["error"])
     if args.dry_run:
         return []
-    summaries = summarize_module_rows(rows)
+    summaries = summarize_module_rows(rows, compact_active_rank(compact))
     write_rows(args.output_dir / "nbs_modules/three_seed_summary.csv", summaries)
     return summaries
 
@@ -469,7 +498,7 @@ def write_combined_lora_summary(args) -> None:
     baseline = dict(module_summary[0])
     baseline.update({
         "method": "nbs", "label": METHOD_LABELS["nbs"],
-        "active_rank_total": TARGET_BUDGET,
+        "active_rank_total": baseline.get("active_rank_total", "unknown"),
     })
     summaries.append(baseline)
     for method in ("uniform", "adalora", "shapley", "eva"):

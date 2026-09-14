@@ -46,16 +46,19 @@ class Server1VpData3PipelineTest(unittest.TestCase):
             command[command.index("--evaluation-rng-mode") + 1], "continuous",
         )
 
-    def test_exact_budget_rejects_nonmatching_checkpoint(self):
+    def test_budget_mismatch_is_recorded_without_rejection(self):
         original = pipeline.vp_lora.checkpoint_description
         pipeline.vp_lora.checkpoint_description = lambda method, checkpoint: {
             "method": method, "active_rank_total": 511,
         }
         try:
-            with self.assertRaisesRegex(ValueError, "expected exactly 512"):
-                pipeline.inspect_exact_budget("adalora", Path("checkpoint"))
+            description = pipeline.inspect_budget("adalora", Path("checkpoint"))
         finally:
             pipeline.vp_lora.checkpoint_description = original
+        self.assertEqual(description["active_rank_total"], 511)
+        self.assertFalse(description["budget_match"])
+        self.assertEqual(description["target_rank_budget"], 512)
+        self.assertEqual(description["budget_note"], "nonmatching_511_target_512")
 
     def test_shell_exposes_data3_and_opt_in_training_safety(self):
         shell = (pipeline.REPO_ROOT / "scripts/run_netllm_experiment.sh").read_text(
