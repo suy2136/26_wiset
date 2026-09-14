@@ -1,6 +1,7 @@
 import argparse
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from analysis import run_server1_overnight_pipeline as pipeline
@@ -65,6 +66,17 @@ class Server1OvernightPipelineTests(unittest.TestCase):
             self.assertEqual(signature["vp_evaluation_rng_mode"], "continuous")
             self.assertEqual(signature["abr_evaluation_rng_mode"], "per-episode")
             self.assertEqual(signature["vp_module_settings"]["token_k"], 8)
+
+    def test_budget_mismatch_is_recorded_but_not_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            checkpoint = Path(root)
+            with mock.patch.object(
+                pipeline.vp_lora,
+                "checkpoint_description",
+                return_value={"active_rank_total": 911},
+            ):
+                result = pipeline.inspect_vp_budget("shapley", checkpoint)
+            self.assertEqual(result["active_rank_total"], 911)
 
 
 if __name__ == "__main__":

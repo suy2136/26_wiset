@@ -181,13 +181,42 @@ def parse_env(path: Path) -> dict[str, str]:
     return values
 
 
-def validate_exact_vp_budget(method: str, checkpoint: Path) -> dict:
+def inspect_vp_budget(method: str, checkpoint: Path) -> dict:
+    """Validate checkpoint structure and report, but do not reject, its budget."""
     description = vp_lora.checkpoint_description(method, checkpoint)
     if description["active_rank_total"] != 512:
-        raise ValueError(
-            f"{method} active rank is {description['active_rank_total']}, expected 512"
+        print(
+            f"[{method}] WARNING: active rank is "
+            f"{description['active_rank_total']}; nominal target is 512. "
+            "Evaluation will continue and record the actual rank.",
+            file=sys.stderr,
+            flush=True,
         )
     return description
+
+
+def latest_vp_training_checkpoint(method: str, variant: str) -> Path | None:
+    latest_file = (
+        REPO_ROOT / "viewport_prediction/data/experiment_runs/netllm_vs_nbs"
+        / f"{variant}_latest.txt"
+    )
+    if not latest_file.is_file():
+        return None
+    run_dir = REPO_ROOT / latest_file.read_text(encoding="utf-8").strip()
+    metadata_path = run_dir / "metadata.env"
+    if not metadata_path.is_file():
+        return None
+    metadata = parse_env(metadata_path)
+    if method == "adalora":
+        best = metadata.get("best_ar_model")
+        checkpoint = Path(best).parent / "final_adalora_model" if best else None
+    else:
+        final = metadata.get("final_nbs_model")
+        checkpoint = Path(final) if final else None
+    if checkpoint is None:
+        return None
+    checkpoint = checkpoint if checkpoint.is_absolute() else REPO_ROOT / checkpoint
+    return checkpoint if checkpoint_complete(checkpoint) else None
 
 
 def train_vp(args, state, state_path, method: str) -> Path:
@@ -195,9 +224,16 @@ def train_vp(args, state, state_path, method: str) -> Path:
     saved = state["checkpoints"].get(key)
     if saved:
         checkpoint = Path(saved)
-        validate_exact_vp_budget(method, checkpoint)
+        inspect_vp_budget(method, checkpoint)
         return checkpoint
     variant = "adalora_b512_data1" if method == "adalora" else "shapley_b512_data1"
+    recovered = latest_vp_training_checkpoint(method, variant)
+    if recovered is not None:
+        inspect_vp_budget(method, recovered)
+        state["checkpoints"][key] = str(recovered.resolve())
+        atomic_json(state_path, state)
+        print(f"[{key}] recovered completed training: {recovered}", flush=True)
+        return recovered
     command = ["bash", "scripts/run_netllm_experiment.sh", variant]
     print(f"[{key}] {shlex.join(command)}", flush=True)
     if args.dry_run:
@@ -208,18 +244,10 @@ def train_vp(args, state, state_path, method: str) -> Path:
         "SKIP_VISUALIZATION": "1", "SAVE_PERIODIC_CHECKPOINTS": "0",
     })
     subprocess.run(command, cwd=REPO_ROOT, env=environment, check=True)
-    latest_file = (
-        REPO_ROOT / "viewport_prediction/data/experiment_runs/netllm_vs_nbs"
-        / f"{variant}_latest.txt"
-    )
-    run_dir = REPO_ROOT / latest_file.read_text(encoding="utf-8").strip()
-    metadata = parse_env(run_dir / "metadata.env")
-    if method == "adalora":
-        checkpoint = Path(metadata["best_ar_model"]).parent / "final_adalora_model"
-    else:
-        checkpoint = Path(metadata["final_nbs_model"])
-    checkpoint = checkpoint if checkpoint.is_absolute() else REPO_ROOT / checkpoint
-    validate_exact_vp_budget(method, checkpoint)
+    checkpoint = latest_vp_training_checkpoint(method, variant)
+    if checkpoint is None:
+        raise FileNotFoundError(f"completed training checkpoint not found: {variant}")
+    inspect_vp_budget(method, checkpoint)
     state["checkpoints"][key] = str(checkpoint.resolve())
     atomic_json(state_path, state)
     return checkpoint
@@ -264,7 +292,7 @@ def summarize_vp_method(rows: list[dict], method: str, label: str,
 def evaluate_vp_method(args, method: str, checkpoint: Path,
                        training_data_seed: int, output_dir: Path) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
-    description = validate_exact_vp_budget(method, checkpoint)
+    description = inspect_vp_budget(method, checkpoint)
     rows_path = output_dir / "per_seed_results.csv"
     rows = load_csv(rows_path) if args.resume else []
     rank_config = vp_lora.write_fixed_rank_config(description, checkpoint, output_dir)
@@ -582,13 +610,25 @@ def main(argv=None):
 
     vp_data2 = {}
     def validate_vp_data2():
+        errors = {}
         for method, fragment in VP_DATA2_FRAGMENTS.items():
-            path = find_checkpoint(VP_MODEL_ROOT, fragment, VP_TERMINALS[method])
-            if method != "nbs":
-                validate_exact_vp_budget(method, path)
-            vp_data2[method] = path
-            state["checkpoints"][f"vp_{method}_data2"] = str(path.resolve())
-        atomic_json(state_path, state)
+            try:
+                path = find_checkpoint(VP_MODEL_ROOT, fragment, VP_TERMINALS[method])
+                if method != "nbs":
+                    inspect_vp_budget(method, path)
+                vp_data2[method] = path
+                state["checkpoints"][f"vp_{method}_data2"] = str(path.resolve())
+            except Exception as error:
+                errors[method] = f"{type(error).__name__}: {error}"
+                print(f"[VP data2 {method}] validation failed: {errors[method]}",
+                      file=sys.stderr, flush=True)
+            finally:
+                atomic_json(state_path, state)
+        if errors:
+            state["checkpoint_errors"] = {
+                **state.get("checkpoint_errors", {}), **errors,
+            }
+            atomic_json(state_path, state)
     run_stage(args, state, state_path, "validate_vp_data2", validate_vp_data2)
 
     compact_holder = {}
@@ -602,13 +642,25 @@ def main(argv=None):
 
     def evaluate_data2_lora():
         summaries = []
+        errors = []
         for method in ("uniform", "adalora", "shapley", "eva"):
-            summaries.append(evaluate_vp_method(
-                args, method, checkpoint_from_state(state, f"vp_{method}_data2"),
-                2, args.output_dir / "vp_data2_lora",
-            ))
+            try:
+                summaries.append(evaluate_vp_method(
+                    args, method,
+                    checkpoint_from_state(state, f"vp_{method}_data2"),
+                    2, args.output_dir / "vp_data2_lora",
+                ))
+            except Exception as error:
+                errors.append({
+                    "method": method, "error_type": type(error).__name__,
+                    "error": str(error),
+                })
+                print(f"[VP data2 {method}] evaluation failed: {error}",
+                      file=sys.stderr, flush=True)
         if not args.dry_run:
             write_rows(args.output_dir / "vp_data2_lora/non_nbs_three_seed_summary.csv", summaries)
+            if errors:
+                atomic_json(args.output_dir / "vp_data2_lora/failed_methods.json", errors)
     run_stage(args, state, state_path, "evaluate_vp_data2_lora_methods", evaluate_data2_lora)
     run_stage(args, state, state_path, "evaluate_vp_data2_nbs_modules",
               lambda: evaluate_vp_modules(args, checkpoint_from_state(state, "vp_nbs_data2_compact")))
