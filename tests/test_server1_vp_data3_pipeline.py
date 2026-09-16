@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from analysis import run_server1_vp_data3_pipeline as pipeline
 
@@ -68,6 +70,39 @@ class Server1VpData3PipelineTest(unittest.TestCase):
             self.assertIn(variant, shell)
         self.assertIn('VP_FP16_PRESCALED_QK="${VP_FP16_PRESCALED_QK:-0}"', shell)
         self.assertIn('TRAIN_CMD+=(--vp-fp16-prescaled-qk)', shell)
+
+    def test_failed_compaction_is_preserved_and_retried_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / "nbs_compact/compact_checkpoint"
+            original.mkdir(parents=True)
+            (original / "equivalence_report.json").write_text('{"passed": false}')
+            args = argparse.Namespace(output_dir=root, resume=True, dry_run=False)
+
+            def fake_run(command, result_dir, resume):
+                candidate = Path(command[command.index("--nbs-compact-output-dir") + 1])
+                self.assertNotEqual(candidate, original)
+                self.assertEqual(
+                    command[command.index("--nbs-compaction-output-atol") + 1],
+                    "0.01",
+                )
+                candidate.mkdir(parents=True)
+                for name in ("compact_adapter.pt", "modules_except_plm.bin",
+                             "compaction_metadata.json"):
+                    (candidate / name).touch()
+                (candidate / "equivalence_report.json").write_text('{"passed": true}')
+                return {}
+
+            with mock.patch.object(pipeline, "inspect_budget"), \
+                    mock.patch.object(pipeline, "module_command", side_effect=
+                        lambda args, compact, kind, seed, result_dir, source: [
+                            "python", "run_plm.py", "--nbs-compact-output-dir", str(compact),
+                        ]), \
+                    mock.patch.object(pipeline, "run_case", side_effect=fake_run):
+                candidate = pipeline.compact_nbs(args, root / "source")
+            self.assertEqual(json.loads((original / "equivalence_report.json").read_text()),
+                             {"passed": False})
+            self.assertTrue(candidate.name.startswith("compact_checkpoint_fp16_retry_"))
 
 
 if __name__ == "__main__":
