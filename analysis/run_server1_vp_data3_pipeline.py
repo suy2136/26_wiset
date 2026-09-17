@@ -42,13 +42,17 @@ VP_RUN_ROOT = (
     REPO_ROOT / "viewport_prediction/data/experiment_runs/netllm_vs_nbs"
 )
 DEFAULT_OUTPUT = VP_RUN_ROOT / "server1_vp_data3_pipeline"
-METHODS = {
-    "uniform": {"variant": "uniform_r8_data3", "terminal": "best_model"},
-    "adalora": {"variant": "adalora_b512_data3", "terminal": "final_adalora_model"},
-    "shapley": {"variant": "shapley_b512_data3", "terminal": "final_shapley_model"},
-    "eva": {"variant": "eva_b512_data3", "terminal": "best_model"},
-    "nbs": {"variant": "nbs_v19_data3", "terminal": "final_nbs_model"},
-}
+def method_specs(data_seed: int) -> dict:
+    return {
+        "uniform": {"variant": f"uniform_r8_data{data_seed}", "terminal": "best_model"},
+        "adalora": {"variant": f"adalora_b512_data{data_seed}", "terminal": "final_adalora_model"},
+        "shapley": {"variant": f"shapley_b512_data{data_seed}", "terminal": "final_shapley_model"},
+        "eva": {"variant": f"eva_b512_data{data_seed}", "terminal": "best_model"},
+        "nbs": {"variant": f"nbs_v19_data{data_seed}", "terminal": "final_nbs_model"},
+    }
+
+
+METHODS = method_specs(TRAINING_DATA_SEED)
 METHOD_LABELS = {
     "uniform": "Uniform LoRA", "adalora": "AdaLoRA", "shapley": "ShapLoRA",
     "eva": "EVA", "nbs": "NBS-LoRA compact",
@@ -69,7 +73,8 @@ STAGE_ORDER = tuple(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--training-data-seed", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--latency-warmup-steps", type=int, default=5)
     parser.add_argument(
@@ -86,7 +91,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.output_dir is None:
+        args.output_dir = (
+            DEFAULT_OUTPUT if args.training_data_seed == 3
+            else VP_RUN_ROOT / "server1_vp_data4_pipeline"
+        )
+    return args
 
 
 def atomic_json(path: Path, value) -> None:
@@ -98,7 +109,7 @@ def atomic_json(path: Path, value) -> None:
 
 def signature(args) -> dict:
     return {
-        "pipeline": "server1_vp_data3_v1",
+        "pipeline": f"server1_vp_data{TRAINING_DATA_SEED}_v1",
         "stages": list(STAGE_ORDER),
         "training_seed": 1,
         "lora_seed": 1,
@@ -204,7 +215,7 @@ def inspect_budget(method: str, checkpoint: Path) -> dict:
 
 
 def train_method(args, state, state_path: Path, method: str) -> Path:
-    key = f"vp_{method}_data3"
+    key = f"vp_{method}_data{TRAINING_DATA_SEED}"
     saved = state["checkpoints"].get(key)
     if saved:
         checkpoint = Path(saved)
@@ -425,7 +436,8 @@ def summarize_module_rows(rows: list[dict], actual_rank: int | None) -> list[dic
         if {int(row["evaluation_seed"]) for row in group} != set(SEEDS):
             raise RuntimeError(f"incomplete module result: {case}")
         item = {
-            "case": case, "label": label, "checkpoint_training_data_seed": 3,
+            "case": case, "label": label,
+            "checkpoint_training_data_seed": TRAINING_DATA_SEED,
             "seed_count": 3, "evaluation_seeds": "1,2,3",
             "evaluation_rng_mode": "continuous",
             "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
@@ -558,16 +570,17 @@ def run_stage(args, state, state_path: Path, name: str, action) -> None:
 
 
 def checkpoint_from_state(state, method: str) -> Path:
-    value = state["checkpoints"].get(f"vp_{method}_data3")
+    value = state["checkpoints"].get(f"vp_{method}_data{TRAINING_DATA_SEED}")
     if not value:
-        raise RuntimeError(f"checkpoint unavailable: vp_{method}_data3")
+        raise RuntimeError(f"checkpoint unavailable: vp_{method}_data{TRAINING_DATA_SEED}")
     return Path(value)
 
 
 def compact_from_state(state) -> Path:
-    value = state["checkpoints"].get("vp_nbs_data3_compact")
+    key = f"vp_nbs_data{TRAINING_DATA_SEED}_compact"
+    value = state["checkpoints"].get(key)
     if not value:
-        raise RuntimeError("checkpoint unavailable: vp_nbs_data3_compact; compact_nbs failed")
+        raise RuntimeError(f"checkpoint unavailable: {key}; compact_nbs failed")
     return Path(value)
 
 
@@ -587,7 +600,10 @@ def validate_assets(args) -> None:
 
 
 def main(argv=None):
+    global TRAINING_DATA_SEED, METHODS
     args = parse_args(argv)
+    TRAINING_DATA_SEED = args.training_data_seed
+    METHODS = method_specs(TRAINING_DATA_SEED)
     args.output_dir = args.output_dir.resolve()
     args.tuned_projector = args.tuned_projector.resolve()
     args.patch_cache = args.patch_cache.resolve()
@@ -625,7 +641,7 @@ def main(argv=None):
     def compact_stage():
         compact = compact_nbs(args, checkpoint_from_state(state, "nbs"))
         if not args.dry_run:
-            state["checkpoints"]["vp_nbs_data3_compact"] = str(compact.resolve())
+            state["checkpoints"][f"vp_nbs_data{TRAINING_DATA_SEED}_compact"] = str(compact.resolve())
             atomic_json(state_path, state)
 
     run_stage(args, state, state_path, "compact_nbs", compact_stage)

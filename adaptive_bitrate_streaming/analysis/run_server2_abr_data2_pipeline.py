@@ -63,7 +63,8 @@ STAGE_ORDER = (
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--training-data-seed", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--base-model-dir", type=Path, default=training.DEFAULT_BASE_MODEL)
     parser.add_argument("--exp-pool-path", type=Path, default=training.DEFAULT_EXP_POOL)
     parser.add_argument("--device", default="cuda:0")
@@ -72,7 +73,13 @@ def parse_args(argv=None):
     parser.add_argument("--video", default="video1")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.output_dir is None:
+        args.output_dir = (
+            DEFAULT_OUTPUT if args.training_data_seed == 2
+            else ABR_ROOT / "artifacts/results/server2_abr_data4_pipeline"
+        )
+    return args
 
 
 def safe_tag(value: str) -> str:
@@ -81,7 +88,7 @@ def safe_tag(value: str) -> str:
 
 def experiment_for(args, method: str) -> dict:
     common = {
-        "name": f"SERVER2_ABR_DATA2_{method.upper()}",
+        "name": f"SERVER2_ABR_DATA{TRAINING_DATA_SEED}_{method.upper()}",
         "method": "uniform_lora" if method == "uniform" else method,
         "rank_budget": TARGET_BUDGET,
         "physical_rank": 24 if method == "uniform" else 32,
@@ -90,7 +97,7 @@ def experiment_for(args, method: str) -> dict:
         "seed": 1,
         "lora_seed": 1,
         "data_seed": TRAINING_DATA_SEED,
-        "run_tag": f"server2_abr_data2_{method}_{safe_tag(args.output_dir.name)}",
+        "run_tag": f"server2_abr_data{TRAINING_DATA_SEED}_{method}_{safe_tag(args.output_dir.name)}",
     }
     if method == "nbs":
         common.update({
@@ -125,7 +132,7 @@ def atomic_json(path: Path, value) -> None:
 
 def signature(args) -> dict:
     return {
-        "pipeline": "server2_abr_data2_v1",
+        "pipeline": f"server2_abr_data{TRAINING_DATA_SEED}_v1",
         "stage_order": list(STAGE_ORDER),
         "base_model_dir": str(args.base_model_dir.resolve()),
         "exp_pool_path": str(args.exp_pool_path.resolve()),
@@ -288,7 +295,7 @@ def discover_checkpoint(experiment: dict, started_at: float = 0.0) -> Path | Non
 
 
 def train_method(args, state, state_path: Path, method: str) -> Path:
-    key = f"{method}_data2"
+    key = f"{method}_data{TRAINING_DATA_SEED}"
     experiment = experiment_for(args, method)
     saved = state["checkpoints"].get(key)
     if saved:
@@ -371,7 +378,7 @@ def evaluate_lora(args, method: str, checkpoint: Path) -> dict:
             print(f"[{method} seed={seed}] already complete; skipping", flush=True)
             continue
         command = add_prescaled_qk(lora_eval.build_command(command_args, method, checkpoint, seed))
-        set_option(command, "--run-tag", f"server2_abr_data2_lora_{safe_tag(args.output_dir.name)}")
+        set_option(command, "--run-tag", f"server2_abr_data{TRAINING_DATA_SEED}_lora_{safe_tag(args.output_dir.name)}")
         print(f"[{method} seed={seed}] {shlex.join(command)}", flush=True)
         if args.dry_run:
             continue
@@ -440,7 +447,7 @@ def nbs_module_args(args, checkpoint: Path):
         video=args.video,
         device=args.device,
         evaluation_rng_mode="per-episode",
-        run_tag=f"server2_abr_data2_modules_{safe_tag(args.output_dir.name)}",
+        run_tag=f"server2_abr_data{TRAINING_DATA_SEED}_modules_{safe_tag(args.output_dir.name)}",
         fp16_numeric_safeguards=True,
         fp16_selective_clamp=True,
         fp16_selective_clamp_threshold=60000.0,
@@ -550,14 +557,16 @@ def run_stage(args, state, state_path: Path, name: str, action) -> None:
 
 
 def checkpoint_from_state(state, method: str) -> Path:
-    value = state["checkpoints"].get(f"{method}_data2")
+    value = state["checkpoints"].get(f"{method}_data{TRAINING_DATA_SEED}")
     if not value:
-        raise RuntimeError(f"checkpoint unavailable: {method}_data2")
+        raise RuntimeError(f"checkpoint unavailable: {method}_data{TRAINING_DATA_SEED}")
     return Path(value)
 
 
 def main(argv=None):
+    global TRAINING_DATA_SEED
     args = parse_args(argv)
+    TRAINING_DATA_SEED = args.training_data_seed
     args.output_dir = args.output_dir.resolve()
     args.base_model_dir = args.base_model_dir.resolve()
     args.exp_pool_path = args.exp_pool_path.resolve()
@@ -573,7 +582,9 @@ def main(argv=None):
         for method in METHOD_ORDER:
             experiment = experiment_for(args, method)
             command = add_prescaled_qk(
-                training.build_training_command(training_args(args, f"{method}_data2"), experiment)
+                training.build_training_command(
+                    training_args(args, f"{method}_data{TRAINING_DATA_SEED}"), experiment
+                )
             )
             print(shlex.join(command))
         return

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from adaptive_bitrate_streaming.analysis import run_server2_abr_data2_pipeline as pipeline
 
@@ -94,6 +95,17 @@ class Server2AbrData2PipelineTest(unittest.TestCase):
         self.assertEqual(result["active_rank_total"], 1472)
         self.assertFalse(result["budget_match"])
         self.assertEqual(result["metadata_effective_rank_budget"], 1536)
+
+    def test_seed4_uses_separate_output_and_training_identity(self):
+        parsed = pipeline.parse_args(["--training-data-seed", "4", "--dry-run"])
+        self.assertEqual(parsed.output_dir.name, "server2_abr_data4_pipeline")
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(pipeline, "TRAINING_DATA_SEED", 4):
+            args = self.args(Path(temporary))
+            experiment = pipeline.experiment_for(args, "nbs")
+            self.assertEqual(experiment["data_seed"], 4)
+            self.assertIn("data4", experiment["run_tag"])
+            self.assertEqual(pipeline.signature(args)["training_data_seed"], 4)
 
 
 if __name__ == "__main__":

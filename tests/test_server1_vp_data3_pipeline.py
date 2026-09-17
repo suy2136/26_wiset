@@ -71,6 +71,20 @@ class Server1VpData3PipelineTest(unittest.TestCase):
         self.assertIn('VP_FP16_PRESCALED_QK="${VP_FP16_PRESCALED_QK:-0}"', shell)
         self.assertIn('TRAIN_CMD+=(--vp-fp16-prescaled-qk)', shell)
 
+    def test_seed4_variants_and_separate_default_output(self):
+        args = pipeline.parse_args(["--training-data-seed", "4", "--dry-run"])
+        self.assertEqual(args.output_dir.name, "server1_vp_data4_pipeline")
+        variants = {item["variant"] for item in pipeline.method_specs(4).values()}
+        self.assertEqual(variants, {
+            "uniform_r8_data4", "adalora_b512_data4", "shapley_b512_data4",
+            "eva_b512_data4", "nbs_v19_data4",
+        })
+        shell = (pipeline.REPO_ROOT / "scripts/run_netllm_experiment.sh").read_text(
+            encoding="utf-8"
+        )
+        for variant in variants:
+            self.assertIn(variant, shell)
+
     def test_failed_compaction_is_preserved_and_retried_separately(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
