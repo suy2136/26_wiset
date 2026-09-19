@@ -23,6 +23,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from analysis import evaluate_vp_fixed_lora_fast_fallback_multiseed as vp_lora
+from analysis.resolve_checkpoint_alias import resolve_checkpoint
 from analysis.evaluate_cached_patch_followups_compact import selector_command
 from analysis.evaluate_cached_patch_selectors_compact import common_command, run_case, write_rows
 from analysis.evaluate_vp_fast_fallback_fullstack_multiseed import (
@@ -154,6 +155,12 @@ def checkpoint_complete(path: Path) -> bool:
     )
 
 
+def resolved_complete_checkpoint(path: Path) -> Path | None:
+    """Use physical adapter weights when a final checkpoint is an alias."""
+    resolved = resolve_checkpoint(path)
+    return resolved if checkpoint_complete(resolved) else None
+
+
 def parse_env(path: Path) -> dict[str, str]:
     result = {}
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -188,7 +195,7 @@ def latest_training_checkpoint(method: str) -> Path | None:
         return None
     if not candidate.is_absolute():
         candidate = REPO_ROOT / candidate
-    return candidate if checkpoint_complete(candidate) else None
+    return resolved_complete_checkpoint(candidate)
 
 
 def inspect_budget(method: str, checkpoint: Path) -> dict:
@@ -218,7 +225,9 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
     key = f"vp_{method}_data{TRAINING_DATA_SEED}"
     saved = state["checkpoints"].get(key)
     if saved:
-        checkpoint = Path(saved)
+        checkpoint = resolved_complete_checkpoint(Path(saved))
+        if checkpoint is None:
+            raise FileNotFoundError(f"saved checkpoint is incomplete: {saved}")
         inspect_budget(method, checkpoint)
         return checkpoint
     if args.resume:

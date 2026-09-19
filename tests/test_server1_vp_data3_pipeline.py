@@ -85,6 +85,47 @@ class Server1VpData3PipelineTest(unittest.TestCase):
         for variant in variants:
             self.assertIn(variant, shell)
 
+    def test_seed4_nbs_final_alias_recovers_physical_weights_without_training(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            variant = pipeline.method_specs(4)["nbs"]["variant"]
+            run_dir = root / "run"
+            run_dir.mkdir()
+            (root / f"{variant}_latest.txt").write_text(str(run_dir))
+            physical = root / "best_ar_model"
+            physical.mkdir()
+            for name in ("adapter_config.json", "adapter_model.bin",
+                         "modules_except_plm.bin"):
+                (physical / name).touch()
+            alias = root / "final_nbs_model"
+            alias.mkdir()
+            (alias / "checkpoint_alias.json").write_text(
+                json.dumps({"is_alias": True, "alias_of": "../best_ar_model"})
+            )
+            (run_dir / "metadata.env").write_text(f"final_nbs_model={alias}\n")
+            state_path = root / "pipeline_state.json"
+            state = {"checkpoints": {}}
+            args = argparse.Namespace(resume=True, dry_run=False)
+            with mock.patch.object(pipeline, "VP_RUN_ROOT", root), \
+                    mock.patch.object(pipeline, "METHODS", pipeline.method_specs(4)), \
+                    mock.patch.object(pipeline, "TRAINING_DATA_SEED", 4), \
+                    mock.patch.object(pipeline, "inspect_budget"), \
+                    mock.patch.object(pipeline.subprocess, "run") as run:
+                recovered = pipeline.train_method(args, state, state_path, "nbs")
+            self.assertEqual(recovered, physical.resolve())
+            self.assertEqual(state["checkpoints"]["vp_nbs_data4"], str(physical.resolve()))
+            run.assert_not_called()
+
+    def test_incomplete_alias_target_is_not_registered(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alias = root / "final_nbs_model"
+            alias.mkdir()
+            (alias / "checkpoint_alias.json").write_text(
+                json.dumps({"alias_of": "../missing_best_ar_model"})
+            )
+            self.assertIsNone(pipeline.resolved_complete_checkpoint(alias))
+
     def test_failed_compaction_is_preserved_and_retried_separately(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
