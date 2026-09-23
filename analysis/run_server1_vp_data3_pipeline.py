@@ -75,6 +75,8 @@ STAGE_ORDER = tuple(
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--training-data-seed", type=int, choices=(3, 4), default=3)
+    parser.add_argument("--target-budget", type=int, choices=(512, 1024, 1536), default=512)
+    parser.add_argument("--lora-only", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--latency-warmup-steps", type=int, default=5)
@@ -94,10 +96,15 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.output_dir is None:
-        args.output_dir = (
-            DEFAULT_OUTPUT if args.training_data_seed == 3
-            else VP_RUN_ROOT / "server1_vp_data4_pipeline"
-        )
+        if args.target_budget == 512:
+            args.output_dir = (
+                DEFAULT_OUTPUT if args.training_data_seed == 3
+                else VP_RUN_ROOT / "server1_vp_data4_pipeline"
+            )
+        else:
+            args.output_dir = VP_RUN_ROOT / (
+                f"server1_vp_data{args.training_data_seed}_budget{args.target_budget}_pipeline"
+            )
     return args
 
 
@@ -109,7 +116,7 @@ def atomic_json(path: Path, value) -> None:
 
 
 def signature(args) -> dict:
-    return {
+    value = {
         "pipeline": f"server1_vp_data{TRAINING_DATA_SEED}_v1",
         "stages": list(STAGE_ORDER),
         "training_seed": 1,
@@ -127,6 +134,9 @@ def signature(args) -> dict:
         "tuned_projector": str(args.tuned_projector.resolve()),
         "patch_cache": str(args.patch_cache.resolve()),
     }
+    if args.lora_only:
+        value["lora_only"] = True
+    return value
 
 
 def load_state(args):
@@ -182,6 +192,8 @@ def latest_training_checkpoint(method: str) -> Path | None:
     if not metadata_path.is_file():
         return None
     metadata = parse_env(metadata_path)
+    if int(metadata.get("rank_budget", -1)) != TARGET_BUDGET:
+        return None
     if method == "adalora":
         best = metadata.get("best_ar_model", "")
         candidate = Path(best).parent / "final_adalora_model" if best else None
@@ -216,7 +228,8 @@ def inspect_budget(method: str, checkpoint: Path) -> dict:
     description["target_rank_budget"] = TARGET_BUDGET
     description["budget_match"] = matched
     description["budget_note"] = (
-        "matched_512" if matched else f"nonmatching_{active}_target_512"
+        f"matched_{TARGET_BUDGET}" if matched
+        else f"nonmatching_{active}_target_{TARGET_BUDGET}"
     )
     return description
 
@@ -251,6 +264,7 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
         "SKIP_VISUALIZATION": "1",
         "SAVE_PERIODIC_CHECKPOINTS": "0",
         "VP_FP16_PRESCALED_QK": "1",
+        "VP_TOTAL_RANK_BUDGET": str(TARGET_BUDGET),
     })
     if method == "eva":
         # Data seed 3 did not converge within the legacy 128 calibration batches.
@@ -438,9 +452,10 @@ def compact_active_rank(compact: Path) -> int | None:
     return int(value) if value is not None else None
 
 
-def summarize_module_rows(rows: list[dict], actual_rank: int | None) -> list[dict]:
+def summarize_module_rows(rows: list[dict], actual_rank: int | None,
+                          cases=MODULE_CASES) -> list[dict]:
     summaries = []
-    for case, label, _ in MODULE_CASES:
+    for case, label, _ in cases:
         group = [row for row in rows if row.get("case") == case and row.get("status") == "complete"]
         if {int(row["evaluation_seed"]) for row in group} != set(SEEDS):
             raise RuntimeError(f"incomplete module result: {case}")
@@ -454,8 +469,8 @@ def summarize_module_rows(rows: list[dict], actual_rank: int | None) -> list[dic
             "target_rank_budget": TARGET_BUDGET,
             "budget_match": actual_rank == TARGET_BUDGET if actual_rank is not None else "unknown",
             "budget_note": (
-                "matched_512" if actual_rank == TARGET_BUDGET
-                else f"nonmatching_{actual_rank}_target_512"
+                f"matched_{TARGET_BUDGET}" if actual_rank == TARGET_BUDGET
+                else f"nonmatching_{actual_rank}_target_{TARGET_BUDGET}"
                 if actual_rank is not None else "compact_rank_unknown"
             ),
         }
@@ -482,7 +497,7 @@ def summarize_module_rows(rows: list[dict], actual_rank: int | None) -> list[dic
     return summaries
 
 
-def evaluate_modules(args, compact: Path) -> list[dict]:
+def evaluate_modules(args, compact: Path, cases=MODULE_CASES) -> list[dict]:
     output = args.output_dir / "nbs_modules/per_seed_results.csv"
     rows = load_rows(output) if args.resume else []
     baseline_dir = args.output_dir / "nbs_modules/seed_1/pure_nbs_compact"
@@ -506,7 +521,7 @@ def evaluate_modules(args, compact: Path) -> list[dict]:
         for row in rows if row.get("status") == "complete"
     }
     for seed in SEEDS:
-        for case, label, kind in MODULE_CASES:
+        for case, label, kind in cases:
             if (case, seed) in completed:
                 continue
             result_dir = args.output_dir / f"nbs_modules/seed_{seed}/{case}"
@@ -528,7 +543,7 @@ def evaluate_modules(args, compact: Path) -> list[dict]:
                 raise RuntimeError(row["error"])
     if args.dry_run:
         return []
-    summaries = summarize_module_rows(rows, compact_active_rank(compact))
+    summaries = summarize_module_rows(rows, compact_active_rank(compact), cases)
     write_rows(args.output_dir / "nbs_modules/three_seed_summary.csv", summaries)
     return summaries
 
@@ -609,21 +624,24 @@ def validate_assets(args) -> None:
 
 
 def main(argv=None):
-    global TRAINING_DATA_SEED, METHODS
+    global TRAINING_DATA_SEED, TARGET_BUDGET, METHODS
     args = parse_args(argv)
     TRAINING_DATA_SEED = args.training_data_seed
+    TARGET_BUDGET = args.target_budget
     METHODS = method_specs(TRAINING_DATA_SEED)
     args.output_dir = args.output_dir.resolve()
     args.tuned_projector = args.tuned_projector.resolve()
     args.patch_cache = args.patch_cache.resolve()
-    validate_assets(args)
+    if not args.lora_only:
+        validate_assets(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     state_path, state = load_state(args)
     if args.dry_run:
         for method, config in METHODS.items():
             print(shlex.join(["bash", "scripts/run_netllm_experiment.sh", config["variant"]]))
         fake_compact = Path("/dry-run/nbs_compact/compact_checkpoint")
-        for case, _, kind in MODULE_CASES:
+        cases = MODULE_CASES[:1] if args.lora_only else MODULE_CASES
+        for case, _, kind in cases:
             print(shlex.join(module_command(
                 args, fake_compact, kind, 1,
                 Path("/dry-run/nbs_modules") / case,
@@ -656,7 +674,10 @@ def main(argv=None):
     run_stage(args, state, state_path, "compact_nbs", compact_stage)
     run_stage(
         args, state, state_path, "evaluate_nbs_modules",
-        lambda: evaluate_modules(args, compact_from_state(state)),
+        lambda: evaluate_modules(
+            args, compact_from_state(state),
+            MODULE_CASES[:1] if args.lora_only else MODULE_CASES,
+        ),
     )
     run_stage(
         args, state, state_path, "write_lora_summary",

@@ -16,7 +16,7 @@ class Server2AbrData2PipelineTest(unittest.TestCase):
             output_dir=root / "run", base_model_dir=root / "model",
             exp_pool_path=root / "pool.pkl", device="cuda:0",
             trace="fcc-test", trace_num=100, video="video1",
-            resume=False, dry_run=True,
+            resume=False, dry_run=True, lora_only=False,
         )
 
     def test_priority_and_method_order(self):
@@ -106,6 +106,21 @@ class Server2AbrData2PipelineTest(unittest.TestCase):
             self.assertEqual(experiment["data_seed"], 4)
             self.assertIn("data4", experiment["run_tag"])
             self.assertEqual(pipeline.signature(args)["training_data_seed"], 4)
+
+    def test_budget_scaling_changes_uniform_rank_and_identity(self):
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(pipeline, "TRAINING_DATA_SEED", 4), \
+                mock.patch.object(pipeline, "TARGET_BUDGET", 512):
+            args = self.args(Path(temporary))
+            args.lora_only = True
+            experiment = pipeline.experiment_for(args, "uniform")
+            self.assertEqual(experiment["rank_budget"], 512)
+            self.assertEqual(experiment["physical_rank"], 8)
+            self.assertIn("budget512", experiment["run_tag"])
+            self.assertEqual(
+                pipeline.signature(args)["modules"],
+                [pipeline.latest_modules.TARGET_SPECS[0]["name"]],
+            )
 
 
 if __name__ == "__main__":

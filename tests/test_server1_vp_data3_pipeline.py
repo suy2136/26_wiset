@@ -85,6 +85,20 @@ class Server1VpData3PipelineTest(unittest.TestCase):
         for variant in variants:
             self.assertIn(variant, shell)
 
+    def test_budget_scaling_arguments_and_shell_override(self):
+        args = pipeline.parse_args([
+            "--training-data-seed", "4", "--target-budget", "1536",
+            "--lora-only", "--dry-run",
+        ])
+        self.assertEqual(args.target_budget, 1536)
+        self.assertTrue(args.lora_only)
+        self.assertEqual(args.output_dir.name, "server1_vp_data4_budget1536_pipeline")
+        shell = (pipeline.REPO_ROOT / "scripts/run_netllm_experiment.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("VP_TOTAL_RANK_BUDGET", shell)
+        self.assertIn('MODEL_TAG="${MODEL_TAG}_budget${RANK_BUDGET}"', shell)
+
     def test_seed4_nbs_final_alias_recovers_physical_weights_without_training(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -102,7 +116,9 @@ class Server1VpData3PipelineTest(unittest.TestCase):
             (alias / "checkpoint_alias.json").write_text(
                 json.dumps({"is_alias": True, "alias_of": "../best_ar_model"})
             )
-            (run_dir / "metadata.env").write_text(f"final_nbs_model={alias}\n")
+            (run_dir / "metadata.env").write_text(
+                f"final_nbs_model={alias}\nrank_budget=512\n"
+            )
             state_path = root / "pipeline_state.json"
             state = {"checkpoints": {}}
             args = argparse.Namespace(resume=True, dry_run=False)

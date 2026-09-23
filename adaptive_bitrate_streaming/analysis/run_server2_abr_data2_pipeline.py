@@ -64,6 +64,8 @@ STAGE_ORDER = (
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--training-data-seed", type=int, choices=(2, 4), default=2)
+    parser.add_argument("--target-budget", type=int, choices=(512, 1024, 1536), default=1536)
+    parser.add_argument("--lora-only", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--base-model-dir", type=Path, default=training.DEFAULT_BASE_MODEL)
     parser.add_argument("--exp-pool-path", type=Path, default=training.DEFAULT_EXP_POOL)
@@ -75,10 +77,15 @@ def parse_args(argv=None):
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.output_dir is None:
-        args.output_dir = (
-            DEFAULT_OUTPUT if args.training_data_seed == 2
-            else ABR_ROOT / "artifacts/results/server2_abr_data4_pipeline"
-        )
+        if args.target_budget == 1536:
+            args.output_dir = (
+                DEFAULT_OUTPUT if args.training_data_seed == 2
+                else ABR_ROOT / "artifacts/results/server2_abr_data4_pipeline"
+            )
+        else:
+            args.output_dir = ABR_ROOT / "artifacts/results" / (
+                f"server2_abr_data{args.training_data_seed}_budget{args.target_budget}_pipeline"
+            )
     return args
 
 
@@ -91,13 +98,16 @@ def experiment_for(args, method: str) -> dict:
         "name": f"SERVER2_ABR_DATA{TRAINING_DATA_SEED}_{method.upper()}",
         "method": "uniform_lora" if method == "uniform" else method,
         "rank_budget": TARGET_BUDGET,
-        "physical_rank": 24 if method == "uniform" else 32,
+        "physical_rank": TARGET_BUDGET // 64 if method == "uniform" else 32,
         "lr": 2e-4,
         "warmup_steps": 500,
         "seed": 1,
         "lora_seed": 1,
         "data_seed": TRAINING_DATA_SEED,
-        "run_tag": f"server2_abr_data{TRAINING_DATA_SEED}_{method}_{safe_tag(args.output_dir.name)}",
+        "run_tag": (
+            f"server2_abr_data{TRAINING_DATA_SEED}_budget{TARGET_BUDGET}_"
+            f"{method}_{safe_tag(args.output_dir.name)}"
+        ),
     }
     if method == "nbs":
         common.update({
@@ -131,7 +141,7 @@ def atomic_json(path: Path, value) -> None:
 
 
 def signature(args) -> dict:
-    return {
+    value = {
         "pipeline": f"server2_abr_data{TRAINING_DATA_SEED}_v1",
         "stage_order": list(STAGE_ORDER),
         "base_model_dir": str(args.base_model_dir.resolve()),
@@ -148,8 +158,16 @@ def signature(args) -> dict:
         "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
         "target_rank_budget": TARGET_BUDGET,
         "experiments": [experiment_for(args, method) for method in METHOD_ORDER],
-        "modules": [spec["name"] for spec in latest_modules.TARGET_SPECS],
+        "modules": [
+            spec["name"] for spec in (
+                latest_modules.TARGET_SPECS[:1]
+                if args.lora_only else latest_modules.TARGET_SPECS
+            )
+        ],
     }
+    if args.lora_only:
+        value["lora_only"] = True
+    return value
 
 
 def load_state(args):
@@ -231,7 +249,10 @@ def inspect_budget(path: Path, method: str, experiment: dict) -> dict:
         "active_rank_total": actual,
         "target_rank_budget": TARGET_BUDGET,
         "budget_match": matched,
-        "budget_note": "matched_1536" if matched else f"nonmatching_{actual}_target_1536",
+        "budget_note": (
+            f"matched_{TARGET_BUDGET}" if matched
+            else f"nonmatching_{actual}_target_{TARGET_BUDGET}"
+        ),
         "metadata_effective_rank_budget": metadata.get("effective_rank_budget"),
     }
 
@@ -355,6 +376,8 @@ def set_option(command: list[str], option: str, value: str) -> None:
 
 def evaluate_lora(args, method: str, checkpoint: Path) -> dict:
     experiment = experiment_for(args, method)
+    if method == "uniform":
+        lora_eval.METHODS["uniform"]["physical_rank"] = experiment["physical_rank"]
     inspection = inspect_budget(checkpoint, method, experiment)
     output = args.output_dir / "lora_methods/per_seed_results.csv"
     rows = lora_eval.load_rows(output) if args.resume else []
@@ -459,15 +482,16 @@ def nbs_module_args(args, checkpoint: Path):
     )
 
 
-def evaluate_nbs_modules(args, checkpoint: Path) -> list[dict]:
+def evaluate_nbs_modules(args, checkpoint: Path, specs=None) -> list[dict]:
     experiment = experiment_for(args, "nbs")
     inspection = inspect_budget(checkpoint, "nbs", experiment)
     output = args.output_dir / "nbs_modules/per_seed_results.csv"
     rows = module_sweep.load_rows(output) if args.resume else []
     run_args = nbs_module_args(args, checkpoint)
     failures = []
+    specs = tuple(specs or latest_modules.TARGET_SPECS)
     for seed in SEEDS:
-        for spec in latest_modules.TARGET_SPECS:
+        for spec in specs:
             try:
                 rows = module_sweep.run_specs(run_args, (spec,), seed, output, rows)
             except Exception as error:
@@ -483,7 +507,7 @@ def evaluate_nbs_modules(args, checkpoint: Path) -> list[dict]:
         return []
     if failures:
         atomic_json(args.output_dir / "nbs_modules/failed_runs.json", failures)
-    summaries = latest_modules.summarize(rows)
+    summaries = latest_modules.summarize(rows, specs)
     for summary in summaries:
         summary.update({
             "checkpoint_training_data_seed": TRAINING_DATA_SEED,
@@ -564,9 +588,11 @@ def checkpoint_from_state(state, method: str) -> Path:
 
 
 def main(argv=None):
-    global TRAINING_DATA_SEED
+    global TRAINING_DATA_SEED, TARGET_BUDGET
     args = parse_args(argv)
     TRAINING_DATA_SEED = args.training_data_seed
+    TARGET_BUDGET = args.target_budget
+    METHOD_LABELS["uniform"] = f"Uniform LoRA r{TARGET_BUDGET // 64}"
     args.output_dir = args.output_dir.resolve()
     args.base_model_dir = args.base_model_dir.resolve()
     args.exp_pool_path = args.exp_pool_path.resolve()
@@ -595,7 +621,10 @@ def main(argv=None):
     )
     run_stage(
         args, state, state_path, "evaluate_nbs_modules",
-        lambda: evaluate_nbs_modules(args, checkpoint_from_state(state, "nbs")),
+        lambda: evaluate_nbs_modules(
+            args, checkpoint_from_state(state, "nbs"),
+            latest_modules.TARGET_SPECS[:1] if args.lora_only else None,
+        ),
     )
     for method in ("uniform", "adalora", "shapley", "eva"):
         run_stage(

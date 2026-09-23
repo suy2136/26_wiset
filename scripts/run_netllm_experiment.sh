@@ -897,6 +897,35 @@ else
   EXTRA_ARGS=()
 fi
 
+# Optional override for additive VP budget-scaling runs. Named experiment
+# variants retain their historical defaults when this variable is unset.
+if [[ -n "${VP_TOTAL_RANK_BUDGET:-}" ]]; then
+  if ! [[ "$VP_TOTAL_RANK_BUDGET" =~ ^[1-9][0-9]*$ ]] || \
+     (( VP_TOTAL_RANK_BUDGET % 64 != 0 )) || \
+     (( VP_TOTAL_RANK_BUDGET > 2048 )); then
+    echo "VP_TOTAL_RANK_BUDGET must be a positive multiple of 64 and at most 2048."
+    exit 2
+  fi
+  case "$VARIANT" in
+    uniform_r8_data1|uniform_r8_data2|uniform_r8_data3|uniform_r8_data4|\
+    adalora_b512_data1|adalora_b512_data2|adalora_b512_data3|adalora_b512_data4|\
+    shapley_b512_data1|shapley_b512_data2|shapley_b512_data3|shapley_b512_data4)
+      RANK=$((VP_TOTAL_RANK_BUDGET / 64))
+      ;;
+    eva_b512_data1|eva_b512_data2|eva_b512_data3|eva_b512_data4|\
+    nbs_v19_data2|nbs_v19_data3|nbs_v19_data4)
+      ;;
+    *)
+      echo "VP_TOTAL_RANK_BUDGET is unsupported for variant: $VARIANT"
+      exit 2
+      ;;
+  esac
+  RANK_BUDGET="$VP_TOTAL_RANK_BUDGET"
+  MODEL_TAG="${MODEL_TAG}_budget${RANK_BUDGET}"
+  DISPLAY_NAME="${DISPLAY_NAME} [total rank budget ${RANK_BUDGET}]"
+  EXTRA_ARGS+=(--experiment-tag "${VARIANT}_budget${RANK_BUDGET}")
+fi
+
 if [[ "${VP_B512_SMOKE:-0}" == "1" ]]; then
   case "$VARIANT" in
     uniform_r8_data2|adalora_b512_data2|eva_b512_data2|shapley_b512_data2|\

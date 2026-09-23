@@ -83,9 +83,9 @@ def reusable_baselines(args):
     return rows
 
 
-def summarize(rows):
+def summarize(rows, specs=TARGET_SPECS):
     summaries = []
-    for spec in TARGET_SPECS:
+    for spec in specs:
         group = sorted(
             (row for row in rows if row["experiment"] == spec["name"]),
             key=lambda row: int(row["data_seed"]),
