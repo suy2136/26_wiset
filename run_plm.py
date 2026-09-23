@@ -48,6 +48,7 @@ from utils.seed_utils import (
     seed_data_worker,
     set_global_seed,
 )
+from utils.experiment_tags import safe_experiment_tag
 
 
 NASH_DIAGNOSTIC_FIELDS = [
@@ -3141,31 +3142,10 @@ if __name__ == '__main__':
             'historical allocator path is unchanged when this flag is omitted.'
         ),
     )
-    parser.add_argument('--experiment-tag',
-                        choices=['nbs_v2', 'nbs_v3', 'nbs_v4', 'nbs_v5',
-                                 'nbs_v6', 'nbs_v7', 'nbs_v8', 'nbs_v9',
-                                 'nbs_v10', 'nbs_v11', 'nbs_v12',
-                                 'nbs_v12_repeat', 'nbs_v13',
-                                 'nbs_v14', 'nbs_v15', 'nbs_v16', 'nbs_v17',
-                                 'nbs_v18', 'nbs_v19', 'nbs_v19_audit',
-                                 'nbs_v20', 'nbs_v21',
-                                 'nbs_v22', 'nbs_v23', 'nbs_v24', 'nbs_v25',
-                                 'nbs_v27', 'nbs_v28', 'nbs_v29',
-                                 'nbs_v19_data2', 'nbs_v19_data3', 'nbs_v19_data4',
-                                 'nbs_budget256_seed1',
-                                 'nbs_adaptive_tau015',
-                                 'uniform_r12', 'uniform_b736', 'adalora_peft_r12',
-                                 'adalora_shapley', 'shapley_v19', 'eva',
-                                 'uniform_r8_data2', 'adalora_b512_data2',
-                                 'eva_b512_data2', 'shapley_b512_data2',
-                                 'uniform_r8_data3', 'adalora_b512_data3',
-                                 'eva_b512_data3', 'shapley_b512_data3',
-                                 'uniform_r8_data4', 'adalora_b512_data4',
-                                 'eva_b512_data4', 'shapley_b512_data4',
-                                 'uniform_r8_data1', 'adalora_b512_data1',
-                                 'eva_b512_data1', 'shapley_b512_data1'],
+    parser.add_argument('--experiment-tag', type=safe_experiment_tag,
                         default=None,
-                        help='Optional suffix that isolates model/result directories for an experiment variant.')
+                        help=('Optional safe suffix that isolates model/result directories for an '
+                              'experiment variant, including additive budget-scaling tags.'))
     parser.add_argument(
         '--experiment-run-id',
         default=None,
