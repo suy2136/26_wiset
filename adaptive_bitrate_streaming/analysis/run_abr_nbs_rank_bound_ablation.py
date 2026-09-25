@@ -31,7 +31,7 @@ except ModuleNotFoundError:
 ABR_ROOT = Path(__file__).resolve().parents[1]
 MODEL_ROOT = ABR_ROOT / "data/ft_plms"
 DEFAULT_OUTPUT = (
-    ABR_ROOT / "artifacts/results/abr_nbs_rank_bound_ablation_c1536_data4"
+    ABR_ROOT / "artifacts/results/abr_nbs_rank_bound_ablation_c1536_data1"
 )
 RANK_BUDGET = 1536
 PHYSICAL_RANK = 32
@@ -65,7 +65,7 @@ SUMMARY_METRICS = (
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--training-data-seed", type=int, default=4)
+    parser.add_argument("--training-data-seed", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--base-model-dir", type=Path, default=training.DEFAULT_BASE_MODEL,

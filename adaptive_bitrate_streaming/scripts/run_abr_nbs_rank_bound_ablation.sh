@@ -4,12 +4,12 @@ set -o pipefail
 
 cd /workspace/26_wiset || exit 1
 PY="${PY:-/opt/conda/envs/abr_netllm/bin/python}"
-OUTPUT="${OUTPUT:-/workspace/26_wiset/adaptive_bitrate_streaming/artifacts/results/abr_nbs_rank_bound_ablation_c1536_data4_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT="${OUTPUT:-/workspace/26_wiset/adaptive_bitrate_streaming/artifacts/results/abr_nbs_rank_bound_ablation_c1536_data1_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUTPUT"
 
 args=(
   adaptive_bitrate_streaming/analysis/run_abr_nbs_rank_bound_ablation.py
-  --training-data-seed 4
+  --training-data-seed 1
   --output-dir "$OUTPUT"
   --device cuda:0
 )

@@ -66,7 +66,7 @@ class ABRNBSRankBoundAblationTests(unittest.TestCase):
             self.assertEqual(len({item["run_tag"] for item in experiments}), 4)
             state_path, state = ablation.load_state(args)
             self.assertEqual(state_path, Path(directory).resolve() / "pipeline_state.json")
-            self.assertEqual(state["signature"]["training_data_seed"], 4)
+            self.assertEqual(state["signature"]["training_data_seed"], 1)
 
 
 if __name__ == "__main__":
