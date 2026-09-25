@@ -477,6 +477,8 @@ def main(argv=None):
     print(f"Three-seed summary: {summary_path}")
     print(f"Failed experiments: {failed or 'none'}")
     print(f"OUTPUT={args.output_dir}")
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
