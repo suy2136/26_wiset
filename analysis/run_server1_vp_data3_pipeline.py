@@ -77,6 +77,10 @@ def parse_args(argv=None):
     parser.add_argument("--training-data-seed", type=int, choices=(3, 4), default=3)
     parser.add_argument("--target-budget", type=int, choices=(512, 1024, 1536), default=512)
     parser.add_argument("--lora-only", action="store_true")
+    parser.add_argument(
+        "--nbs-only", action="store_true",
+        help="train, compact, and three-seed evaluate only pure NBS",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--latency-warmup-steps", type=int, default=5)
@@ -95,6 +99,8 @@ def parse_args(argv=None):
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
+    if args.lora_only and args.nbs_only:
+        parser.error("--lora-only and --nbs-only are mutually exclusive")
     if args.output_dir is None:
         if args.target_budget == 512:
             args.output_dir = (
@@ -136,6 +142,8 @@ def signature(args) -> dict:
     }
     if args.lora_only:
         value["lora_only"] = True
+    if args.nbs_only:
+        value["nbs_only"] = True
     return value
 
 
@@ -210,19 +218,22 @@ def latest_training_checkpoint(method: str) -> Path | None:
     return resolved_complete_checkpoint(candidate)
 
 
-def inspect_budget(method: str, checkpoint: Path) -> dict:
+def inspect_budget(method: str, checkpoint: Path, *, require_exact=False) -> dict:
     """Validate checkpoint structure and report budget mismatch without blocking."""
     inspection_method = "adalora" if method == "nbs" else method
     description = vp_lora.checkpoint_description(inspection_method, checkpoint)
     active = int(description["active_rank_total"])
     matched = active == TARGET_BUDGET
     if not matched:
+        message = (
+            f"[{method}] active rank is {active}, target is {TARGET_BUDGET}: "
+            f"{checkpoint}"
+        )
+        if require_exact:
+            raise ValueError(message)
         print(
-            f"[{method}] WARNING: active rank is {active}, target is "
-            f"{TARGET_BUDGET}; evaluation will continue and record the mismatch: "
-            f"{checkpoint}",
-            file=sys.stderr,
-            flush=True,
+            f"{message}; evaluation will continue and record the mismatch",
+            file=sys.stderr, flush=True,
         )
     description["method"] = method
     description["target_rank_budget"] = TARGET_BUDGET
@@ -241,12 +252,12 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
         checkpoint = resolved_complete_checkpoint(Path(saved))
         if checkpoint is None:
             raise FileNotFoundError(f"saved checkpoint is incomplete: {saved}")
-        inspect_budget(method, checkpoint)
+        inspect_budget(method, checkpoint, require_exact=method == "nbs")
         return checkpoint
     if args.resume:
         recovered = latest_training_checkpoint(method)
         if recovered is not None:
-            inspect_budget(method, recovered)
+            inspect_budget(method, recovered, require_exact=method == "nbs")
             state["checkpoints"][key] = str(recovered.resolve())
             atomic_json(state_path, state)
             print(f"[{method}] recovered completed checkpoint: {recovered}", flush=True)
@@ -274,7 +285,7 @@ def train_method(args, state, state_path: Path, method: str) -> Path:
     checkpoint = latest_training_checkpoint(method)
     if checkpoint is None:
         raise FileNotFoundError(f"final checkpoint not found for {variant}")
-    inspect_budget(method, checkpoint)
+    inspect_budget(method, checkpoint, require_exact=method == "nbs")
     state["checkpoints"][key] = str(checkpoint.resolve())
     atomic_json(state_path, state)
     return checkpoint
@@ -402,7 +413,7 @@ def module_command(args, compact: Path, kind: str, seed: int, result_dir: Path,
 
 
 def compact_nbs(args, source: Path) -> Path:
-    inspect_budget("nbs", source)
+    inspect_budget("nbs", source, require_exact=True)
     root = args.output_dir / "nbs_compact"
     original = root / "compact_checkpoint"
     # Never overwrite a failed or incomplete compaction from an earlier attempt.
@@ -412,8 +423,14 @@ def compact_nbs(args, source: Path) -> Path:
             candidate / "compaction_metadata.json", candidate / "equivalence_report.json",
         )
         if all(path.is_file() for path in required):
+            metadata = json.loads(required[-2].read_text(encoding="utf-8"))
             report = json.loads(required[-1].read_text(encoding="utf-8"))
-            if report.get("passed"):
+            if (
+                report.get("passed")
+                and int(metadata.get("compact_rank_total", -1)) == TARGET_BUDGET
+                and Path(metadata.get("source_checkpoint", "")).resolve()
+                == source.resolve()
+            ):
                 return candidate
     attempt = 1
     while (root / f"compact_checkpoint_fp16_retry_{attempt}").exists():
@@ -441,6 +458,15 @@ def compact_nbs(args, source: Path) -> Path:
         report = json.loads(required[-1].read_text(encoding="utf-8"))
         if not report.get("passed"):
             raise RuntimeError("compact checkpoint equivalence report did not pass")
+        metadata = json.loads(required[-2].read_text(encoding="utf-8"))
+        actual = int(metadata.get("compact_rank_total", -1))
+        if actual != TARGET_BUDGET:
+            raise RuntimeError(
+                f"compact rank total {actual} does not match target "
+                f"{TARGET_BUDGET}; evaluation was not started"
+            )
+        if Path(metadata.get("source_checkpoint", "")).resolve() != source.resolve():
+            raise RuntimeError("compact checkpoint source does not match trained NBS")
     return compact
 
 
@@ -632,15 +658,17 @@ def main(argv=None):
     args.output_dir = args.output_dir.resolve()
     args.tuned_projector = args.tuned_projector.resolve()
     args.patch_cache = args.patch_cache.resolve()
-    if not args.lora_only:
+    if not args.lora_only and not args.nbs_only:
         validate_assets(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     state_path, state = load_state(args)
     if args.dry_run:
-        for method, config in METHODS.items():
+        dry_methods = ("nbs",) if args.nbs_only else tuple(METHODS)
+        for method in dry_methods:
+            config = METHODS[method]
             print(shlex.join(["bash", "scripts/run_netllm_experiment.sh", config["variant"]]))
         fake_compact = Path("/dry-run/nbs_compact/compact_checkpoint")
-        cases = MODULE_CASES[:1] if args.lora_only else MODULE_CASES
+        cases = MODULE_CASES[:1] if args.lora_only or args.nbs_only else MODULE_CASES
         for case, _, kind in cases:
             print(shlex.join(module_command(
                 args, fake_compact, kind, 1,
@@ -648,17 +676,18 @@ def main(argv=None):
             )))
         return
 
-    for method in ("uniform", "adalora", "shapley", "eva"):
-        run_stage(
-            args, state, state_path, f"train_{method}",
-            lambda method=method: train_method(args, state, state_path, method),
-        )
-        run_stage(
-            args, state, state_path, f"evaluate_{method}",
-            lambda method=method: evaluate_lora_method(
-                args, method, checkpoint_from_state(state, method),
-            ),
-        )
+    if not args.nbs_only:
+        for method in ("uniform", "adalora", "shapley", "eva"):
+            run_stage(
+                args, state, state_path, f"train_{method}",
+                lambda method=method: train_method(args, state, state_path, method),
+            )
+            run_stage(
+                args, state, state_path, f"evaluate_{method}",
+                lambda method=method: evaluate_lora_method(
+                    args, method, checkpoint_from_state(state, method),
+                ),
+            )
 
     run_stage(
         args, state, state_path, "train_nbs",
@@ -676,13 +705,14 @@ def main(argv=None):
         args, state, state_path, "evaluate_nbs_modules",
         lambda: evaluate_modules(
             args, compact_from_state(state),
-            MODULE_CASES[:1] if args.lora_only else MODULE_CASES,
+            MODULE_CASES[:1] if args.lora_only or args.nbs_only else MODULE_CASES,
         ),
     )
-    run_stage(
-        args, state, state_path, "write_lora_summary",
-        lambda: write_combined_lora_summary(args),
-    )
+    if not args.nbs_only:
+        run_stage(
+            args, state, state_path, "write_lora_summary",
+            lambda: write_combined_lora_summary(args),
+        )
 
     if not args.dry_run:
         failed = [name for name, item in state["stages"].items() if item.get("status") == "failed"]

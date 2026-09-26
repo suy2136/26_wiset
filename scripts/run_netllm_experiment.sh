@@ -568,7 +568,11 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_${VARIANT}"
     RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
-    RANK_BUDGET=512
+    # Resolve the optional scaling override before EXTRA_ARGS captures the
+    # value. Previously the generic override ran only after EXTRA_ARGS had
+    # already embedded 512, so budget-1024/1536 runs were silently trained
+    # with an allocator budget of 512 despite their directory names.
+    RANK_BUDGET="${VP_TOTAL_RANK_BUDGET:-512}"
     SEED=1
     LORA_SEED=1
     if [[ "$VARIANT" == "nbs_v19_data3" || "$VARIANT" == "nbs_v19_data4" ]]; then
@@ -924,6 +928,24 @@ if [[ -n "${VP_TOTAL_RANK_BUDGET:-}" ]]; then
   MODEL_TAG="${MODEL_TAG}_budget${RANK_BUDGET}"
   DISPLAY_NAME="${DISPLAY_NAME} [total rank budget ${RANK_BUDGET}]"
   EXTRA_ARGS+=(--experiment-tag "${VARIANT}_budget${RANK_BUDGET}")
+fi
+
+# Fail before launching a long NBS run if the allocator argument captured a
+# stale budget. This guards the budget-scaling path against shell ordering
+# regressions where directory labels and the actual allocator diverge.
+if [[ "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
+      "$VARIANT" == "nbs_v19_data4" ]]; then
+  NBS_ALLOCATOR_BUDGET=""
+  for ((ARG_INDEX = 0; ARG_INDEX < ${#EXTRA_ARGS[@]}; ARG_INDEX++)); do
+    if [[ "${EXTRA_ARGS[$ARG_INDEX]}" == "--adalora-rank-budget" ]]; then
+      NBS_ALLOCATOR_BUDGET="${EXTRA_ARGS[$((ARG_INDEX + 1))]:-}"
+      break
+    fi
+  done
+  if [[ -z "$NBS_ALLOCATOR_BUDGET" || "$NBS_ALLOCATOR_BUDGET" != "$RANK_BUDGET" ]]; then
+    echo "NBS allocator budget mismatch before training: argument=${NBS_ALLOCATOR_BUDGET:-missing}, expected=${RANK_BUDGET}."
+    exit 2
+  fi
 fi
 
 if [[ "${VP_B512_SMOKE:-0}" == "1" ]]; then

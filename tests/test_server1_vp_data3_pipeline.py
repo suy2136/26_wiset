@@ -98,6 +98,33 @@ class Server1VpData3PipelineTest(unittest.TestCase):
         )
         self.assertIn("VP_TOTAL_RANK_BUDGET", shell)
         self.assertIn('MODEL_TAG="${MODEL_TAG}_budget${RANK_BUDGET}"', shell)
+        self.assertIn(
+            'RANK_BUDGET="${VP_TOTAL_RANK_BUDGET:-512}"', shell,
+        )
+
+    def test_nbs_only_runs_pure_compact_pipeline(self):
+        args = pipeline.parse_args([
+            "--training-data-seed", "4", "--target-budget", "1024",
+            "--nbs-only", "--dry-run",
+        ])
+        self.assertTrue(args.nbs_only)
+        self.assertFalse(args.lora_only)
+
+    def test_strict_nbs_budget_mismatch_is_rejected(self):
+        original = pipeline.vp_lora.checkpoint_description
+        original_budget = pipeline.TARGET_BUDGET
+        pipeline.vp_lora.checkpoint_description = lambda method, checkpoint: {
+            "method": method, "active_rank_total": 512,
+        }
+        pipeline.TARGET_BUDGET = 1024
+        try:
+            with self.assertRaisesRegex(ValueError, "active rank is 512.*target is 1024"):
+                pipeline.inspect_budget(
+                    "nbs", Path("checkpoint"), require_exact=True,
+                )
+        finally:
+            pipeline.vp_lora.checkpoint_description = original
+            pipeline.TARGET_BUDGET = original_budget
 
     def test_seed4_nbs_final_alias_recovers_physical_weights_without_training(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,9 +185,12 @@ class Server1VpData3PipelineTest(unittest.TestCase):
                     "0.01",
                 )
                 candidate.mkdir(parents=True)
-                for name in ("compact_adapter.pt", "modules_except_plm.bin",
-                             "compaction_metadata.json"):
+                for name in ("compact_adapter.pt", "modules_except_plm.bin"):
                     (candidate / name).touch()
+                (candidate / "compaction_metadata.json").write_text(json.dumps({
+                    "compact_rank_total": pipeline.TARGET_BUDGET,
+                    "source_checkpoint": str((root / "source").resolve()),
+                }))
                 (candidate / "equivalence_report.json").write_text('{"passed": true}')
                 return {}
 
