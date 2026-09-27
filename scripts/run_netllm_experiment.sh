@@ -19,7 +19,7 @@ if [[ "$VARIANT" != "nbs" && "$VARIANT" != "nbs_v2" && \
       "$VARIANT" != "nbs_v23" && "$VARIANT" != "nbs_v24" && \
       "$VARIANT" != "nbs_v25" && "$VARIANT" != "nbs_v27" && \
       "$VARIANT" != "nbs_v28" && "$VARIANT" != "nbs_v29" && \
-      "$VARIANT" != "nbs_v19_data2" && "$VARIANT" != "nbs_v19_data3" && \
+      "$VARIANT" != "nbs_v19_data1" && "$VARIANT" != "nbs_v19_data2" && "$VARIANT" != "nbs_v19_data3" && \
       "$VARIANT" != "nbs_v19_data4" && \
       "$VARIANT" != "nbs_budget256_seed1" && \
       "$VARIANT" != "nbs_adaptive_tau015" && \
@@ -168,7 +168,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       "$VARIANT" == "nbs_v24" || "$VARIANT" == "nbs_v25" || \
       "$VARIANT" == "nbs_v27" || "$VARIANT" == "nbs_v28" || \
       "$VARIANT" == "nbs_v29" || \
-      "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
+      "$VARIANT" == "nbs_v19_data1" || "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
       "$VARIANT" == "nbs_v19_data4" || \
       "$VARIANT" == "nbs_budget256_seed1" || \
       "$VARIANT" == "nbs_adaptive_tau015" ]]; then
@@ -563,11 +563,11 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
       --early-stopping-patience "$EARLY_STOPPING_PATIENCE"
       --early-stopping-min-delta "$EARLY_STOPPING_MIN_DELTA"
     )
-  elif [[ "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
+  elif [[ "$VARIANT" == "nbs_v19_data1" || "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
           "$VARIANT" == "nbs_v19_data4" ]]; then
     use_v19_schedule
     MODEL_TAG="llama_base_low_rank_adalora_${VARIANT}"
-    RANK_CONFIG="configs/adalora_rank_config_llama7b_min2_max32.json"
+    RANK_CONFIG="${VP_NBS_RANK_CONFIG:-configs/adalora_rank_config_llama7b_min2_max32.json}"
     # Resolve the optional scaling override before EXTRA_ARGS captures the
     # value. Previously the generic override ran only after EXTRA_ARGS had
     # already embedded 512, so budget-1024/1536 runs were silently trained
@@ -575,7 +575,11 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     RANK_BUDGET="${VP_TOTAL_RANK_BUDGET:-512}"
     SEED=1
     LORA_SEED=1
-    if [[ "$VARIANT" == "nbs_v19_data3" || "$VARIANT" == "nbs_v19_data4" ]]; then
+    if [[ "$VARIANT" == "nbs_v19_data1" ]]; then
+      DATA_SEED=1
+      DISPLAY_NAME="NBS-NetLLM v19 rank-bound ablation (LoRA seed1, data seed1)"
+      EXPERIMENT_ARGS=(--experiment-tag "$VARIANT")
+    elif [[ "$VARIANT" == "nbs_v19_data3" || "$VARIANT" == "nbs_v19_data4" ]]; then
       if [[ "$VARIANT" == "nbs_v19_data4" ]]; then DATA_SEED=4; else DATA_SEED=3; fi
       DISPLAY_NAME="NBS-NetLLM v19 (min2-max32-budget512, LoRA seed1, data seed${DATA_SEED})"
       EXPERIMENT_ARGS=(--experiment-tag "$VARIANT")
@@ -917,7 +921,7 @@ if [[ -n "${VP_TOTAL_RANK_BUDGET:-}" ]]; then
       RANK=$((VP_TOTAL_RANK_BUDGET / 64))
       ;;
     eva_b512_data1|eva_b512_data2|eva_b512_data3|eva_b512_data4|\
-    nbs_v19_data2|nbs_v19_data3|nbs_v19_data4)
+    nbs_v19_data1|nbs_v19_data2|nbs_v19_data3|nbs_v19_data4)
       ;;
     *)
       echo "VP_TOTAL_RANK_BUDGET is unsupported for variant: $VARIANT"
@@ -933,17 +937,27 @@ fi
 # Fail before launching a long NBS run if the allocator argument captured a
 # stale budget. This guards the budget-scaling path against shell ordering
 # regressions where directory labels and the actual allocator diverge.
-if [[ "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
+if [[ "$VARIANT" == "nbs_v19_data1" || "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
       "$VARIANT" == "nbs_v19_data4" ]]; then
+  if [[ ! -f "$RANK_CONFIG" ]]; then
+    echo "NBS rank config does not exist: $RANK_CONFIG"
+    exit 2
+  fi
   NBS_ALLOCATOR_BUDGET=""
+  NBS_ALLOCATOR_CONFIG=""
   for ((ARG_INDEX = 0; ARG_INDEX < ${#EXTRA_ARGS[@]}; ARG_INDEX++)); do
     if [[ "${EXTRA_ARGS[$ARG_INDEX]}" == "--adalora-rank-budget" ]]; then
       NBS_ALLOCATOR_BUDGET="${EXTRA_ARGS[$((ARG_INDEX + 1))]:-}"
-      break
+    elif [[ "${EXTRA_ARGS[$ARG_INDEX]}" == "--adalora-rank-config" ]]; then
+      NBS_ALLOCATOR_CONFIG="${EXTRA_ARGS[$((ARG_INDEX + 1))]:-}"
     fi
   done
   if [[ -z "$NBS_ALLOCATOR_BUDGET" || "$NBS_ALLOCATOR_BUDGET" != "$RANK_BUDGET" ]]; then
     echo "NBS allocator budget mismatch before training: argument=${NBS_ALLOCATOR_BUDGET:-missing}, expected=${RANK_BUDGET}."
+    exit 2
+  fi
+  if [[ -z "$NBS_ALLOCATOR_CONFIG" || "$NBS_ALLOCATOR_CONFIG" != "$RANK_CONFIG" ]]; then
+    echo "NBS allocator config mismatch before training: argument=${NBS_ALLOCATOR_CONFIG:-missing}, expected=${RANK_CONFIG}."
     exit 2
   fi
 fi
@@ -953,7 +967,7 @@ if [[ "${VP_B512_SMOKE:-0}" == "1" ]]; then
     uniform_r8_data2|adalora_b512_data2|eva_b512_data2|shapley_b512_data2|\
     uniform_r8_data3|adalora_b512_data3|eva_b512_data3|shapley_b512_data3|nbs_v19_data3|\
     uniform_r8_data4|adalora_b512_data4|eva_b512_data4|shapley_b512_data4|nbs_v19_data4|\
-    uniform_r8_data1|adalora_b512_data1|eva_b512_data1|shapley_b512_data1)
+    uniform_r8_data1|adalora_b512_data1|eva_b512_data1|shapley_b512_data1|nbs_v19_data1)
       EPOCHS=1
       CHECKPOINT_INTERVAL=10
       VALIDATION_INTERVAL=5
