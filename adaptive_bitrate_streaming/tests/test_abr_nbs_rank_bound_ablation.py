@@ -44,10 +44,8 @@ class ABRNBSRankBoundAblationTests(unittest.TestCase):
             )
         )
         evaluation = {**experiment, "seed": 3, "data_seed": 3}
-        test = ablation.add_prescaled_qk(
-            ablation.training.build_test_command(
-                ablation.training_args(args, spec), evaluation, Path("checkpoint"),
-            )
+        test = ablation.evaluation_command(
+            args, spec, evaluation, Path("checkpoint"),
         )
         for command in (train, test):
             self.assertIn("--fp16-attention-prescaled-qk", command)
@@ -55,6 +53,10 @@ class ABRNBSRankBoundAblationTests(unittest.TestCase):
             self.assertEqual(command[command.index("--nbs-rank-budget") + 1], "1536")
             self.assertEqual(command[command.index("--nbs-rank-config") + 1], spec["rank_config"])
         self.assertIn("--nbs-compact-inference", test)
+        self.assertEqual(
+            test[test.index("--nbs-compaction-atol") + 1],
+            str(ablation.COMPACTION_ATOL),
+        )
         self.assertEqual(test[test.index("--seed") + 1], "3")
         self.assertEqual(test[test.index("--data-seed") + 1], "3")
         self.assertEqual(test[test.index("--lora-seed") + 1], "1")

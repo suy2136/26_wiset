@@ -188,17 +188,7 @@ def parse_env(path: Path) -> dict[str, str]:
     return result
 
 
-def latest_training_checkpoint(method: str) -> Path | None:
-    variant = METHODS[method]["variant"]
-    latest = VP_RUN_ROOT / f"{variant}_latest.txt"
-    if not latest.is_file():
-        return None
-    run_dir = Path(latest.read_text(encoding="utf-8").strip())
-    if not run_dir.is_absolute():
-        run_dir = REPO_ROOT / run_dir
-    metadata_path = run_dir / "metadata.env"
-    if not metadata_path.is_file():
-        return None
+def checkpoint_from_metadata(method: str, metadata_path: Path) -> Path | None:
     metadata = parse_env(metadata_path)
     if int(metadata.get("rank_budget", -1)) != TARGET_BUDGET:
         return None
@@ -218,12 +208,66 @@ def latest_training_checkpoint(method: str) -> Path | None:
     return resolved_complete_checkpoint(candidate)
 
 
+def latest_training_checkpoint(method: str) -> Path | None:
+    variant = METHODS[method]["variant"]
+    latest = VP_RUN_ROOT / f"{variant}_latest.txt"
+    metadata_paths = []
+    if latest.is_file():
+        run_dir = Path(latest.read_text(encoding="utf-8").strip())
+        if not run_dir.is_absolute():
+            run_dir = REPO_ROOT / run_dir
+        metadata_paths.append(run_dir / "metadata.env")
+    # A later budget run overwrites <variant>_latest.txt. Search the isolated
+    # run manifests as a fallback so resume can recover an earlier budget
+    # without retraining it.
+    history_root = VP_RUN_ROOT / variant
+    if history_root.is_dir():
+        metadata_paths.extend(sorted(
+            history_root.glob("*/metadata.env"),
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        ))
+    seen = set()
+    for metadata_path in metadata_paths:
+        resolved = metadata_path.resolve()
+        if resolved in seen or not metadata_path.is_file():
+            continue
+        seen.add(resolved)
+        checkpoint = checkpoint_from_metadata(method, metadata_path)
+        if checkpoint is not None:
+            return checkpoint
+    return None
+
+
+def nbs_allocator_rank(checkpoint: Path) -> tuple[int, int]:
+    allocator_path = checkpoint / "nash_rank_allocator.pt"
+    if not allocator_path.is_file():
+        raise FileNotFoundError(allocator_path)
+    import torch
+    state = torch.load(allocator_path, map_location="cpu")
+    ranks = state.get("ranks") or state.get("current_ranks") or {}
+    if not isinstance(ranks, dict) or not ranks:
+        raise ValueError(f"NBS allocator ranks are missing: {allocator_path}")
+    active = sum(vp_lora.active_rank(value) for value in ranks.values())
+    budget = int(state.get("rank_budget", active))
+    return active, budget
+
+
 def inspect_budget(method: str, checkpoint: Path, *, require_exact=False) -> dict:
     """Validate checkpoint structure and report budget mismatch without blocking."""
     inspection_method = "adalora" if method == "nbs" else method
     description = vp_lora.checkpoint_description(inspection_method, checkpoint)
-    active = int(description["active_rank_total"])
-    matched = active == TARGET_BUDGET
+    if method == "nbs":
+        description["adapter_config_active_rank_total"] = int(
+            description["active_rank_total"]
+        )
+        active, allocator_budget = nbs_allocator_rank(checkpoint)
+        description["active_rank_total"] = active
+        description["allocator_rank_budget"] = allocator_budget
+    else:
+        active = int(description["active_rank_total"])
+    matched = active == TARGET_BUDGET and (
+        method != "nbs" or allocator_budget == TARGET_BUDGET
+    )
     if not matched:
         message = (
             f"[{method}] active rank is {active}, target is {TARGET_BUDGET}: "

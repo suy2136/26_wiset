@@ -37,6 +37,10 @@ RANK_BUDGET = 1536
 PHYSICAL_RANK = 32
 MODULE_COUNT = 64
 EVALUATION_SEEDS = (1, 2, 3)
+# FP16 compact inference can differ from the dense path by about 1e-2 in
+# action logits. This tolerance only gates the equivalence audit; it does not
+# alter model outputs or reward computation.
+COMPACTION_ATOL = 0.012
 SPECS = (
     {
         "name": "min8_max32", "min_rank": 8, "max_rank": 32,
@@ -137,6 +141,16 @@ def add_prescaled_qk(command):
     command = [item for item in command if item != "--fp16-attention-fp32-scores"]
     if "--fp16-attention-prescaled-qk" not in command:
         command.append("--fp16-attention-prescaled-qk")
+    return command
+
+
+def evaluation_command(args, spec, evaluation, checkpoint):
+    command = add_prescaled_qk(
+        training.build_test_command(
+            training_args(args, spec), evaluation, checkpoint,
+        )
+    )
+    command.extend(["--nbs-compaction-atol", str(COMPACTION_ATOL)])
     return command
 
 
@@ -345,11 +359,7 @@ def evaluate_one(args, spec, checkpoint, rows, output):
             **experiment, "seed": seed, "lora_seed": 1, "data_seed": seed,
             "run_tag": f"{experiment['run_tag']}_eval{seed}",
         }
-        command = add_prescaled_qk(
-            training.build_test_command(
-                training_args(args, spec), evaluation, checkpoint,
-            )
-        )
+        command = evaluation_command(args, spec, evaluation, checkpoint)
         print(f"[{spec['name']} seed={seed}:test] {shlex.join(command)}", flush=True)
         if args.dry_run:
             continue
@@ -362,6 +372,7 @@ def evaluate_one(args, spec, checkpoint, rows, output):
             "checkpoint_dir": str(checkpoint.resolve()),
             "evaluation_rng_mode": "per-episode",
             "attention_score_mode": "fp16_prescaled_qk_with_fp32_retry",
+            "nbs_compaction_atol": COMPACTION_ATOL,
             "status": "failed", **ranks,
         }
         try:

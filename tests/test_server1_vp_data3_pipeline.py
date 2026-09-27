@@ -118,13 +118,37 @@ class Server1VpData3PipelineTest(unittest.TestCase):
         }
         pipeline.TARGET_BUDGET = 1024
         try:
-            with self.assertRaisesRegex(ValueError, "active rank is 512.*target is 1024"):
-                pipeline.inspect_budget(
+            with mock.patch.object(
+                pipeline, "nbs_allocator_rank", return_value=(512, 512),
+            ):
+                with self.assertRaisesRegex(ValueError, "active rank is 512.*target is 1024"):
+                    pipeline.inspect_budget(
+                        "nbs", Path("checkpoint"), require_exact=True,
+                    )
+        finally:
+            pipeline.vp_lora.checkpoint_description = original
+            pipeline.TARGET_BUDGET = original_budget
+
+    def test_nbs_budget_uses_allocator_instead_of_adapter_default(self):
+        original = pipeline.vp_lora.checkpoint_description
+        original_budget = pipeline.TARGET_BUDGET
+        pipeline.vp_lora.checkpoint_description = lambda method, checkpoint: {
+            "method": method, "active_rank_total": 512,
+        }
+        pipeline.TARGET_BUDGET = 1536
+        try:
+            with mock.patch.object(
+                pipeline, "nbs_allocator_rank", return_value=(1536, 1536),
+            ):
+                description = pipeline.inspect_budget(
                     "nbs", Path("checkpoint"), require_exact=True,
                 )
         finally:
             pipeline.vp_lora.checkpoint_description = original
             pipeline.TARGET_BUDGET = original_budget
+        self.assertEqual(description["active_rank_total"], 1536)
+        self.assertEqual(description["adapter_config_active_rank_total"], 512)
+        self.assertTrue(description["budget_match"])
 
     def test_seed4_nbs_final_alias_recovers_physical_weights_without_training(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,6 +182,33 @@ class Server1VpData3PipelineTest(unittest.TestCase):
             self.assertEqual(recovered, physical.resolve())
             self.assertEqual(state["checkpoints"]["vp_nbs_data4"], str(physical.resolve()))
             run.assert_not_called()
+
+    def test_budget_history_recovers_exact_checkpoint_after_latest_is_overwritten(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            variant = pipeline.method_specs(4)["nbs"]["variant"]
+            newer = root / variant / "newer"
+            exact = root / variant / "exact"
+            newer.mkdir(parents=True)
+            exact.mkdir(parents=True)
+            checkpoint = root / "budget1024_checkpoint"
+            checkpoint.mkdir()
+            for name in ("adapter_config.json", "adapter_model.bin", "modules_except_plm.bin"):
+                (checkpoint / name).touch()
+            (newer / "metadata.env").write_text("rank_budget=1536\n")
+            (exact / "metadata.env").write_text(
+                f"rank_budget=1024\nfinal_nbs_model={checkpoint}\n"
+            )
+            (root / f"{variant}_latest.txt").write_text(str(newer))
+            original_budget = pipeline.TARGET_BUDGET
+            try:
+                pipeline.TARGET_BUDGET = 1024
+                with mock.patch.object(pipeline, "VP_RUN_ROOT", root), \
+                        mock.patch.object(pipeline, "METHODS", pipeline.method_specs(4)):
+                    recovered = pipeline.latest_training_checkpoint("nbs")
+            finally:
+                pipeline.TARGET_BUDGET = original_budget
+            self.assertEqual(recovered, checkpoint.resolve())
 
     def test_incomplete_alias_target_is_not_registered(self):
         with tempfile.TemporaryDirectory() as temporary:
