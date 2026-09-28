@@ -27,7 +27,6 @@ from analysis.resolve_checkpoint_alias import resolve_checkpoint
 
 
 TARGET_BUDGET = 512
-PHYSICAL_RANK = 32
 TRAINING_DATA_SEED = 1
 MODULE_COUNT = 64
 VARIANT = "nbs_v19_data1"
@@ -67,9 +66,8 @@ def load_rows(path: Path) -> list[dict]:
 
 def signature() -> dict:
     return {
-        "pipeline": "vp_nbs_rank_bound_ablation_v1",
+        "pipeline": "vp_nbs_rank_bound_ablation_v2",
         "target_budget": TARGET_BUDGET,
-        "physical_rank": PHYSICAL_RANK,
         "training_seed": 1,
         "lora_seed": 1,
         "training_data_seed": TRAINING_DATA_SEED,
@@ -79,7 +77,7 @@ def signature() -> dict:
         "inference": "compact_pure_nbs",
         "specs": [
             {"name": name, "min_rank": minimum, "max_rank": maximum,
-             "rank_config": config}
+             "physical_rank": maximum, "rank_config": config}
             for name, minimum, maximum, config in SPECS
         ],
     }
@@ -93,7 +91,28 @@ def load_state(args):
             raise FileExistsError(f"output exists: {args.output_dir}; use --resume")
         state = json.loads(path.read_text(encoding="utf-8"))
         if state.get("signature") != expected:
-            raise ValueError("resume state differs from the current configuration")
+            previous = state.get("signature", {})
+            # v1 incorrectly treated physical rank as globally fixed at 32.
+            # Preserve completed max32 experiments while migrating the same
+            # four-spec queue to per-spec physical widths for max16/max12.
+            migratable = (
+                previous.get("pipeline") == "vp_nbs_rank_bound_ablation_v1"
+                and previous.get("target_budget") == TARGET_BUDGET
+                and previous.get("training_data_seed") == TRAINING_DATA_SEED
+                and [
+                    (item.get("name"), item.get("min_rank"), item.get("max_rank"),
+                     item.get("rank_config"))
+                    for item in previous.get("specs", [])
+                ] == [
+                    (name, minimum, maximum, config)
+                    for name, minimum, maximum, config in SPECS
+                ]
+            )
+            if not migratable:
+                raise ValueError("resume state differs from the current configuration")
+            state["signature"] = expected
+            atomic_json(path, state)
+            print("Migrated rank-bound pipeline state from v1 to v2", flush=True)
         return path, state
     state = {"signature": expected, "experiments": {}}
     if not args.dry_run:
@@ -145,6 +164,12 @@ def validate_checkpoint(checkpoint: Path, minimum: int, maximum: int) -> list[in
     if not vp.checkpoint_complete(resolved):
         raise FileNotFoundError(f"incomplete checkpoint: {resolved}")
     vp.inspect_budget("nbs", resolved, require_exact=True)
+    adapter = json.loads((resolved / "adapter_config.json").read_text(encoding="utf-8"))
+    physical_rank = int(adapter.get("init_r", adapter.get("r", -1)))
+    if physical_rank != maximum:
+        raise ValueError(
+            f"checkpoint physical rank is {physical_rank}, expected max_rank {maximum}"
+        )
     ranks = allocator_ranks(resolved)
     if sum(ranks) != TARGET_BUDGET:
         raise ValueError(f"actual allocator rank total is {sum(ranks)}, expected 512")
@@ -164,6 +189,8 @@ def checkpoint_from_metadata(metadata_path: Path, config: Path,
     if int(metadata.get("data_seed", -1)) != TRAINING_DATA_SEED:
         return None
     if int(metadata.get("rank_budget", -1)) != TARGET_BUDGET:
+        return None
+    if int(metadata.get("rank", -1)) != maximum:
         return None
     recorded = Path(metadata.get("rank_config", ""))
     if not recorded.is_absolute():
@@ -215,6 +242,8 @@ def train(args, config: Path, minimum: int, maximum: int) -> Path:
         "VP_FP16_PRESCALED_QK": "1",
         "VP_TOTAL_RANK_BUDGET": str(TARGET_BUDGET),
         "VP_NBS_RANK_CONFIG": str(config.relative_to(REPO_ROOT)),
+        # In VP NBS, configured max_rank is the physical AdaLoRA width.
+        "VP_NBS_TARGET_RANK": str(maximum),
     })
     subprocess.run(command, cwd=REPO_ROOT, env=environment, check=True)
     checkpoint = recover_checkpoint(config, minimum, maximum)
@@ -259,7 +288,7 @@ def run_experiment(args, state, state_path: Path, spec) -> None:
         if args.dry_run:
             print(
                 f"Would validate bounds [{minimum}, {maximum}], compact to "
-                f"rank {TARGET_BUDGET}, and evaluate seeds 1,2,3 with "
+                f"rank {TARGET_BUDGET} (physical rank {maximum}), and evaluate seeds 1,2,3 with "
                 "FP16 prescaled Q/K.",
                 flush=True,
             )
@@ -277,6 +306,7 @@ def run_experiment(args, state, state_path: Path, spec) -> None:
             "actual_rank_total": sum(ranks) if ranks else TARGET_BUDGET,
             "actual_rank_min": min(ranks) if ranks else minimum,
             "actual_rank_max": max(ranks) if ranks else maximum,
+            "physical_rank": maximum,
         })
     except Exception as error:
         record.update({
@@ -300,6 +330,7 @@ def write_summary(args, state) -> None:
         row.update({
             "experiment": name, "configured_min_rank": minimum,
             "configured_max_rank": maximum, "rank_config": config,
+            "physical_rank": maximum,
             "actual_rank_total": record["actual_rank_total"],
             "actual_rank_min": record["actual_rank_min"],
             "actual_rank_max": record["actual_rank_max"],

@@ -573,6 +573,7 @@ if [[ "$VARIANT" == "nbs" || "$VARIANT" == "nbs_v2" || \
     # already embedded 512, so budget-1024/1536 runs were silently trained
     # with an allocator budget of 512 despite their directory names.
     RANK_BUDGET="${VP_TOTAL_RANK_BUDGET:-512}"
+    RANK="${VP_NBS_TARGET_RANK:-32}"
     SEED=1
     LORA_SEED=1
     if [[ "$VARIANT" == "nbs_v19_data1" ]]; then
@@ -939,6 +940,10 @@ fi
 # regressions where directory labels and the actual allocator diverge.
 if [[ "$VARIANT" == "nbs_v19_data1" || "$VARIANT" == "nbs_v19_data2" || "$VARIANT" == "nbs_v19_data3" || \
       "$VARIANT" == "nbs_v19_data4" ]]; then
+  if ! [[ "$RANK" =~ ^[1-9][0-9]*$ ]] || (( RANK > 32 )); then
+    echo "VP_NBS_TARGET_RANK must be a positive integer no larger than 32: $RANK"
+    exit 2
+  fi
   if [[ ! -f "$RANK_CONFIG" ]]; then
     echo "NBS rank config does not exist: $RANK_CONFIG"
     exit 2
